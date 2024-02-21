@@ -21,6 +21,8 @@
 #include <limits>
 #include <span>
 
+#include <silkworm/core/execution/precompile.hpp>
+
 #ifdef EVMONE_PRECOMPILES_GMP
 #include "precompiles_gmp.hpp"
 #endif
