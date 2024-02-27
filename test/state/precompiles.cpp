@@ -691,6 +691,14 @@ static ExecutionResult p256verify_execute(
     return {EVMC_SUCCESS, 0};
 }
 
+static ExecutionResult silkworm_ecrecover_execute(const uint8_t* input, size_t input_size, uint8_t* output,
+    [[maybe_unused]] size_t output_size) noexcept
+{
+    auto res = silkworm::precompile::ecrec_run({input, input_size});
+    std::memcpy(output, res->data(), res->size());
+    return {EVMC_SUCCESS, res->size()};
+}
+
 namespace
 {
 using PrecompileLookupIndex = uint16_t;
@@ -704,7 +712,7 @@ struct PrecompileTraits
 };
 
 inline constexpr std::array<PrecompileTraits, 18> traits{{
-    {0x0001, EVMC_FRONTIER, ecrecover_analyze, ecrecover_execute},
+    {0x0001, EVMC_FRONTIER, ecrecover_analyze, silkworm_ecrecover_execute},
     {0x0002, EVMC_FRONTIER, sha256_analyze, sha256_execute},
     {0x0003, EVMC_FRONTIER, ripemd160_analyze, ripemd160_execute},
     {0x0004, EVMC_FRONTIER, identity_analyze, identity_execute},
