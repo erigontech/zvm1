@@ -102,7 +102,7 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
 
 /// Check memory requirements of a reasonable size.
 inline bool check_memory(
-    int64_t& gas_left, Memory& memory, const uint256& offset, uint64_t size) noexcept
+    int64_t& gas_left, int64_t& gas_cost, Memory& memory, const uint256& offset, uint64_t size) noexcept
 {
     // TODO: This should be done in intx.
     // There is "branchless" variant of this using | instead of ||, but benchmarks difference
@@ -110,16 +110,18 @@ inline bool check_memory(
     if (((offset[3] | offset[2] | offset[1]) != 0) || (offset[0] > max_buffer_size))
         return false;
 
+    const auto initial_gas = gas_left;
     const auto new_size = static_cast<uint64_t>(offset) + size;
     if (new_size > memory.size())
         gas_left = grow_memory(gas_left, memory, new_size);
 
+    gas_cost += initial_gas - gas_left;
     return gas_left >= 0;  // Always true for no-grow case.
 }
 
 /// Check memory requirements for "copy" instructions.
 inline bool check_memory(
-    int64_t& gas_left, Memory& memory, const uint256& offset, const uint256& size) noexcept
+    int64_t& gas_left, int64_t& gas_cost, Memory& memory, const uint256& offset, const uint256& size) noexcept
 {
     if (size == 0)  // Copy of size 0 is always valid (even if offset is huge).
         return true;
@@ -130,7 +132,7 @@ inline bool check_memory(
     if (((size[3] | size[2] | size[1]) != 0) || (size[0] > max_buffer_size))
         return false;
 
-    return check_memory(gas_left, memory, offset, static_cast<uint64_t>(size));
+    return check_memory(gas_left, gas_cost, memory, offset, static_cast<uint64_t>(size));
 }
 
 namespace instr::core
@@ -223,7 +225,7 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     const auto additional_cost = exponent_significant_bytes * exponent_cost;
     if ((gas_left -= additional_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
-
+    state.last_opcode_gas_cost += additional_cost;
     exponent = intx::exp(base, exponent);
     return {EVMC_SUCCESS, gas_left};
 }
@@ -362,13 +364,16 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     const auto& index = stack.pop();
     auto& size = stack.top();
 
-    if (!check_memory(gas_left, state.memory, index, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto i = static_cast<size_t>(index);
     const auto s = static_cast<size_t>(size);
     const auto w = num_words(s);
     const auto cost = w * 6;
+
+    state.last_opcode_gas_cost += cost;
+
     if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
@@ -376,7 +381,6 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
     return {EVMC_SUCCESS, gas_left};
 }
-
 
 inline void address(StackTop stack, ExecutionState& state) noexcept
 {
@@ -443,7 +447,7 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
     const auto& input_index = stack.pop();
     const auto& size = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, mem_index, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, mem_index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     auto dst = static_cast<size_t>(mem_index);
@@ -451,9 +455,12 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
                                                      static_cast<size_t>(input_index);
     auto s = static_cast<size_t>(size);
     auto copy_size = std::min(s, state.msg->input_size - src);
+    const auto cost = copy_cost(s);
+    state.last_opcode_gas_cost += cost;
 
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    if ((gas_left -= cost) < 0) {
         return {EVMC_OUT_OF_GAS, gas_left};
+    }
 
     if (copy_size > 0)
         std::memcpy(&state.memory[dst], &state.msg->input_data[src], copy_size);
@@ -477,7 +484,7 @@ inline Result codecopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
     const auto& input_index = stack.pop();
     const auto& size = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, mem_index, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, mem_index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto code_size = state.original_code.size();
@@ -486,7 +493,10 @@ inline Result codecopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
     const auto s = static_cast<size_t>(size);
     const auto copy_size = std::min(s, code_size - src);
 
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    const auto cost = copy_cost(s);
+    state.last_opcode_gas_cost += cost;
+
+    if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
     // TODO: Add unit tests for each combination of conditions.
@@ -547,11 +557,14 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
     const auto& input_index = stack.pop();
     const auto& size = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, mem_index, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, mem_index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto s = static_cast<size_t>(size);
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    const auto cost = copy_cost(s);
+    state.last_opcode_gas_cost += cost;
+
+    if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
@@ -603,7 +616,7 @@ inline Result returndatacopy(StackTop stack, int64_t gas_left, ExecutionState& s
     const auto& input_index = stack.pop();
     const auto& size = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, mem_index, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, mem_index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     auto dst = static_cast<size_t>(mem_index);
@@ -615,7 +628,10 @@ inline Result returndatacopy(StackTop stack, int64_t gas_left, ExecutionState& s
                                                             static_cast<size_t>(input_index);
         auto copy_size = std::min(s, state.return_data.size() - src);
 
-        if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+        const auto cost = copy_cost(s);
+        state.last_opcode_gas_cost += cost;
+
+        if ((gas_left -= cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
 
         if (copy_size > 0)
@@ -633,7 +649,10 @@ inline Result returndatacopy(StackTop stack, int64_t gas_left, ExecutionState& s
         if (src + s > state.return_data.size())
             return {EVMC_INVALID_MEMORY_ACCESS, gas_left};
 
-        if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+        const auto cost = copy_cost(s);
+        state.last_opcode_gas_cost += cost;
+
+        if ((gas_left -= cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
 
         if (s > 0)
@@ -713,7 +732,7 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
 {
     auto& index = stack.top();
 
-    if (!check_memory(gas_left, state.memory, index, 32))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     index = intx::be::unsafe::load<uint256>(&state.memory[static_cast<size_t>(index)]);
@@ -725,7 +744,7 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     const auto& index = stack.pop();
     const auto& value = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, index, 32))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     intx::be::unsafe::store(&state.memory[static_cast<size_t>(index)], value);
@@ -737,7 +756,7 @@ inline Result mstore8(StackTop stack, int64_t gas_left, ExecutionState& state) n
     const auto& index = stack.pop();
     const auto& value = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, index, 1))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, index, 1))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     state.memory[static_cast<size_t>(index)] = static_cast<uint8_t>(value);
@@ -981,14 +1000,17 @@ inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     const auto& src_u256 = stack.pop();
     const auto& size_u256 = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, std::max(dst_u256, src_u256), size_u256))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, std::max(dst_u256, src_u256), size_u256))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto dst = static_cast<size_t>(dst_u256);
     const auto src = static_cast<size_t>(src_u256);
     const auto size = static_cast<size_t>(size_u256);
 
-    if (const auto cost = copy_cost(size); (gas_left -= cost) < 0)
+    const auto cost = copy_cost(size);
+    state.last_opcode_gas_cost += cost;
+
+    if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (size > 0)
@@ -1037,7 +1059,7 @@ inline Result datacopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
     const auto& data_index = stack.pop();
     const auto& size = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, mem_index, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, mem_index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto dst = static_cast<size_t>(mem_index);
@@ -1046,7 +1068,10 @@ inline Result datacopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
     const auto s = static_cast<size_t>(size);
     const auto copy_size = std::min(s, data.size() - src);
 
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    const auto cost = copy_cost(s);
+    state.last_opcode_gas_cost += cost;
+
+    if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (copy_size > 0)
@@ -1069,13 +1094,15 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     const auto& offset = stack.pop();
     const auto& size = stack.pop();
 
-    if (!check_memory(gas_left, state.memory, offset, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, offset, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto o = static_cast<size_t>(offset);
     const auto s = static_cast<size_t>(size);
 
     const auto cost = int64_t(s) * 8;
+    state.last_opcode_gas_cost += cost;
+
     if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
@@ -1166,7 +1193,7 @@ inline TermResult return_impl(StackTop stack, int64_t gas_left, ExecutionState& 
     const auto& offset = stack[0];
     const auto& size = stack[1];
 
-    if (!check_memory(gas_left, state.memory, offset, size))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, offset, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     state.output_size = static_cast<size_t>(size);
@@ -1183,7 +1210,8 @@ inline TermResult returncode(
     const auto& offset = stack[0];
     const auto& size = stack[1];
 
-    if (!check_memory(gas_left, state.memory, offset, size))
+    int64_t gas_cost{0};
+    if (!check_memory(gas_left, gas_cost, state.memory, offset, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto deploy_container_index = size_t{pos[1]};

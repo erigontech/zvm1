@@ -22,7 +22,7 @@ evmc_result execute(AdvancedExecutionState& state, const AdvancedCodeAnalysis& a
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
 
     assert(state.output_size != 0 || state.output_offset == 0);
-    return evmc::make_result(state.status, gas_left, gas_refund,
+    return evmc::make_result(state.status, gas_left, gas_refund, state.gas_cost,
         state.memory.data() + state.output_offset, state.output_size);
 }
 
@@ -41,7 +41,7 @@ evmc_result execute(evmc_vm* /*unused*/, const evmc_host_interface* host, evmc_h
         else
             // Skip analysis, because it will recognize 01 section id as OP_ADD and return
             // EVMC_STACKUNDERFLOW.
-            return evmc::make_result(EVMC_UNDEFINED_INSTRUCTION, 0, 0, nullptr, 0);
+            return evmc::make_result(EVMC_UNDEFINED_INSTRUCTION, 0, 0, msg->gas_cost, nullptr, 0);
     }
     else
         analysis = analyze(rev, container);

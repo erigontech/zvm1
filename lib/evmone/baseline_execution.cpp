@@ -42,14 +42,14 @@ namespace
 /// @return  Status code with information which check has failed
 ///          or EVMC_SUCCESS if everything is fine.
 template <Opcode Op>
-inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
+inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left, int64_t& gas_cost,
     const uint256* stack_top, const uint256* stack_bottom) noexcept
 {
     static_assert(
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
         "undefined instructions must not be handled by check_requirements()");
 
-    auto gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
+    gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
     if constexpr (!instr::has_const_gas_cost(Op))
     {
         gas_cost = cost_table[Op];  // If not, load the cost from the table.
@@ -174,7 +174,7 @@ template <Opcode Op>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
     Position pos, int64_t& gas, ExecutionState& state) noexcept
 {
-    if (const auto status = check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom);
+    if (const auto status = check_requirements<Op>(cost_table, gas, state.last_opcode_gas_cost, pos.stack_end, stack_bottom);
         status != EVMC_SUCCESS)
     {
         state.status = status;
@@ -323,9 +323,9 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     assert(state.output_size != 0 || state.output_offset == 0);
     const auto result =
         (state.deploy_container.has_value() ?
-                evmc::make_result(state.status, gas_left, gas_refund,
+                evmc::make_result(state.status, gas_left, gas_refund, state.last_opcode_gas_cost,
                     state.deploy_container->data(), state.deploy_container->size()) :
-                evmc::make_result(state.status, gas_left, gas_refund,
+                evmc::make_result(state.status, gas_left, gas_refund, state.last_opcode_gas_cost,
                     state.output_size != 0 ? &state.memory[state.output_offset] : nullptr,
                     state.output_size));
 
@@ -350,7 +350,7 @@ evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_co
         const auto container_kind =
             (msg->kind == EVMC_EOFCREATE ? ContainerKind::initcode : ContainerKind::runtime);
         if (validate_eof(rev, container_kind, container) != EOFValidationError::success)
-            return evmc_make_result(EVMC_CONTRACT_VALIDATION_FAILURE, 0, 0, nullptr, 0);
+            return evmc_make_result(EVMC_CONTRACT_VALIDATION_FAILURE, 0, 0, msg->gas_cost, nullptr, 0);
     }
 
     const auto code_analysis = analyze(container, eof_enabled);

@@ -782,7 +782,7 @@ evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcep
     const auto output_data = new (std::nothrow) uint8_t[max_output_size];
     const auto [status_code, output_size] =
         execute(msg.input_data, msg.input_size, output_data, max_output_size);
-    const evmc_result result{status_code, status_code == EVMC_SUCCESS ? gas_left : 0, 0,
+    const evmc_result result{status_code, status_code == EVMC_SUCCESS ? gas_left : 0, 0, 0,
         output_data, output_size,
         [](const evmc_result* res) noexcept { delete[] res->output_data; }};
     return evmc::Result{result};
