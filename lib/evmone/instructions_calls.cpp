@@ -11,6 +11,7 @@ constexpr int64_t MIN_RETAINED_GAS = 5000;
 constexpr int64_t MIN_CALLEE_GAS = 2300;
 constexpr int64_t CALL_VALUE_COST = 9000;
 constexpr int64_t ACCOUNT_CREATION_COST = 25000;
+constexpr int64_t CALL_STIPEND = 2300;
 
 constexpr auto EXTCALL_SUCCESS = 0;
 constexpr auto EXTCALL_REVERT = 1;
@@ -164,8 +165,8 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     if (has_value)
     {
-        msg.gas += 2300;  // Add stipend.
-        gas_left += 2300;
+        msg.gas += CALL_STIPEND;  // Add stipend.
+        gas_left += CALL_STIPEND;
     }
 
     if (state.msg->depth >= 1024)
@@ -388,8 +389,6 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     state.return_data.assign(result.output_data, result.output_size);
     if (result.status_code == EVMC_SUCCESS)
         stack.top() = intx::be::load<uint256>(result.create_address);
-
-    state.last_opcode_gas_cost = 0;
 
     return {EVMC_SUCCESS, gas_left};
 }

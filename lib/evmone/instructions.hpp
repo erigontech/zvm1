@@ -223,9 +223,9 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
         static_cast<int>(intx::count_significant_bytes(exponent));
     const auto exponent_cost = state.rev >= EVMC_SPURIOUS_DRAGON ? 50 : 10;
     const auto additional_cost = exponent_significant_bytes * exponent_cost;
+    state.last_opcode_gas_cost += additional_cost;
     if ((gas_left -= additional_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
-    state.last_opcode_gas_cost += additional_cost;
     exponent = intx::exp(base, exponent);
     return {EVMC_SUCCESS, gas_left};
 }
@@ -373,7 +373,6 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     const auto cost = w * 6;
 
     state.last_opcode_gas_cost += cost;
-
     if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
@@ -394,6 +393,7 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
+        state.last_opcode_gas_cost += instr::additional_cold_account_access_cost;
         if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -457,7 +457,6 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
     auto copy_size = std::min(s, state.msg->input_size - src);
     const auto cost = copy_cost(s);
     state.last_opcode_gas_cost += cost;
-
     if ((gas_left -= cost) < 0) {
         return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -495,7 +494,6 @@ inline Result codecopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
 
     const auto cost = copy_cost(s);
     state.last_opcode_gas_cost += cost;
-
     if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
@@ -542,6 +540,7 @@ inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
+        state.last_opcode_gas_cost += instr::additional_cold_account_access_cost;
         if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -569,6 +568,7 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
+        state.last_opcode_gas_cost += instr::additional_cold_account_access_cost;
         if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -669,6 +669,7 @@ inline Result extcodehash(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
+        state.last_opcode_gas_cost += instr::additional_cold_account_access_cost;
         if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -1237,6 +1238,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(beneficiary) == EVMC_ACCESS_COLD)
     {
+        state.last_opcode_gas_cost += instr::cold_account_access_cost;
         if ((gas_left -= instr::cold_account_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -1249,6 +1251,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
             // sending value to a non-existing account.
             if (!state.host.account_exists(beneficiary))
             {
+                state.last_opcode_gas_cost += 25000;
                 if ((gas_left -= 25000) < 0)
                     return {EVMC_OUT_OF_GAS, gas_left};
             }
