@@ -153,13 +153,17 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         return {EVMC_OUT_OF_GAS, gas_left};
 
     msg.gas = std::numeric_limits<int64_t>::max();
-    if (gas < msg.gas)
+    bool gas_on_stack = false;
+    if ((gas_on_stack = gas < msg.gas))
         msg.gas = static_cast<int64_t>(gas);
 
     if (state.rev >= EVMC_TANGERINE_WHISTLE)  // TODO: Always true for STATICCALL.
         msg.gas = std::min(msg.gas, gas_left - gas_left / 64);
-    else if (msg.gas > gas_left)
+    else if (msg.gas > gas_left) {
+        if (gas_on_stack)
+            gas_cost += msg.gas;
         return {EVMC_OUT_OF_GAS, gas_left};
+    }
 
     gas_cost += msg.gas;
 
