@@ -376,7 +376,7 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
             // Transfer value: sender → recipient.
             // The sender's balance is already checked therefore the sender account must exist.
             const auto value = intx::be::load<intx::uint256>(msg.value);
-            //assert(m_state.get(msg.sender).balance >= value);
+            assert(m_state.get(msg.sender).balance >= value);
             m_state.journal_balance_change(msg.sender, m_state.get(msg.sender).balance);
             m_state.journal_balance_change(msg.recipient, dst_acc.balance);
             m_state.get(msg.sender).balance -= value;
@@ -388,35 +388,21 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
     if ((msg.flags & EVMC_DELEGATED) == 0 && is_precompile(m_rev, msg.code_address))
         return call_precompile(m_rev, msg);
 
-    // auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
-
     const auto code_acc = m_state.find(msg.code_address);
     if (code_acc == nullptr || code_acc->code_hash == Account::EMPTY_CODE_HASH)
-    {
-        // If the account or the code is empty, we can skip invoking instruction execution.
-        evmc::Result result{EVMC_SUCCESS, msg.gas};
-        // if (const auto tracer = my_vm->get_tracer())
-        // {
-        //     // However, we still need to notify the tracer about the execution.
-        //     tracer->notify_execution_start(m_rev, msg, {});
-        //     tracer->notify_execution_end(result.raw());
-        // }
-        return result;
-    }
+        return evmc::Result{EVMC_SUCCESS, msg.gas};
 
-    // auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
-    //     [this](const address& addr) { return m_state.get_code(addr); });
-    // if (opt_result.has_value())
-    //     return std::move(*opt_result);
+    auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
+    auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
+        [this](const address& addr) { return m_state.get_code(addr); });
+    if (opt_result.has_value())
+        return std::move(*opt_result);
 
-    // // TODO: get_code() performs the account lookup. Add a way to get an account with code?
-    // auto thisRef = *this;
+    // TODO: get_code() performs the account lookup. Add a way to get an account with code?
     const auto code = m_state.get_code(msg.code_address);
-    if (code.empty()) {
-        return evmc::Result{EVMC_SUCCESS, msg.gas};}  // Skip trivial execution.
+    if (code.empty())
+        return evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
 
-    // return evmc::Result{EVMC_SUCCESS, msg.gas};
-    
     return m_vm.execute(*this, m_rev, msg, code.data(), code.size());
 }
 
@@ -428,10 +414,8 @@ evmc::Result Host::call(const evmc_message& orig_msg) noexcept
 
     const auto logs_checkpoint = m_logs.size();
     const auto state_checkpoint = m_state.checkpoint();
-    evmc::Result result;
 
-    auto msgRef = *msg;
-    result = execute_message(msgRef);
+    auto result = execute_message(*msg);
 
     if (result.status_code != EVMC_SUCCESS)
     {
@@ -454,7 +438,7 @@ evmc_tx_context Host::get_tx_context() const noexcept
 {
     // TODO: The effective gas price is already computed in transaction validation.
     // TODO: The effective gas price calculation is broken for system calls (gas price 0).
-    // //assert(m_tx.max_gas_price >= m_block.base_fee || m_tx.max_gas_price == 0);
+    assert(m_tx.max_gas_price >= m_block.base_fee || m_tx.max_gas_price == 0);
     const auto priority_gas_price =
         std::min(m_tx.max_priority_gas_price, m_tx.max_gas_price - m_block.base_fee);
     const auto effective_gas_price = m_block.base_fee + priority_gas_price;
