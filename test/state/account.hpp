@@ -5,7 +5,8 @@
 
 #include <evmc/evmc.hpp>
 #include <intx/intx.hpp>
-#include <unordered_map>
+
+#include <silkworm/core/common/hash_maps.hpp>
 
 namespace evmone::state
 {
@@ -48,10 +49,10 @@ struct Account
     bool has_initial_storage = false;
 
     /// The cached and modified account storage entries.
-    std::unordered_map<bytes32, StorageValue> storage;
+    silkworm::FlatHashMap<bytes32, StorageValue> storage;
 
     /// The EIP-1153 transient (transaction-level lifetime) storage.
-    std::unordered_map<bytes32, bytes32> transient_storage;
+    silkworm::FlatHashMap<bytes32, bytes32> transient_storage;
 
     /// The cache of the account code.
     ///
