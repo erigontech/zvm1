@@ -663,12 +663,7 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     state.touch(block.coinbase).balance += gas_used * priority_gas_price;
 
     // Cumulative gas used is unknown in this scope.
-    TransactionReceipt receipt{
-        tx.type, result.status_code, gas_used, {}, host.take_logs(), {}, state.build_diff(rev)};
-
-    // Cannot put it into constructor call because logs are std::moved from host instance.
-    receipt.logs_bloom_filter = compute_bloom_filter(receipt.logs);
-
-    return receipt;
+    return TransactionReceipt{
+        tx.type, result.status_code, gas_used, {}, host.take_logs(), state.build_diff(rev)};
 }
 }  // namespace evmone::state

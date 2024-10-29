@@ -5,7 +5,6 @@
 #pragma once
 
 #include "blob_schedule.hpp"
-#include "bloom_filter.hpp"
 #include "state_diff.hpp"
 #include <intx/intx.hpp>
 #include <optional>
@@ -124,11 +123,11 @@ struct TransactionReceipt
     /// Amount of gas used by this and previous transactions in the block.
     int64_t cumulative_gas_used = 0;
     std::vector<Log> logs;
-    BloomFilter logs_bloom_filter;
+    // BloomFilter logs_bloom_filter;
     StateDiff state_diff;
 
     /// Root hash of the state after this transaction. Used only in old pre-Byzantium transactions.
-    std::optional<bytes32> post_state;
+    // std::optional<bytes32> post_state;
 };
 
 /// Defines how to RLP-encode a Transaction.
