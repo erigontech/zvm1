@@ -148,14 +148,17 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         if ((has_value || state.rev < EVMC_SPURIOUS_DRAGON) && !state.host.account_exists(dst))
             cost += ACCOUNT_CREATION_COST;
     }
-    gas_cost += cost;
-    if ((gas_left -= cost) < 0)
-        return {EVMC_OUT_OF_GAS, gas_left};
-
     msg.gas = std::numeric_limits<int64_t>::max();
     bool gas_on_stack = false;
     if ((gas_on_stack = gas < msg.gas))
         msg.gas = static_cast<int64_t>(gas);
+
+    gas_cost += cost;
+    if ((gas_left -= cost) < 0) {
+        if (gas_on_stack)
+            gas_cost += msg.gas;
+        return {EVMC_OUT_OF_GAS, gas_left};
+    }
 
     if (state.rev >= EVMC_TANGERINE_WHISTLE)  // TODO: Always true for STATICCALL.
         msg.gas = std::min(msg.gas, gas_left - gas_left / 64);
