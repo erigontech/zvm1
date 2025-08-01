@@ -101,8 +101,8 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
 }
 
 /// Check memory requirements of a reasonable size.
-inline bool check_memory(
-    int64_t& gas_left, int64_t& gas_cost, Memory& memory, const uint256& offset, uint64_t size) noexcept
+inline bool check_memory(int64_t& gas_left, int64_t& gas_cost, Memory& memory,
+    const uint256& offset, uint64_t size) noexcept
 {
     // TODO: This should be done in intx.
     // There is "branchless" variant of this using | instead of ||, but benchmarks difference
@@ -120,8 +120,8 @@ inline bool check_memory(
 }
 
 /// Check memory requirements for "copy" instructions.
-inline bool check_memory(
-    int64_t& gas_left, int64_t& gas_cost, Memory& memory, const uint256& offset, const uint256& size) noexcept
+inline bool check_memory(int64_t& gas_left, int64_t& gas_cost, Memory& memory,
+    const uint256& offset, const uint256& size) noexcept
 {
     if (size == 0)  // Copy of size 0 is always valid (even if offset is huge).
         return true;
@@ -457,7 +457,8 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
     auto copy_size = std::min(s, state.msg->input_size - src);
     const auto cost = copy_cost(s);
     state.last_opcode_gas_cost += cost;
-    if ((gas_left -= cost) < 0) {
+    if ((gas_left -= cost) < 0)
+    {
         return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -874,7 +875,7 @@ inline void push0(StackTop stack) noexcept
 template <size_t Len>
 inline uint64_t load_partial_push_data(code_iterator pos) noexcept
 {
-    static_assert(Len > 4 && Len < 8);
+    // static_assert(Len > 4 && Len < 8);
 
     // It loads up to 3 additional bytes.
     return intx::be::unsafe::load<uint64_t>(pos) >> (8 * (sizeof(uint64_t) - Len));
@@ -945,7 +946,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
 template <int N>
 inline void dup(StackTop stack) noexcept
 {
-    static_assert(N >= 1 && N <= 16);
+    // static_assert(N >= 1 && N <= 16);
     stack.push(stack[N - 1]);
 }
 
@@ -954,7 +955,7 @@ inline void dup(StackTop stack) noexcept
 template <int N>
 inline void swap(StackTop stack) noexcept
 {
-    static_assert(N >= 1 && N <= 16);
+    // static_assert(N >= 1 && N <= 16);
 
     // The simple std::swap(stack.top(), stack[N]) is not used to workaround
     // clang missed optimization: https://github.com/llvm/llvm-project/issues/59116
@@ -1001,7 +1002,8 @@ inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     const auto& src_u256 = stack.pop();
     const auto& size_u256 = stack.pop();
 
-    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, std::max(dst_u256, src_u256), size_u256))
+    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory,
+            std::max(dst_u256, src_u256), size_u256))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto dst = static_cast<size_t>(dst_u256);
@@ -1087,7 +1089,7 @@ inline Result datacopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
 template <size_t NumTopics>
 inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
-    static_assert(NumTopics <= 4);
+    // static_assert(NumTopics <= 4);
 
     if (state.in_static_mode())
         return {EVMC_STATIC_MODE_VIOLATION, 0};

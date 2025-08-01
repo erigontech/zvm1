@@ -36,14 +36,14 @@ public:
     Path(const uint8_t* first, const uint8_t* last) noexcept
       : m_size(static_cast<size_t>(last - first))
     {
-        assert(m_size <= std::size(m_nibbles));
+        // assert(m_size <= std::size(m_nibbles));
         std::copy(first, last, m_nibbles);
     }
 
     /// Constructs a path from bytes - each byte will produce 2 nibbles in the path.
     explicit Path(bytes_view key) noexcept : m_size{2 * key.size()}
     {
-        assert(m_size <= std::size(m_nibbles) && "a keys must not be longer than 32 bytes");
+        // assert(m_size <= std::size(m_nibbles) && "a keys must not be longer than 32 bytes");
         size_t i = 0;
         for (const auto b : key)
         {

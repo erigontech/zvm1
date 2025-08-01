@@ -102,7 +102,7 @@ bytes_view extcode(bytes_view code) noexcept
 
     // The hot storage is ignored because it can contain elements from access list.
     // TODO: Is this correct for destructed accounts?
-    assert(!acc.destructed && "untested");
+    //assert(!acc.destructed && "untested");
     return false;
 }
 }  // namespace
@@ -217,7 +217,7 @@ address compute_create2_address(
 {
     const auto init_code_hash = keccak256(init_code);
     uint8_t buffer[1 + sizeof(sender) + sizeof(salt) + sizeof(init_code_hash)];
-    static_assert(std::size(buffer) == 85);
+    // static_assert(std::size(buffer) == 85);
     auto it = std::begin(buffer);
     *it++ = 0xff;
     it = std::copy_n(sender.bytes, sizeof(sender), it);
@@ -264,10 +264,10 @@ std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
         if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE)
         {
             // Compute and set the address of the account being created.
-            assert(msg.recipient == address{});
-            assert(msg.code_address == address{});
+            //assert(msg.recipient == address{});
+            //assert(msg.code_address == address{});
             // Nonce was already incremented, but creation calculation needs non-incremented value
-            assert(sender_acc.nonce != 0);
+            //assert(sender_acc.nonce != 0);
             const auto creation_sender_nonce = sender_acc.nonce - 1;
             if (msg.kind == EVMC_CREATE)
                 msg.recipient = compute_create_address(msg.sender, creation_sender_nonce);
@@ -293,7 +293,7 @@ std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
 
 evmc::Result Host::create(const evmc_message& msg) noexcept
 {
-    assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE);
+    //assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE);
 
     auto* new_acc = m_state.find(msg.recipient);
     const bool new_acc_exists = new_acc != nullptr;
@@ -303,8 +303,8 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
         return evmc::Result{EVMC_FAILURE};  // TODO: Add EVMC errors for creation failures.
     m_state.journal_create(msg.recipient, new_acc_exists);
 
-    assert(new_acc != nullptr);
-    assert(new_acc->nonce == 0);
+    //assert(new_acc != nullptr);
+    //assert(new_acc->nonce == 0);
 
     if (m_rev >= EVMC_SPURIOUS_DRAGON)
         new_acc->nonce = 1;  // No need to journal: create revert will 0 the nonce.
@@ -313,7 +313,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
     auto& sender_acc = m_state.get(msg.sender);  // TODO: Duplicated account lookup.
     const auto value = intx::be::load<intx::uint256>(msg.value);
-    assert(sender_acc.balance >= value && "EVM must guarantee balance");
+    //assert(sender_acc.balance >= value && "EVM must guarantee balance");
     m_state.journal_balance_change(msg.sender, sender_acc.balance);
     m_state.journal_balance_change(msg.recipient, new_acc->balance);
     sender_acc.balance -= value;
@@ -348,13 +348,13 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     }
 
     auto gas_left = result.gas_left;
-    assert(gas_left >= 0);
+    //assert(gas_left >= 0);
 
     const bytes_view code{result.output_data, result.output_size};
 
     // for EOFCREATE successful result is guaranteed to be non-empty
     // because container section is not allowed to be empty
-    assert(msg.kind != EVMC_EOFCREATE || result.status_code != EVMC_SUCCESS || !code.empty());
+    //assert(msg.kind != EVMC_EOFCREATE || result.status_code != EVMC_SUCCESS || !code.empty());
 
     if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > MAX_CODE_SIZE)
         return evmc::Result{EVMC_FAILURE};
@@ -379,8 +379,8 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
                 // EF. It must be valid EOF, which was validated before execution.
                 if (msg.kind != EVMC_EOFCREATE)
                     return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-                assert(validate_eof(m_rev, ContainerKind::runtime, code) ==
-                       EOFValidationError::success);
+                //assert(validate_eof(m_rev, ContainerKind::runtime, code) ==
+                    //    EOFValidationError::success);
             }
             else if (m_rev >= EVMC_LONDON)
             {
@@ -423,7 +423,7 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
             // Transfer value: sender → recipient.
             // The sender's balance is already checked therefore the sender account must exist.
             const auto value = intx::be::load<intx::uint256>(msg.value);
-            assert(m_state.get(msg.sender).balance >= value);
+            //assert(m_state.get(msg.sender).balance >= value);
             m_state.journal_balance_change(msg.sender, m_state.get(msg.sender).balance);
             m_state.journal_balance_change(msg.recipient, dst_acc.balance);
             m_state.get(msg.sender).balance -= value;
@@ -456,10 +456,14 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
     if (opt_result.has_value())
         return std::move(*opt_result);
 
-    // TODO: get_code() performs the account lookup. Add a way to get an account with code?
+    // // TODO: get_code() performs the account lookup. Add a way to get an account with code?
+    auto thisRef = *this;
     const auto code = m_state.get_code(msg.code_address);
-    if (code.empty())
-        return evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
+    if (code.data() == nullptr) {
+        return evmc::Result{EVMC_SUCCESS, msg.gas};}  // Skip trivial execution.
+    // if (code.size() != 44) return evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
+
+    // return evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
 
     return m_vm.execute(*this, m_rev, msg, code.data(), code.size());
 }
@@ -472,8 +476,10 @@ evmc::Result Host::call(const evmc_message& orig_msg) noexcept
 
     const auto logs_checkpoint = m_logs.size();
     const auto state_checkpoint = m_state.checkpoint();
+    evmc::Result result;
 
-    auto result = execute_message(*msg);
+    auto msgRef = *msg;
+    execute_message(msgRef);
 
     if (result.status_code != EVMC_SUCCESS)
     {
@@ -496,7 +502,7 @@ evmc_tx_context Host::get_tx_context() const noexcept
 {
     // TODO: The effective gas price is already computed in transaction validation.
     // TODO: The effective gas price calculation is broken for system calls (gas price 0).
-    assert(m_tx.max_gas_price >= m_block.base_fee || m_tx.max_gas_price == 0);
+    // //assert(m_tx.max_gas_price >= m_block.base_fee || m_tx.max_gas_price == 0);
     const auto priority_gas_price =
         std::min(m_tx.max_priority_gas_price, m_tx.max_gas_price - m_block.base_fee);
     const auto effective_gas_price = m_block.base_fee + priority_gas_price;

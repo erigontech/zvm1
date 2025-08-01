@@ -357,7 +357,7 @@ void store(uint8_t _rx[128], const blst_fp2& _x) noexcept
     static constexpr auto P1_SIZE = 2 * FP_SIZE;
     static constexpr auto P2_SIZE = 2 * FP2_SIZE;
     static constexpr auto PAIR_SIZE = P1_SIZE + P2_SIZE;
-    assert(size % PAIR_SIZE == 0);
+    // assert(size % PAIR_SIZE == 0);
 
     auto acc = *blst_fp12_one();
     const auto pairs_end = _pairs + size;

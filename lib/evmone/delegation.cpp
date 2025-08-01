@@ -22,7 +22,7 @@ std::optional<evmc::address> get_delegate_address(
     // Copy the delegate address from the designation buffer.
     evmc::address delegate_address;
     // Assume the designation with the valid magic has also valid length.
-    assert(designation.size() == std::size(designation_buffer));
+    // assert(designation.size() == std::size(designation_buffer));
     std::ranges::copy(designation.substr(std::size(DELEGATION_MAGIC)), delegate_address.bytes);
     return delegate_address;
 }

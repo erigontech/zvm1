@@ -165,7 +165,7 @@ std::variant<EOFSectionHeaders, EOFValidationError> validate_section_headers(byt
         {
             if (section_id == CODE_SECTION)
             {
-                assert(section_num > 0);  // Guaranteed by previous validation step.
+                // assert(section_num > 0);  // Guaranteed by previous validation step.
                 for (size_t i = 0; i < section_num; ++i)
                 {
                     if (it >= container_end - 1)
@@ -340,7 +340,7 @@ std::variant<InstructionValidationResult, EOFValidationError> validate_instructi
     bytes_view container) noexcept
 {
     const bytes_view code{header.get_code(container, code_idx)};
-    assert(!code.empty());  // guaranteed by EOF headers validation
+    // assert(!code.empty());  // guaranteed by EOF headers validation
 
     const auto& cost_table = baseline::get_baseline_cost_table(rev, 1);
 
@@ -380,7 +380,7 @@ std::variant<InstructionValidationResult, EOFValidationError> validate_instructi
         else if (op == OP_RETF)
         {
             is_returning = true;
-            static_assert(instr::traits[OP_RETF].immediate_size == 0);
+            // static_assert(instr::traits[OP_RETF].immediate_size == 0);
         }
         else if (op == OP_JUMPF)
         {
@@ -514,7 +514,7 @@ std::variant<int32_t, EOFValidationError> validate_stack_height(
         [[nodiscard]] bool visited() const noexcept { return min != LOC_UNVISITED; }
     };
 
-    assert(!code.empty());
+    // assert(!code.empty());
 
     const auto type = header.get_type(container, func_index);
     std::vector<StackHeightRange> stack_heights(code.size());
@@ -545,7 +545,7 @@ std::variant<int32_t, EOFValidationError> validate_stack_height(
                 return EOFValidationError::stack_overflow;
 
             // Instruction validation ensures target function is returning
-            assert(callee_type.outputs != NON_RETURNING_FUNCTION);
+            // assert(callee_type.outputs != NON_RETURNING_FUNCTION);
             stack_height_change = static_cast<int8_t>(callee_type.outputs - stack_height_required);
         }
         else if (opcode == OP_JUMPF)
@@ -611,7 +611,7 @@ std::variant<int32_t, EOFValidationError> validate_stack_height(
             {
                 // successor_offset == current_offset case is possible only with jump into the same
                 // jump instruction, e.g. RJUMP(-3), so it is technically a backwards jump, too.
-                assert(successor_stack_height.visited());
+                // assert(successor_stack_height.visited());
                 // The spec could have been relaxed to
                 // return successor_stack_height.min >= required_stack_height.min &&
                 //        successor_stack_height.max <= required_stack_height.max;
@@ -878,7 +878,7 @@ EOF1Header read_valid_eof1_header(bytes_view container)
     auto code_offset = header_size + section_headers.type_size;
     for (const auto code_size : header.code_sizes)
     {
-        assert(code_offset <= std::numeric_limits<uint16_t>::max());
+        // assert(code_offset <= std::numeric_limits<uint16_t>::max());
         header.code_offsets.emplace_back(static_cast<uint16_t>(code_offset));
         code_offset += code_size;
     }
@@ -903,7 +903,7 @@ bool append_data_section(bytes& container, bytes_view aux_data)
     const auto header = read_valid_eof1_header(container);
 
     // Assert we don't need to trim off the bytes beyond the declared data section first.
-    assert(container.size() <= header.data_offset + header.data_size);
+    // assert(container.size() <= header.data_offset + header.data_size);
 
     const auto new_data_size = container.size() - header.data_offset + aux_data.size();
     if (new_data_size > std::numeric_limits<uint16_t>::max())

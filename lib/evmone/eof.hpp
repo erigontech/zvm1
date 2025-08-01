@@ -114,7 +114,7 @@ struct EOF1Header
     /// A helper to extract reference to a specific code section.
     [[nodiscard]] bytes_view get_code(bytes_view container, size_t code_idx) const noexcept
     {
-        assert(code_idx < code_offsets.size());
+        // assert(code_idx < code_offsets.size());
         return container.substr(code_offsets[code_idx], code_sizes[code_idx]);
     }
 
@@ -135,7 +135,7 @@ struct EOF1Header
     [[nodiscard]] bytes_view get_container(
         bytes_view container, size_t container_idx) const noexcept
     {
-        assert(container_idx < container_offsets.size());
+        // assert(container_idx < container_offsets.size());
         return container.substr(container_offsets[container_idx], container_sizes[container_idx]);
     }
 

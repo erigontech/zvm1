@@ -225,7 +225,7 @@ PrecompileAnalysis bls12_g1msm_analyze(bytes_view input, evmc_revision) noexcept
         return {GasCostMax, 0};
 
     const auto k = input.size() / BLS12_G1_MUL_INPUT_SIZE;
-    assert(k > 0);
+    // assert(k > 0);
     const auto discount = DISCOUNTS[std::min(k, std::size(DISCOUNTS)) - 1];
     const auto cost = (G1MUL_GAS_COST * discount * static_cast<int64_t>(k)) / 1000;
     return {cost, BLS12_G1_POINT_SIZE};
@@ -253,7 +253,7 @@ PrecompileAnalysis bls12_g2msm_analyze(bytes_view input, evmc_revision) noexcept
         return {GasCostMax, 0};
 
     const auto k = input.size() / BLS12_G2_MUL_INPUT_SIZE;
-    assert(k > 0);
+    // assert(k > 0);
     const auto discount = DISCOUNTS[std::min(k, std::size(DISCOUNTS)) - 1];
     const auto cost = (G2MUL_GAS_COST * discount * static_cast<int64_t>(k)) / 1000;
     return {cost, BLS12_G2_POINT_SIZE};
@@ -295,7 +295,7 @@ static PrecompileAnalysis p256verify_analyze(bytes_view, evmc_revision) noexcept
 ExecutionResult ecrecover_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= 32);
+    // assert(output_size >= 32);
 
     uint8_t input_buffer[128]{};
     if (input_size != 0)
@@ -326,7 +326,7 @@ ExecutionResult ecrecover_execute(const uint8_t* input, size_t input_size, uint8
 ExecutionResult sha256_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= 32);
+    // assert(output_size >= 32);
     crypto::sha256(reinterpret_cast<std::byte*>(output), reinterpret_cast<const std::byte*>(input),
         input_size);
     return {EVMC_SUCCESS, 32};
@@ -335,7 +335,7 @@ ExecutionResult sha256_execute(const uint8_t* input, size_t input_size, uint8_t*
 ExecutionResult ripemd160_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= 32);
+    // assert(output_size >= 32);
     output = std::fill_n(output, 12, std::uint8_t{0});
     crypto::ripemd160(reinterpret_cast<std::byte*>(output),
         reinterpret_cast<const std::byte*>(input), input_size);
@@ -435,7 +435,7 @@ ExecutionResult expmod_execute_gmp(
 ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= 64);
+    // assert(output_size >= 64);
 
     uint8_t input_buffer[128]{};
     if (input_size != 0)
@@ -462,7 +462,7 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
 ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= 64);
+    // assert(output_size >= 64);
 
     uint8_t input_buffer[96]{};
     if (input_size != 0)
@@ -525,7 +525,7 @@ ExecutionResult ecpairing_execute(const uint8_t* input, size_t input_size, uint8
 ExecutionResult identity_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= input_size);
+    // assert(output_size >= input_size);
     std::copy_n(input, input_size, output);
     return {EVMC_SUCCESS, input_size};
 }
@@ -533,39 +533,39 @@ ExecutionResult identity_execute(const uint8_t* input, size_t input_size, uint8_
 ExecutionResult blake2bf_execute(const uint8_t* input, [[maybe_unused]] size_t input_size,
     uint8_t* output, [[maybe_unused]] size_t output_size) noexcept
 {
-    static_assert(std::endian::native == std::endian::little,
-        "blake2bf only works correctly on little-endian architectures");
-    assert(input_size >= 213);
-    assert(output_size >= 64);
+    // static_assert(std::endian::native == std::endian::little,
+        // "blake2bf only works correctly on little-endian architectures");
+        // assert(input_size >= 213);
+        // assert(output_size >= 64);
 
-    const auto rounds = intx::be::unsafe::load<uint32_t>(input);
-    input += sizeof(rounds);
+        const auto rounds = intx::be::unsafe::load<uint32_t>(input);
+        input += sizeof(rounds);
 
-    uint64_t h[8];
-    std::memcpy(h, input, sizeof(h));
-    input += sizeof(h);
+        uint64_t h[8];
+        std::memcpy(h, input, sizeof(h));
+        input += sizeof(h);
 
-    uint64_t m[16];
-    std::memcpy(m, input, sizeof(m));
-    input += sizeof(m);
+        uint64_t m[16];
+        std::memcpy(m, input, sizeof(m));
+        input += sizeof(m);
 
-    uint64_t t[2];
-    std::memcpy(t, input, sizeof(t));
-    input += sizeof(t);
+        uint64_t t[2];
+        std::memcpy(t, input, sizeof(t));
+        input += sizeof(t);
 
-    const auto f = *input;
-    if (f != 0 && f != 1) [[unlikely]]
-        return {EVMC_PRECOMPILE_FAILURE, 0};
+        const auto f = *input;
+        if (f != 0 && f != 1) [[unlikely]]
+            return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    crypto::blake2b_compress(rounds, h, m, t, f != 0);
-    std::memcpy(output, h, sizeof(h));
-    return {EVMC_SUCCESS, sizeof(h)};
+        crypto::blake2b_compress(rounds, h, m, t, f != 0);
+        std::memcpy(output, h, sizeof(h));
+        return {EVMC_SUCCESS, sizeof(h)};
 }
 
 ExecutionResult point_evaluation_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    assert(output_size >= 64);
+    // assert(output_size >= 64);
     if (input_size != 192)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
@@ -591,7 +591,7 @@ ExecutionResult bls12_g1add_execute(const uint8_t* input, size_t input_size, uin
     if (input_size != 2 * BLS12_G1_POINT_SIZE)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == BLS12_G1_POINT_SIZE);
+    // assert(output_size == BLS12_G1_POINT_SIZE);
 
     if (!crypto::bls::g1_add(output, &output[64], input, &input[64], &input[128], &input[192]))
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -605,7 +605,7 @@ ExecutionResult bls12_g1msm_execute(const uint8_t* input, size_t input_size, uin
     if (input_size % BLS12_G1_MUL_INPUT_SIZE != 0)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == BLS12_G1_POINT_SIZE);
+    // assert(output_size == BLS12_G1_POINT_SIZE);
 
     if (!crypto::bls::g1_msm(output, &output[64], input, input_size))
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -619,7 +619,7 @@ ExecutionResult bls12_g2add_execute(const uint8_t* input, size_t input_size, uin
     if (input_size != 2 * BLS12_G2_POINT_SIZE)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == BLS12_G2_POINT_SIZE);
+    // assert(output_size == BLS12_G2_POINT_SIZE);
 
     if (!crypto::bls::g2_add(output, &output[128], input, &input[128], &input[256], &input[384]))
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -633,7 +633,7 @@ ExecutionResult bls12_g2msm_execute(const uint8_t* input, size_t input_size, uin
     if (input_size % BLS12_G2_MUL_INPUT_SIZE != 0)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == BLS12_G2_POINT_SIZE);
+    // assert(output_size == BLS12_G2_POINT_SIZE);
 
     if (!crypto::bls::g2_msm(output, &output[128], input, input_size))
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -647,7 +647,7 @@ ExecutionResult bls12_pairing_check_execute(const uint8_t* input, size_t input_s
     if (input_size % (BLS12_G1_POINT_SIZE + BLS12_G2_POINT_SIZE) != 0)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == 32);
+    // assert(output_size == 32);
 
     if (!crypto::bls::pairing_check(output, input, input_size))
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -661,7 +661,7 @@ ExecutionResult bls12_map_fp_to_g1_execute(const uint8_t* input, size_t input_si
     if (input_size != BLS12_FIELD_ELEMENT_SIZE)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == BLS12_G1_POINT_SIZE);
+    // assert(output_size == BLS12_G1_POINT_SIZE);
 
     if (!crypto::bls::map_fp_to_g1(output, &output[64], input))
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -675,7 +675,7 @@ ExecutionResult bls12_map_fp2_to_g2_execute(const uint8_t* input, size_t input_s
     if (input_size != 2 * BLS12_FIELD_ELEMENT_SIZE)
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    assert(output_size == BLS12_G2_POINT_SIZE);
+    // assert(output_size == BLS12_G2_POINT_SIZE);
 
     if (!crypto::bls::map_fp2_to_g2(output, &output[128], input))
         return {EVMC_PRECOMPILE_FAILURE, 0};

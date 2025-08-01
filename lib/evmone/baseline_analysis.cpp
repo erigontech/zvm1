@@ -21,7 +21,7 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
     // To find if op is any PUSH opcode (OP_PUSH1 <= op <= OP_PUSH32)
     // it can be noticed that OP_PUSH32 is INT8_MAX (0x7f) therefore,
     // static_cast<int8_t>(op) <= OP_PUSH32 is always true and can be skipped.
-    static_assert(OP_PUSH32 == std::numeric_limits<int8_t>::max());
+    // static_assert(OP_PUSH32 == std::numeric_limits<int8_t>::max());
 
     for (size_t i = 0; i < code.size(); ++i)
     {

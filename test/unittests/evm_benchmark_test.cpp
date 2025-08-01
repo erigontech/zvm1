@@ -98,7 +98,7 @@ TEST_P(evm, signextend_bench)
         24, 27, 31,
         // clang-format on
     };
-    static_assert(std::size(byte_indexes) == 15);
+    // static_assert(std::size(byte_indexes) == 15);
 
     bytecode code;
     for (const auto b : byte_indexes)

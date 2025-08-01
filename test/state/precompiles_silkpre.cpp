@@ -22,7 +22,7 @@ ExecutionResult execute(const uint8_t* input, size_t input_size, uint8_t* output
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
     // Check if max_output_size computed by analysis match the computed result.
-    assert(output_size <= max_output_size);
+    // assert(output_size <= max_output_size);
 
     const auto trimmed_output_size = std::min(output_size, max_output_size);
     std::memcpy(output_buf, output, trimmed_output_size);

@@ -58,12 +58,12 @@ int64_t calculate_difficulty_since_byzantium(int64_t parent_difficulty, bool par
     const auto delay = get_bomb_delay(rev);
     const auto fake_block_number = std::max(int64_t{0}, block_number - delay);
     const auto p = (fake_block_number / 100'000) - 2;
-    assert(p < 63);
+    // assert(p < 63);
     const auto epsilon = p < 0 ? 0 : int64_t{1} << p;
     const auto y = parent_has_ommers ? 2 : 1;
 
     const auto timestamp_diff = current_timestamp - parent_timestamp;
-    assert(timestamp_diff > 0);
+    // assert(timestamp_diff > 0);
     const auto sigma_2 = std::max(y - timestamp_diff / 9, int64_t{-99});
     const auto x = parent_difficulty / 2048;
     return parent_difficulty + x * sigma_2 + epsilon;

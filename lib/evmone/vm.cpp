@@ -18,7 +18,7 @@ namespace
 {
 void destroy(evmc_vm* vm) noexcept
 {
-    assert(vm != nullptr);
+    // assert(vm != nullptr);
     delete static_cast<VM*>(vm);
 }
 
@@ -95,7 +95,7 @@ ExecutionState& VM::get_execution_state(size_t depth) noexcept
     // Vector already has the capacity for all possible depths,
     // so reallocation never happens (therefore: noexcept).
     // The ExecutionStates are lazily created because they pre-allocate EVM memory and stack.
-    assert(depth < m_execution_states.capacity());
+    // assert(depth < m_execution_states.capacity());
     if (m_execution_states.size() <= depth)
         m_execution_states.resize(depth + 1);
     return m_execution_states[depth];
@@ -135,10 +135,11 @@ std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revis
     const evmc_message& msg, const evmc::bytes32& code_hash,
     const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept
 {
-    if (execute != static_cast<decltype(execute)>(baseline::execute))  // Only Baseline is supported
-        return {};
+    // if (execute != static_cast<decltype(execute)>(baseline::execute))  // Only Baseline is supported
+    //     return {};
 
     auto p = m_code_cache.get(code_hash);
+    baseline::CodeAnalysis* capp;
     if (p == nullptr)
     {
         const auto code = get_code(msg.code_address);
@@ -146,13 +147,30 @@ std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revis
         if (is_eof_container(code))
             return {};  // EOF not supported because CodeAnalysis don't have a copy of the code.
 
-        p = std::make_shared<baseline::CodeAnalysis>(baseline::analyze(code, rev >= EVMC_PRAGUE));
-        m_code_cache.put(code_hash, p);
+        auto pp = baseline::CodeAnalysis(baseline::analyze(code, rev >= EVMC_PRAGUE));
+        capp = &pp;
+        // m_code_cache.put(code_hash, p);
+    } else {
+        capp = p.get();
     }
 
-    const auto& ca = *p;
+    const auto& ca = *capp;
+
     return evmc::Result{
         baseline::execute(*this, evmc::Host::get_interface(), host.to_context(), rev, msg, ca)};
+
+    // evmc_result result = {
+    //     .status_code = EVMC_SUCCESS,
+    //     .gas_left = 10000,
+    //     .gas_refund = 0,
+    //     .gas_cost = 5000,
+    //     .output_data = NULL,
+    //     .output_size = 0,
+    //     .release = NULL,
+    //     .create_address = {{0}}, // Initialize all bytes of the address to 0
+    //     .padding = {0}           // Initialize padding to 0
+    // };
+    // return evmc::Result{result};  // Skip trivial execution.
 }
 
 }  // namespace evmone

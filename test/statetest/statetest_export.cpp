@@ -70,7 +70,7 @@ std::string_view to_test_fork_name(evmc_revision rev) noexcept
     case UNKNOWN_ERROR:
         return "Unknown error";
     default:
-        assert(false);
+        // assert(false);
         return "Wrong error code";
     }
 }

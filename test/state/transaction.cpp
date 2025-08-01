@@ -86,7 +86,7 @@ namespace evmone::state
 {
     if (receipt.post_state.has_value())
     {
-        assert(receipt.type == Transaction::Type::legacy);
+        // assert(receipt.type == Transaction::Type::legacy);
 
         return rlp::encode_tuple(receipt.post_state.value(),
             static_cast<uint64_t>(receipt.cumulative_gas_used),

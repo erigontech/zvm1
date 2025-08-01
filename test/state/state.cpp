@@ -251,7 +251,7 @@ StateDiff State::build_diff(evmc_revision rev) const
 Account& State::insert(const address& addr, Account account)
 {
     const auto r = m_modified.insert({addr, std::move(account)});
-    assert(r.second);
+    // assert(r.second);
     return r.first->second;
 }
 

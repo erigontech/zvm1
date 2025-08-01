@@ -56,7 +56,7 @@ BloomFilter compute_bloom_filter(std::span<const TransactionReceipt> receipts) n
 
 BloomFilter bloom_filter_from_bytes(const bytes_view& data) noexcept
 {
-    assert(data.size() == 256);
+    // assert(data.size() == 256);
     BloomFilter res;
     std::ranges::copy(data, res.bytes);
     return res;

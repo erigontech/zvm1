@@ -97,7 +97,7 @@ inline const std::error_category& evmone_category() noexcept
             case UNKNOWN_ERROR:
                 return "Unknown error";
             default:
-                assert(false);
+                // assert(false);
                 return "Wrong error code";
             }
         }

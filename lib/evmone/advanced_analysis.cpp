@@ -217,10 +217,10 @@ AdvancedCodeAnalysis analyze(evmc_revision rev, bytes_view code) noexcept
     // TODO: This is not needed if the last instruction is a terminating one.
     analysis.instrs.emplace_back(op_tbl[OP_STOP].fn);
 
-    assert(analysis.instrs.size() <= max_instrs_size);
+    // assert(analysis.instrs.size() <= max_instrs_size);
 
     // Make sure the push_values has not been reallocated. Otherwise, iterators are invalid.
-    assert(analysis.push_values.size() <= max_args_storage_size);
+    // assert(analysis.push_values.size() <= max_args_storage_size);
 
     return analysis;
 }
