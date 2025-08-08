@@ -435,36 +435,35 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
     if ((msg.flags & EVMC_DELEGATED) == 0 && is_precompile(m_rev, msg.code_address))
         return call_precompile(m_rev, msg);
 
-    auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
+    // auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
 
     const auto code_acc = m_state.find(msg.code_address);
     if (code_acc == nullptr || code_acc->code_hash == Account::EMPTY_CODE_HASH)
     {
         // If the account or the code is empty, we can skip invoking instruction execution.
         evmc::Result result{EVMC_SUCCESS, msg.gas};
-        if (const auto tracer = my_vm->get_tracer())
-        {
-            // However, we still need to notify the tracer about the execution.
-            tracer->notify_execution_start(m_rev, msg, {});
-            tracer->notify_execution_end(result.raw());
-        }
+        // if (const auto tracer = my_vm->get_tracer())
+        // {
+        //     // However, we still need to notify the tracer about the execution.
+        //     tracer->notify_execution_start(m_rev, msg, {});
+        //     tracer->notify_execution_end(result.raw());
+        // }
         return result;
     }
 
-    auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
-        [this](const address& addr) { return m_state.get_code(addr); });
-    if (opt_result.has_value())
-        return std::move(*opt_result);
+    // auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
+    //     [this](const address& addr) { return m_state.get_code(addr); });
+    // if (opt_result.has_value())
+    //     return std::move(*opt_result);
 
     // // TODO: get_code() performs the account lookup. Add a way to get an account with code?
-    auto thisRef = *this;
+    // auto thisRef = *this;
     const auto code = m_state.get_code(msg.code_address);
-    if (code.data() == nullptr) {
+    if (code.empty()) {
         return evmc::Result{EVMC_SUCCESS, msg.gas};}  // Skip trivial execution.
-    // if (code.size() != 44) return evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
 
-    // return evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
-
+    // return evmc::Result{EVMC_SUCCESS, msg.gas};
+    
     return m_vm.execute(*this, m_rev, msg, code.data(), code.size());
 }
 
@@ -479,7 +478,7 @@ evmc::Result Host::call(const evmc_message& orig_msg) noexcept
     evmc::Result result;
 
     auto msgRef = *msg;
-    execute_message(msgRef);
+    result = execute_message(msgRef);
 
     if (result.status_code != EVMC_SUCCESS)
     {

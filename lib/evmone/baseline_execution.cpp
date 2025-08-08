@@ -182,28 +182,28 @@ template <Opcode Op, bool TracingEnabled>
         cost_table, gas, state.last_opcode_gas_cost, pos.stack_end, stack_bottom);
     if (status != EVMC_SUCCESS)
     {
-        if constexpr (TracingEnabled)
-        {
-            if (status == EVMC_OUT_OF_GAS)
-            {
-                switch (Op)
-                {
-                case OP_CALL:
-                case OP_CALLCODE:
-                case OP_STATICCALL:
-                case OP_DELEGATECALL:
-                case OP_CREATE:
-                case OP_CREATE2:
-                case OP_KECCAK256:
-                case OP_MSTORE:
-                    break;
+        // if constexpr (TracingEnabled)
+        // {
+        //     if (status == EVMC_OUT_OF_GAS)
+        //     {
+        //         switch (Op)
+        //         {
+        //         case OP_CALL:
+        //         case OP_CALLCODE:
+        //         case OP_STATICCALL:
+        //         case OP_DELEGATECALL:
+        //         case OP_CREATE:
+        //         case OP_CREATE2:
+        //         case OP_KECCAK256:
+        //         case OP_MSTORE:
+        //             break;
 
-                default:
-                    invoke(instr::core::impl<Op>, pos, starting_gas, state);
-                    break;
-                }
-            }
-        }
+        //         default:
+        //             invoke(instr::core::impl<Op>, pos, starting_gas, state);
+        //             break;
+        //         }
+        //     }
+        // }
         state.status = status;
         return {nullptr, pos.stack_end};
     }
@@ -330,20 +330,20 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     const auto& cost_table = get_baseline_cost_table(state.rev, analysis.eof_header().version);
 
     auto* tracer = vm.get_tracer();
-    if (INTX_UNLIKELY(tracer != nullptr))
-    {
-        tracer->notify_execution_start(state.rev, *state.msg, code);
-        gas = dispatch<true>(cost_table, state, gas, code_begin, tracer);
-    }
-    else
-    {
+    // if (INTX_UNLIKELY(tracer != nullptr))
+    // {
+    //     tracer->notify_execution_start(state.rev, *state.msg, code);
+    //     gas = dispatch<true>(cost_table, state, gas, code_begin, tracer);
+    // }
+    // else
+    // {
 #if EVMONE_CGOTO_SUPPORTED
         if (vm.cgoto)
             gas = dispatch_cgoto(cost_table, state, gas, code_begin);
         else
 #endif
             gas = dispatch<false>(cost_table, state, gas, code_begin);
-    }
+    // }
 
     const auto gas_left = (state.status == EVMC_SUCCESS || state.status == EVMC_REVERT) ? gas : 0;
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
@@ -357,8 +357,8 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
                     state.output_size != 0 ? &state.memory[state.output_offset] : nullptr,
                     state.output_size));
 
-    if (INTX_UNLIKELY(tracer != nullptr))
-        tracer->notify_execution_end(result);
+    // if (INTX_UNLIKELY(tracer != nullptr))
+    //     tracer->notify_execution_end(result);
 
     return result;    
     // evmc_result result = {
@@ -372,7 +372,7 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     //     .create_address = {{0}}, // Initialize all bytes of the address to 0
     //     .padding = {0}           // Initialize padding to 0
     // };
-    // return result;  // Skip trivial execution.
+    // return result;
 }
 
 evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_context* ctx,
@@ -397,8 +397,6 @@ evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_co
     const auto code_analysis = analyze(container, false);
 
     return execute(*vm, *host, ctx, rev, *msg, code_analysis);
-
-    // evmc_result result;
-    // return result;
+    // return evmc_result{EVMC_SUCCESS, msg->gas};
 }
 }  // namespace evmone::baseline
