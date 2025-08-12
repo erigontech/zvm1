@@ -46,8 +46,8 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     int64_t& gas_cost, const uint256* stack_top, const uint256* stack_bottom) noexcept
 {
     // static_assert(
-        // !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
-        // "undefined instructions must not be handled by check_requirements()");
+    //     !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
+    //     "undefined instructions must not be handled by check_requirements()");
 
         gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
         if constexpr (!instr::has_const_gas_cost(Op))
@@ -238,21 +238,20 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
         const auto op = *position.code_it;
         switch (op)
         {
-#define ON_OPCODE(OPCODE)                                                                       \
-    case OPCODE:                                                                                \
-        ASM_COMMENT(OPCODE);                                                                    \
-        if (const auto next =                                                                   \
-                invoke<OPCODE, TracingEnabled>(cost_table, stack_bottom, position, gas, state); \
-            next.code_it == nullptr)                                                            \
-        {                                                                                       \
-            return gas;                                                                         \
-        }                                                                                       \
-        else                                                                                    \
-        {                                                                                       \
-            /* Update current position only when no error,                                      \
-               this improves compiler optimization. */                                          \
-            position = next;                                                                    \
-        }                                                                                       \
+#define ON_OPCODE(OPCODE)                                                                     \
+    case OPCODE:                                                                              \
+        ASM_COMMENT(OPCODE);                                                                  \
+        if (const auto next = invoke<OPCODE, TracingEnabled>(cost_table, stack_bottom, position, gas, state); \
+            next.code_it == nullptr)                                                          \
+        {                                                                                     \
+            return gas;                                                                       \
+        }                                                                                     \
+        else                                                                                  \
+        {                                                                                     \
+            /* Update current position only when no error,                                    \
+               this improves compiler optimization. */                                        \
+            position = next;                                                                  \
+        }                                                                                     \
         break;
 
             MAP_OPCODES
@@ -290,19 +289,19 @@ int64_t dispatch_cgoto(
 
     goto* cgoto_table[*position.code_it];
 
-#define ON_OPCODE(OPCODE)                                                                        \
-    TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
+#define ON_OPCODE(OPCODE)                                                                 \
+    TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                \
     if (const auto next = invoke<OPCODE, false>(cost_table, stack_bottom, position, gas, state); \
-        next.code_it == nullptr)                                                                 \
-    {                                                                                            \
-        return gas;                                                                              \
-    }                                                                                            \
-    else                                                                                         \
-    {                                                                                            \
-        /* Update current position only when no error,                                           \
-           this improves compiler optimization. */                                               \
-        position = next;                                                                         \
-    }                                                                                            \
+        next.code_it == nullptr)                                                          \
+    {                                                                                     \
+        return gas;                                                                       \
+    }                                                                                     \
+    else                                                                                  \
+    {                                                                                     \
+        /* Update current position only when no error,                                    \
+           this improves compiler optimization. */                                        \
+        position = next;                                                                  \
+    }                                                                                     \
     goto* cgoto_table[*position.code_it];
 
     MAP_OPCODES
@@ -361,18 +360,6 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     //     tracer->notify_execution_end(result);
 
     return result;    
-    // evmc_result result = {
-    //     .status_code = EVMC_SUCCESS,
-    //     .gas_left = 10000,
-    //     .gas_refund = 0,
-    //     .gas_cost = 5000,
-    //     .output_data = NULL,
-    //     .output_size = 0,
-    //     .release = NULL,
-    //     .create_address = {{0}}, // Initialize all bytes of the address to 0
-    //     .padding = {0}           // Initialize padding to 0
-    // };
-    // return result;
 }
 
 evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_context* ctx,
