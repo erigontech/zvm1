@@ -4,6 +4,7 @@
 
 #include "precompiles.hpp"
 #include "../utils/stdx/utility.hpp"
+#include "evmone_precompiles/secp256r1.hpp"
 #include "precompiles_internal.hpp"
 #include "precompiles_stubs.hpp"
 #include <evmone_precompiles/blake2b.hpp>
@@ -683,12 +684,28 @@ ExecutionResult bls12_map_fp2_to_g2_execute(const uint8_t* input, size_t input_s
     return {EVMC_SUCCESS, BLS12_G2_POINT_SIZE};
 }
 
-static ExecutionResult p256verify_execute(
-    const uint8_t*, size_t, uint8_t*, [[maybe_unused]] size_t output_size) noexcept
+static ExecutionResult p256verify_execute(const uint8_t* input, size_t input_size, uint8_t* output,
+    [[maybe_unused]] size_t output_size) noexcept
 {
     assert(output_size >= 32);
-    // Not implemented. Assume input or signature is invalid.
-    return {EVMC_SUCCESS, 0};
+
+    if (input_size != 160)
+        return {EVMC_SUCCESS, 0};
+
+    ethash::hash256 h{};
+    std::copy_n(input, sizeof(h), h.bytes);
+    const auto r = intx::be::unsafe::load<intx::uint256>(input + 32);
+    const auto s = intx::be::unsafe::load<intx::uint256>(input + 64);
+    const auto qx = intx::be::unsafe::load<intx::uint256>(input + 96);
+    const auto qy = intx::be::unsafe::load<intx::uint256>(input + 128);
+
+    if (!evmmax::secp256r1::verify(h, r, s, qx, qy))
+        return {EVMC_SUCCESS, 0};  // In case of invalid signature, return empty output.
+
+    // Return 1_u256.
+    std::fill_n(output, 31, 0);
+    output[31] = 1;
+    return {EVMC_SUCCESS, 32};
 }
 
 static ExecutionResult silkworm_ecrecover_execute(const uint8_t* input, size_t input_size, uint8_t* output,
