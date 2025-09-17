@@ -5,8 +5,12 @@
 #include "tracing.hpp"
 #include "execution_state.hpp"
 #include "instructions_traits.hpp"
+#include "silkworm/print.hpp"
+
 #include <evmc/hex.hpp>
+
 #include <fstream>
+#include <sstream>
 #include <stack>
 
 namespace evmone
@@ -125,7 +129,8 @@ class InstructionTracer : public Tracer
     };
 
     std::stack<Context> m_contexts;
-    std::ostream& m_out;  ///< Output stream.
+    std::ostringstream m_out;  ///< Output stream.
+
 
     void output_stack(const intx::uint256* stack_top, int stack_height)
     {
@@ -171,13 +176,18 @@ class InstructionTracer : public Tracer
         m_out << R"(,"opName":")" << get_name(opcode) << '"';
 
         m_out << "}\n";
+
+        sys_print(m_out.str().c_str());
+        m_out.str({});
+        m_out.clear();
     }
 
     void on_execution_end(const evmc_result& /*result*/) noexcept override { m_contexts.pop(); }
 
 public:
-    explicit InstructionTracer(std::ostream& out) noexcept : m_out{out}
+    explicit InstructionTracer(std::ostream& out) noexcept
     {
+        (void)out;
         m_out << std::dec;  // Set number formatting to dec, JSON does not support other forms.
     }
 };
