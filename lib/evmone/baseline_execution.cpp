@@ -6,7 +6,9 @@
 #include "baseline_instruction_table.hpp"
 #include "execution_state.hpp"
 #include "instructions.hpp"
+#include "silkworm/print.hpp"
 #include "vm.hpp"
+
 #include <memory>
 
 #ifdef NDEBUG
@@ -301,20 +303,20 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     const auto& cost_table = get_baseline_cost_table(state.rev);
 
     auto* tracer = vm.get_tracer();
-    // if (INTX_UNLIKELY(tracer != nullptr))
-    // {
-    //     tracer->notify_execution_start(state.rev, *state.msg, code);
-    //     gas = dispatch<true>(cost_table, state, gas, code_begin, tracer);
-    // }
-    // else
-    // {
+    if (INTX_UNLIKELY(tracer != nullptr))
+    {
+        tracer->notify_execution_start(state.rev, *state.msg, code);
+        gas = dispatch<true>(cost_table, state, gas, code_begin, tracer);
+    }
+    else
+    {
 #if EVMONE_CGOTO_SUPPORTED
         if (vm.cgoto)
             gas = dispatch_cgoto(cost_table, state, gas, code_begin);
         else
 #endif
             gas = dispatch<false>(cost_table, state, gas, code_begin);
-    // }
+    }
 
     const auto gas_left = (state.status == EVMC_SUCCESS || state.status == EVMC_REVERT) ? gas : 0;
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
@@ -323,10 +325,10 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     const auto result = evmc::make_result(state.status, gas_left, gas_refund,
         state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size);
 
-    // if (INTX_UNLIKELY(tracer != nullptr))
-    //     tracer->notify_execution_end(result);
+    if (INTX_UNLIKELY(tracer != nullptr))
+        tracer->notify_execution_end(result);
 
-    return result;    
+    return result;
 }
 
 evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_context* ctx,
