@@ -414,7 +414,7 @@ ExecutionResult expmod_execute(
 #ifdef EVMONE_PRECOMPILES_GMP
     expmod_gmp(base, exp, mod, output);
 #else
-    expmod_stub(base, exp, mod, output);
+    // expmod_stub(base, exp, mod, output);
 #endif
     return {EVMC_SUCCESS, mod.size()};
 }
