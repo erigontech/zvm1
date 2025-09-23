@@ -262,8 +262,6 @@ AffinePoint<Curve> add(const AffinePoint<Curve>& p, const AffinePoint<Curve>& q)
 template <typename Curve>
 ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexcept
 {
-    static_assert(Curve::A == 0, "untested for A != 0");
-
     if (p == 0)
         return q;
     if (q == 0)
@@ -317,7 +315,6 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
 template <typename Curve>
 ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noexcept
 {
-    static_assert(Curve::A == 0, "untested for A != 0");
     assert(p != ProjPoint(q));
 
     if (q == 0)
@@ -360,33 +357,65 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
 template <typename Curve>
 ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 {
-    static_assert(Curve::A == 0, "point doubling procedure is for A = 0");
-
-    // Use the "dbl-2009-l" formula for a=0 curve in Jacobian coordinates.
-    // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#doubling-dbl-2009-l
-
     const auto& [x1, y1, z1] = p;
 
-    const auto a = x1 * x1;
-    const auto b = y1 * y1;
-    const auto c = b * b;
-    const auto t0 = x1 + b;
-    const auto t1 = t0 * t0;
-    const auto t2 = t1 - a;
-    const auto t3 = t2 - c;
-    const auto d = t3 + t3;
-    const auto e = a + a + a;
-    const auto f = e * e;
-    const auto t4 = d + d;
-    const auto x3 = f - t4;
-    const auto t5 = d - x3;
-    const auto t6 = c + c + c + c + c + c + c + c;
-    const auto t7 = e * t5;
-    const auto y3 = t7 - t6;
-    const auto t8 = y1 * z1;
-    const auto z3 = t8 + t8;
+    if constexpr (Curve::A == 0)
+    {
+        // Use the "dbl-2009-l" formula for a=0 curve in Jacobian coordinates.
+        // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#doubling-dbl-2009-l
 
-    return {x3, y3, z3};
+        const auto xx = x1 * x1;
+        const auto yy = y1 * y1;
+        const auto yyyy = yy * yy;
+        const auto t0 = x1 + yy;
+        const auto t1 = t0 * t0;
+        const auto t2 = t1 - xx;
+        const auto t3 = t2 - yyyy;
+        const auto d = t3 + t3;
+        const auto e = xx + xx + xx;
+        const auto f = e * e;
+        const auto t4 = d + d;
+        const auto x3 = f - t4;
+        const auto t6 = d - x3;
+        const auto t8 = yyyy + yyyy + yyyy + yyyy + yyyy + yyyy + yyyy + yyyy;
+        const auto t9 = e * t6;
+        const auto y3 = t9 - t8;
+        const auto t10 = y1 * z1;
+        const auto z3 = t10 + t10;
+        return {x3, y3, z3};
+    }
+    else if constexpr (Curve::A == Curve::FIELD_PRIME - 3)
+    {
+        // Use the "dbl-2001-b" doubling formula.
+        // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#doubling-dbl-2001-b
+
+        const auto zz = z1 * z1;
+        const auto yy = y1 * y1;
+        const auto xyy = x1 * yy;
+        const auto t0 = x1 - zz;
+        const auto t1 = x1 + zz;
+        const auto t2 = t0 * t1;
+        const auto alpha = t2 + t2 + t2;
+        const auto t3 = alpha * alpha;
+        const auto t4 = xyy + xyy + xyy + xyy + xyy + xyy + xyy + xyy;
+        const auto x3 = t3 - t4;
+        const auto t5 = y1 + z1;
+        const auto t6 = t5 * t5;
+        const auto t7 = t6 - yy;
+        const auto z3 = t7 - zz;
+        const auto t8 = xyy + xyy + xyy + xyy;
+        const auto t9 = t8 - x3;
+        const auto t10 = yy * yy;
+        const auto t11 = t10 + t10 + t10 + t10 + t10 + t10 + t10 + t10;
+        const auto t12 = alpha * t9;
+        const auto y3 = t12 - t11;
+        return {x3, y3, z3};
+    }
+    else
+    {
+        // TODO(c++23): Use fake always-false condition for older compilers.
+        static_assert(Curve::A == 0, "unsupported Curve::A value");
+    }
 }
 
 template <typename Curve>
