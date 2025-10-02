@@ -587,7 +587,6 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     const TransactionProperties& tx_props)
 {
     State state{state_view};
-
     auto& sender_acc = state.get_or_insert(tx.sender);
     assert(sender_acc.nonce < Account::NonceMax);  // Required for valid tx.
     ++sender_acc.nonce;                            // Bump sender nonce.
