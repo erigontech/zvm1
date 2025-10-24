@@ -43,7 +43,7 @@ private:
         word_type bit_mask;
     };
 
-    [[nodiscard, gnu::always_inline, msvc::forceinline]] Ref get_ref(size_t index) const noexcept
+    [[nodiscard, gnu::always_inline]] Ref get_ref(size_t index) const noexcept
     {
         const auto word_index = index / WORD_BITS;
         const auto bit_index = index % WORD_BITS;
