@@ -81,14 +81,16 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     // static_assert(
         // Op == OP_CALL || Op == OP_CALLCODE || Op == OP_DELEGATECALL || Op == OP_STATICCALL);
 
-        const auto gas = stack.pop();
-        const auto dst = intx::be::trunc<evmc::address>(stack.pop());
-        const auto value = (Op == OP_STATICCALL || Op == OP_DELEGATECALL) ? 0 : stack.pop();
-        const auto has_value = value != 0;
-        const auto input_offset_u256 = stack.pop();
-        const auto input_size_u256 = stack.pop();
-        const auto output_offset_u256 = stack.pop();
-        const auto output_size_u256 = stack.pop();
+    static constexpr bool HAS_VALUE_ARG = Op == OP_CALL || Op == OP_CALLCODE;
+
+    const auto gas = stack.pop();
+    const auto dst = intx::be::trunc<evmc::address>(stack.pop());
+    const auto value = (!HAS_VALUE_ARG) ? 0 : stack.pop();
+    const auto has_value = value != 0;
+    const auto input_offset_u256 = stack.pop();
+    const auto input_size_u256 = stack.pop();
+    const auto output_offset_u256 = stack.pop();
+    const auto output_size_u256 = stack.pop();
 
         stack.push(0);  // Assume failure.
         state.return_data.clear();
@@ -153,51 +155,64 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         if ((gas_on_stack = gas < msg.gas))
             msg.gas = static_cast<int64_t>(gas);
 
-        gas_cost += cost;
-        if ((gas_left -= cost) < 0)
+    if constexpr (HAS_VALUE_ARG)
+    {
+        auto cost = has_value ? CALL_VALUE_COST : 0;
+
+        if constexpr (Op == OP_CALL)
         {
-            if (gas_on_stack)
-                gas_cost += msg.gas;
-            return {EVMC_OUT_OF_GAS, gas_left};
+            if (has_value && state.in_static_mode())
+                return {EVMC_STATIC_MODE_VIOLATION, gas_left};
+
+            if ((has_value || state.rev < EVMC_SPURIOUS_DRAGON) && !state.host.account_exists(dst))
+                cost += ACCOUNT_CREATION_COST;
         }
 
-        if (state.rev >= EVMC_TANGERINE_WHISTLE)  // TODO: Always true for STATICCALL.
+        if ((gas_left -= cost) < 0)
+            return {EVMC_OUT_OF_GAS, gas_left};
+    }
+
+    msg.gas = std::numeric_limits<int64_t>::max();
+    if (gas < msg.gas)
+        msg.gas = static_cast<int64_t>(gas);
+
+    if constexpr (Op == OP_STATICCALL)
+    {
+        msg.gas = std::min(msg.gas, gas_left - gas_left / 64);
+    }
+    else
+    {
+        if (state.rev >= EVMC_TANGERINE_WHISTLE)  // Always true for STATICCALL.
             msg.gas = std::min(msg.gas, gas_left - gas_left / 64);
         else if (msg.gas > gas_left)
-        {
-            if (gas_on_stack)
-                gas_cost += msg.gas;
             return {EVMC_OUT_OF_GAS, gas_left};
-        }
+    }
 
-        gas_cost += msg.gas;
-
+    if constexpr (HAS_VALUE_ARG)
+    {
         if (has_value)
         {
-            msg.gas += CALL_STIPEND;  // Add stipend.
-            gas_left += CALL_STIPEND;
+            msg.gas += 2300;  // Add stipend.
+            gas_left += 2300;
+            if (intx::be::load<uint256>(state.host.get_balance(state.msg->recipient)) < value)
+                return {EVMC_SUCCESS, gas_left};  // "Light" failure.
         }
-
-        if (state.msg->depth >= 1024)
-            return {EVMC_SUCCESS, gas_left};  // "Light" failure.
-
-        if (has_value &&
-            intx::be::load<uint256>(state.host.get_balance(state.msg->recipient)) < value)
-            return {EVMC_SUCCESS, gas_left};  // "Light" failure.
-
-        msg.gas_cost = gas_cost;
-        const auto result = state.host.call(msg);
-        state.return_data.assign(result.output_data, result.output_size);
-        stack.top() = result.status_code == EVMC_SUCCESS;
+    }
 
         if (const auto copy_size = std::min(output_size, result.output_size); copy_size > 0)
             std::memcpy(&state.memory[output_offset], result.output_data, copy_size);
 
-        const auto gas_used = msg.gas - result.gas_left;
-        gas_left -= gas_used;
-        state.gas_refund += result.gas_refund;
+    const auto result = state.host.call(msg);
+    state.return_data.assign(result.output_data, result.output_size);
+    stack.top() = result.status_code == EVMC_SUCCESS;
 
-        return {EVMC_SUCCESS, gas_left};
+    if (const auto copy_size = std::min(output_size, result.output_size); copy_size > 0)
+        std::memcpy(&state.memory[output_offset], result.output_data, copy_size);
+
+    const auto gas_used = msg.gas - result.gas_left;
+    gas_left -= gas_used;
+    state.gas_refund += result.gas_refund;
+    return {EVMC_SUCCESS, gas_left};
 }
 
 template Result call_impl<OP_CALL>(
