@@ -5,6 +5,76 @@ Documentation of all notable changes to the **evmone** project.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.17.0] — 2025-10-29
+
+This release provides full [Osaka] compatibility by implementing 3 remaining EIPs.
+
+### Added
+
+- Implementation of the `p256verify` ([EIP-7951]) precompile for the secp256r1/P256 signature verification.
+  [#1321](https://github.com/ipsilon/evmone/pull/1321)
+  [#1328](https://github.com/ipsilon/evmone/pull/1328)
+- Unit tests and benchmarks for the `p256verify` precompile.
+  [#1326](https://github.com/ipsilon/evmone/pull/1326)
+  [#1333](https://github.com/ipsilon/evmone/pull/1333)
+- Support for [EIP-7934]—MAX_RLP_BLOCK_SIZE in testing infrastructure.
+  [#1329](https://github.com/ipsilon/evmone/pull/1329)
+- Support for [EIP-7892]—Blob Parameter Only (BPO) forks in testing infrastructure.
+  [#1330](https://github.com/ipsilon/evmone/pull/1330)
+
+### Changed
+
+- **Testing infrastructure improvements**:
+  - State and blockchain test runners now discover tests by individual test cases.
+    [#1331](https://github.com/ipsilon/evmone/pull/1331)
+  - Block header validation fixes.
+    [#1244](https://github.com/ipsilon/evmone/pull/1244)
+  - Fix deposit log and system contract validations in t8n.
+    [#1339](https://github.com/ipsilon/evmone/pull/1339)
+- **Cryptography optimizations**:
+  - Optimize bit test of scalars in ECC multiplication.
+    [#1336](https://github.com/ipsilon/evmone/pull/1336)
+  - Add ECC doubling formula for curves with A coefficient of -3.
+    [#1321](https://github.com/ipsilon/evmone/pull/1321)
+  - Use `g1_mul` and `g2_mul` for single-input multiplication in BLS precompiles.
+    [#1340](https://github.com/ipsilon/evmone/pull/1340)
+- **Code quality and coverage improvements**:
+  - Refactor MPT implementation for more precise code coverage.
+    [#1341](https://github.com/ipsilon/evmone/pull/1341)
+  - Filter relevant functionality in `call_impl` template.
+    [#1348](https://github.com/ipsilon/evmone/pull/1348)
+  - Remove deprecated methods in `TestState`.
+    [#1352](https://github.com/ipsilon/evmone/pull/1352)
+  - Remove dead code: `ethash_keccak256_32`, secp256k1 affine point multiplication, and RLP `encode(array)`.
+    [#1345](https://github.com/ipsilon/evmone/pull/1345)
+    [#1346](https://github.com/ipsilon/evmone/pull/1346)
+    [#1342](https://github.com/ipsilon/evmone/pull/1342)
+  - Degrade always-true condition to assert in the `Host` code.
+    [#1344](https://github.com/ipsilon/evmone/pull/1344)
+  - Remove potentially dead code in `ExecutionState`.
+    [#1338](https://github.com/ipsilon/evmone/pull/1338)
+  - Move `BlobSchedule` from state library to test utilities.
+    [#1349](https://github.com/ipsilon/evmone/pull/1349)
+- **Build and dependencies**:
+  - Upgrade minimum CMake version to 3.19.
+    [#1350](https://github.com/ipsilon/evmone/pull/1350)
+  - Disable `-Werror` by default.
+    [#1351](https://github.com/ipsilon/evmone/pull/1351)
+  - Upgrade minimum Xcode to 16.2.0.
+    [#1334](https://github.com/ipsilon/evmone/pull/1334)
+- **External test suites**:
+  - [Execution Spec Tests] upgraded to [v5.3.0][Execution Spec Tests 5.3.0].
+    [#1334](https://github.com/ipsilon/evmone/pull/1334)
+    [#1327](https://github.com/ipsilon/evmone/pull/1327)
+  - Adjust coverage report for EEST tests.
+    [#1318](https://github.com/ipsilon/evmone/pull/1318)
+
+### Fixed
+
+- Fix handling of the input point-at-infinity in secp256r1 signature verification.
+  [#1328](https://github.com/ipsilon/evmone/pull/1328)
+
+
 ## [0.16.0] — 2025-09-25
 
 ### Added
@@ -1034,6 +1104,7 @@ It delivers fully-compatible and high-speed EVM implementation.
 - Exposes [EVMC] 6 ABI.
 - The [intx 0.2.0](https://github.com/chfast/intx/releases/tag/v0.2.0) library is used for 256-bit precision arithmetic. 
 
+[0.17.0]: https://github.com/ethereum/evmone/releases/tag/v0.17.0
 [0.16.0]: https://github.com/ethereum/evmone/releases/tag/v0.16.0
 [0.15.0]: https://github.com/ethereum/evmone/releases/tag/v0.15.0
 [0.14.1]: https://github.com/ethereum/evmone/releases/tag/v0.14.1
@@ -1096,7 +1167,9 @@ It delivers fully-compatible and high-speed EVM implementation.
 [EIP-7825]: https://eips.ethereum.org/EIPS/eip-7825
 [EIP-7873]: https://eips.ethereum.org/EIPS/eip-7873
 [EIP-7883]: https://eips.ethereum.org/EIPS/eip-7883
+[EIP-7892]: https://eips.ethereum.org/EIPS/eip-7892
 [EIP-7918]: https://eips.ethereum.org/EIPS/eip-7918
+[EIP-7934]: https://eips.ethereum.org/EIPS/eip-7934
 [EIP-7939]: https://eips.ethereum.org/EIPS/eip-7939
 [EIP-7951]: https://eips.ethereum.org/EIPS/eip-7951
 
@@ -1146,6 +1219,7 @@ It delivers fully-compatible and high-speed EVM implementation.
 [tests 8.0.4]: https://github.com/ethereum/tests/releases/tag/8.0.4
 
 [Execution Spec Tests]: https://github.com/ethereum/execution-spec-tests
+[Execution Spec Tests 5.3.0]: https://github.com/ethereum/execution-spec-tests/releases/tag/v5.3.0
 [Execution Spec Tests 3.0.0]: https://github.com/ethereum/execution-spec-tests/releases/tag/v3.0.0
 [Execution Spec Tests 1.0.6]: https://github.com/ethereum/execution-spec-tests/releases/tag/v1.0.6
 
