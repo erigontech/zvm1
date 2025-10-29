@@ -4,7 +4,8 @@
 
 #pragma once
 
-#include "blob_schedule.hpp"
+#include "blob_params.hpp"
+#include "bloom_filter.hpp"
 #include "state_diff.hpp"
 #include <intx/intx.hpp>
 #include <optional>
