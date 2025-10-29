@@ -15,7 +15,7 @@ TEST_F(state_transition, tx_legacy)
     tx.type = Transaction::Type::legacy;
     tx.to = To;
 
-    expect.post.at(Sender).nonce = pre.get(Sender).nonce + 1;
+    expect.post.at(Sender).nonce = pre[Sender].nonce + 1;
 }
 
 TEST_F(state_transition, tx_non_existing_sender)
@@ -66,7 +66,7 @@ TEST_F(state_transition, tx_blob_gas_price)
     block.blob_base_fee = 1;
     block.blob_gas_used = 786432;
 
-    pre.get(tx.sender).balance = GAS_PER_BLOB + tx.gas_limit * tx.max_gas_price;
+    pre[tx.sender].balance = GAS_PER_BLOB + tx.gas_limit * tx.max_gas_price;
 
     expect.post[Coinbase].exists = false;  // all gas is burned, Coinbase gets nothing
     expect.status = EVMC_SUCCESS;
@@ -81,7 +81,7 @@ TEST_F(state_transition, empty_coinbase_fee_0_sd)
     tx.to = To;
     tx.max_gas_price = 0;
     tx.max_priority_gas_price = 0;
-    pre.insert(Coinbase, {});
+    pre[Coinbase] = {};
     expect.post[To].exists = false;
     expect.post[Coinbase].exists = false;
 }
@@ -95,7 +95,7 @@ TEST_F(state_transition, empty_coinbase_fee_0_tw)
     tx.to = To;
     tx.max_gas_price = 0;
     tx.max_priority_gas_price = 0;
-    pre.insert(Coinbase, {});
+    pre[Coinbase] = {};
     expect.post[To].exists = true;
     expect.post[Coinbase].balance = 0;
 }
@@ -105,7 +105,7 @@ TEST_F(state_transition, access_list_storage)
     tx.to = To;
     tx.access_list = {{To, {0x01_bytes32}}};
 
-    pre.insert(To, {.storage = {{0x01_bytes32, 0x01_bytes32}}, .code = sstore(2, sload(1))});
+    pre[To] = {.storage = {{0x01_bytes32, 0x01_bytes32}}, .code = sstore(2, sload(1))};
 
     expect.post[To].storage[0x01_bytes32] = 0x01_bytes32;
     expect.post[To].storage[0x02_bytes32] = 0x01_bytes32;
