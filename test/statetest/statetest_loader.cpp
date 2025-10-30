@@ -8,7 +8,6 @@
 #include <test/state/precompiles.hpp>
 
 #include <evmone/delegation.hpp>
-#include <evmone/eof.hpp>
 #include <nlohmann/json.hpp>
 
 namespace evmone::test
@@ -418,12 +417,6 @@ static void from_json_tx_common(const json::json& j, state::Transaction& o)
         o.type = state::Transaction::Type::set_code;
         o.authorization_list = from_json<state::AuthorizationList>(*au_it);
     }
-    else if (const auto it_initcodes = j.find("initcodes"); it_initcodes != j.end())
-    {
-        o.type = state::Transaction::Type::initcodes;
-        for (const auto& initcode : *it_initcodes)
-            o.initcodes.push_back(from_json<bytes>(initcode));
-    }
 }
 
 template <>
@@ -565,7 +558,6 @@ void validate_state(const TestState& state, evmc_revision rev)
             throw std::invalid_argument("unexpected code at precompile address " + hex0x(addr));
 
         const bool allowedEF = (rev >= EVMC_PRAGUE && is_code_delegated(acc.code)) ||
-                               (rev >= EVMC_EXPERIMENTAL && is_eof_container(acc.code)) ||
                                // exceptions to EIP-3541 rule existing on Mainnet
                                acc.code == "EF"_hex || acc.code == "EFF09f918bf09f9fa9"_hex;
         if (rev >= EVMC_LONDON && !allowedEF && !acc.code.empty() && acc.code[0] == 0xEF)
@@ -580,16 +572,6 @@ void validate_state(const TestState& state, evmc_revision rev)
         {
             throw std::invalid_argument(
                 "EIP-7702 delegation designator at " + hex0x(addr) + " has invalid size");
-        }
-
-        if (rev >= EVMC_EXPERIMENTAL && is_eof_container(acc.code))
-        {
-            if (const auto result = validate_eof(rev, ContainerKind::runtime, acc.code);
-                result != EOFValidationError::success)
-            {
-                throw std::invalid_argument("EOF container at " + hex0x(addr) + " is invalid: " +
-                                            std::string(get_error_message(result)));
-            }
         }
 
         for (const auto& [key, value] : acc.storage)

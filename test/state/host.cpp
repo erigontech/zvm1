@@ -5,8 +5,6 @@
 #include "host.hpp"
 #include "precompiles.hpp"
 #include <evmone/constants.hpp>
-#include <evmone/eof.hpp>
-#include <evmone/vm.hpp>
 
 namespace evmone::state
 {
@@ -78,14 +76,6 @@ uint256be Host::get_balance(const address& addr) const noexcept
 
 namespace
 {
-/// For EXTCODE* instructions if the target is an EOF account, then only return EF00.
-/// While we only do this if the caller is legacy, it is not a problem doing this
-/// unconditionally, because EOF contracts dot no have EXTCODE* instructions.
-bytes_view extcode(bytes_view code) noexcept
-{
-    return is_eof_container(code) ? code.substr(0, 2) : code;
-}
-
 /// Check if an existing account is the "create collision"
 /// as defined in the [EIP-7610](https://eips.ethereum.org/EIPS/eip-7610).
 [[nodiscard]] bool is_create_collision(const Account& acc) noexcept
@@ -111,7 +101,7 @@ bytes_view extcode(bytes_view code) noexcept
 size_t Host::get_code_size(const address& addr) const noexcept
 {
     const auto raw_code = m_state.get_code(addr);
-    return extcode(raw_code).size();
+    return raw_code.size();
 }
 
 bytes32 Host::get_code_hash(const address& addr) const noexcept
@@ -120,19 +110,13 @@ bytes32 Host::get_code_hash(const address& addr) const noexcept
     if (acc == nullptr || acc->is_empty())
         return {};
 
-    // Load code and check if not EOF.
-    // TODO: Optimize the second account lookup here.
-    if (is_eof_container(m_state.get_code(addr)))
-        return EOF_CODE_HASH_SENTINEL;
-
     return acc->code_hash;
 }
 
 size_t Host::copy_code(const address& addr, size_t code_offset, uint8_t* buffer_data,
     size_t buffer_size) const noexcept
 {
-    const auto raw_code = m_state.get_code(addr);
-    const auto code = extcode(raw_code);
+    const auto code = m_state.get_code(addr);
     const auto code_slice = code.substr(std::min(code_offset, code.size()));
     const auto num_bytes = std::min(buffer_size, code_slice.size());
     std::copy_n(code_slice.begin(), num_bytes, buffer_data);
@@ -230,25 +214,10 @@ address compute_create2_address(
     return addr;
 }
 
-address compute_eofcreate_address(const address& sender, const bytes32& salt) noexcept
-{
-    uint8_t buffer[1 + 32 + sizeof(salt)];
-    static_assert(std::size(buffer) == 65);
-    auto it = std::begin(buffer);
-    *it++ = 0xff;
-    it = std::fill_n(it, 32 - sizeof(sender), 0);  // zero-pad sender to 32 bytes.
-    it = std::copy_n(sender.bytes, sizeof(sender), it);
-    std::copy_n(salt.bytes, sizeof(salt), it);
-    const auto base_hash = keccak256({buffer, std::size(buffer)});
-    address addr;
-    std::copy_n(&base_hash.bytes[sizeof(base_hash) - sizeof(addr)], sizeof(addr), addr.bytes);
-    return addr;
-}
-
 std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
 {
-    if (msg.depth == 0 || msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 ||
-        msg.kind == EVMC_EOFCREATE)
+    assert(msg.kind != EVMC_EOFCREATE);
+    if (msg.depth == 0 || msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2)
     {
         auto& sender_acc = m_state.get(msg.sender);
 
@@ -262,7 +231,7 @@ std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
             ++sender_acc.nonce;  // Bump sender nonce.
         }
 
-        if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE)
+        if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2)
         {
             // Compute and set the address of the account being created.
             //assert(msg.recipient == address{});
@@ -272,16 +241,11 @@ std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
             const auto creation_sender_nonce = sender_acc.nonce - 1;
             if (msg.kind == EVMC_CREATE)
                 msg.recipient = compute_create_address(msg.sender, creation_sender_nonce);
-            else if (msg.kind == EVMC_CREATE2)
-            {
-                msg.recipient = compute_create2_address(
-                    msg.sender, msg.create2_salt, {msg.input_data, msg.input_size});
-            }
             else
             {
-                // EOFCREATE or TXCREATE
-                assert(msg.kind == EVMC_EOFCREATE);
-                msg.recipient = compute_eofcreate_address(msg.sender, msg.create2_salt);
+                assert(msg.kind == EVMC_CREATE2);
+                msg.recipient = compute_create2_address(
+                    msg.sender, msg.create2_salt, {msg.input_data, msg.input_size});
             }
 
             // By EIP-2929, the access to new created address is never reverted.
@@ -321,26 +285,9 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     new_acc->balance += value;  // The new account may be prefunded.
 
     auto create_msg = msg;
-    const auto initcode = (msg.kind == EVMC_EOFCREATE ? bytes_view{msg.code, msg.code_size} :
-                                                        bytes_view{msg.input_data, msg.input_size});
-
-    if (m_rev >= EVMC_EXPERIMENTAL && msg.kind != EVMC_EOFCREATE && msg.depth == 0)
-    {
-        // EOF initcode is not allowed for legacy creation tx
-        // We cannot let the EVM handle that on the initial `EF` invalid instruction,
-        // b/c it will default to running `initcode` as an EOF container. At the same time setting
-        // the execution mode (legacy vs EOF) deeper down based on `msg.kind` seems awkward.
-        // NOTE: EOF initcode is also not allowed in CREATE/CREATE2, but that is blocked
-        // earlier on the opcode level.
-        if (is_eof_container(initcode))
-            return evmc::Result{EVMC_FAILURE};
-    }
-    if (msg.kind != EVMC_EOFCREATE)
-    {
-        create_msg.input_data = nullptr;
-        create_msg.input_size = 0;
-    }
-
+    create_msg.input_data = nullptr;
+    create_msg.input_size = 0;
+    const bytes_view initcode{msg.input_data, msg.input_size};
     auto result = m_vm.execute(*this, m_rev, create_msg, initcode.data(), initcode.size());
     if (result.status_code != EVMC_SUCCESS)
     {
@@ -372,23 +319,9 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
     if (!code.empty())
     {
-        if (code[0] == 0xEF)
-        {
-            if (m_rev >= EVMC_EXPERIMENTAL)
-            {
-                // Only EOFCREATE/TXCREATE is allowed to deploy code starting with
-                // EF. It must be valid EOF, which was validated before execution.
-                if (msg.kind != EVMC_EOFCREATE)
-                    return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-                //assert(validate_eof(m_rev, ContainerKind::runtime, code) ==
-                    //    EOFValidationError::success);
-            }
-            else if (m_rev >= EVMC_LONDON)
-            {
-                // EIP-3541: Reject EF code.
-                return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-            }
-        }
+        // EIP-3541: Reject new contract code starting with the 0xEF byte.
+        if (m_rev >= EVMC_LONDON && code[0] == 0xEF)
+            return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
 
         new_acc->code_hash = keccak256(code);
         new_acc->code = code;
@@ -400,7 +333,8 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
 evmc::Result Host::execute_message(const evmc_message& msg) noexcept
 {
-    if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE)
+    assert(msg.kind != EVMC_EOFCREATE);
+    if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2)
         return create(msg);
 
     if (msg.kind == EVMC_CALL)
@@ -520,8 +454,6 @@ evmc_tx_context Host::get_tx_context() const noexcept
         intx::be::store<uint256be>(m_block.blob_base_fee.value_or(0)),
         m_tx.blob_hashes.data(),
         m_tx.blob_hashes.size(),
-        m_tx_initcodes.data(),
-        m_tx_initcodes.size(),
     };
 }
 

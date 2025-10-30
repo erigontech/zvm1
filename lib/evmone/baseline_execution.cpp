@@ -4,7 +4,6 @@
 
 #include "baseline.hpp"
 #include "baseline_instruction_table.hpp"
-#include "eof.hpp"
 #include "execution_state.hpp"
 #include "instructions.hpp"
 #include "silkworm/print.hpp"
@@ -134,41 +133,10 @@ struct Position
 }
 
 [[release_inline]] inline code_iterator invoke(
-    code_iterator (*instr_fn)(StackTop, code_iterator) noexcept, Position pos, int64_t& /*gas*/,
-    ExecutionState& /*state*/) noexcept
-{
-    return instr_fn(pos.stack_end, pos.code_it);
-}
-
-[[release_inline]] inline code_iterator invoke(
     TermResult (*instr_fn)(StackTop, int64_t, ExecutionState&) noexcept, Position pos, int64_t& gas,
     ExecutionState& state) noexcept
 {
     const auto result = instr_fn(pos.stack_end, gas, state);
-    gas = result.gas_left;
-    state.status = result.status;
-    return nullptr;
-}
-
-[[release_inline]] inline code_iterator invoke(
-    Result (*instr_fn)(StackTop, int64_t, ExecutionState&, code_iterator&) noexcept, Position pos,
-    int64_t& gas, ExecutionState& state) noexcept
-{
-    const auto result = instr_fn(pos.stack_end, gas, state, pos.code_it);
-    gas = result.gas_left;
-    if (result.status != EVMC_SUCCESS)
-    {
-        state.status = result.status;
-        return nullptr;
-    }
-    return pos.code_it;
-}
-
-[[release_inline]] inline code_iterator invoke(
-    TermResult (*instr_fn)(StackTop, int64_t, ExecutionState&, code_iterator) noexcept,
-    Position pos, int64_t& gas, ExecutionState& state) noexcept
-{
-    const auto result = instr_fn(pos.stack_end, gas, state, pos.code_it);
     gas = result.gas_left;
     state.status = result.status;
     return nullptr;
@@ -328,7 +296,7 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 
-    const auto& cost_table = get_baseline_cost_table(state.rev, analysis.eof_header().version);
+    const auto& cost_table = get_baseline_cost_table(state.rev);
 
     auto* tracer = vm.get_tracer();
     if (INTX_UNLIKELY(tracer != nullptr))
@@ -349,14 +317,9 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     const auto gas_left = (state.status == EVMC_SUCCESS || state.status == EVMC_REVERT) ? gas : 0;
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
 
-//     // assert(state.output_size != 0 || state.output_offset == 0);
-    const auto result =
-        (state.deploy_container.has_value() ?
-                evmc::make_result(state.status, gas_left, gas_refund, state.last_opcode_gas_cost,
-                    state.deploy_container->data(), state.deploy_container->size()) :
-                evmc::make_result(state.status, gas_left, gas_refund, state.last_opcode_gas_cost,
-                    state.output_size != 0 ? &state.memory[state.output_offset] : nullptr,
-                    state.output_size));
+    assert(state.output_size != 0 || state.output_offset == 0);
+    const auto result = evmc::make_result(state.status, gas_left, gas_refund,
+        state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size);
 
     if (INTX_UNLIKELY(tracer != nullptr))
         tracer->notify_execution_end(result);
@@ -369,22 +332,8 @@ evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_co
 {
     auto vm = static_cast<VM*>(c_vm);
     const bytes_view container{code, code_size};
-    const auto eof_enabled = rev >= instr::REV_EOF1;
 
-    // Since EOF validation recurses into subcontainers, it only makes sense to do for top level
-    // message calls. The condition for `msg->kind` inside differentiates between creation tx code
-    // (initcode) and already deployed code (runtime).
-    if (vm->validate_eof && eof_enabled && is_eof_container(container) && msg->depth == 0)
-    {
-        const auto container_kind =
-            (msg->kind == EVMC_EOFCREATE ? ContainerKind::initcode : ContainerKind::runtime);
-        if (validate_eof(rev, container_kind, container) != EOFValidationError::success)
-            return evmc_make_result(
-                EVMC_CONTRACT_VALIDATION_FAILURE, 0, 0, msg->gas_cost, nullptr, 0);
-    }
-
-    const auto code_analysis = analyze(container, false);
-
+    const auto code_analysis = analyze(container);
     return execute(*vm, *host, ctx, rev, *msg, code_analysis);
     // return evmc_result{EVMC_SUCCESS, msg->gas};
 }
