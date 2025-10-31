@@ -5,6 +5,21 @@ Documentation of all notable changes to the **evmone** project.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.18.0] — 2025-10-31
+
+Bye-bye, EOF.
+
+### Removed
+
+- The implementation of the [EVM Object Format version 1](https://eips.ethereum.org/EIPS/eip-7692) (EOFv1)
+  has been completely removed.
+  [#1321](https://github.com/ipsilon/evmone/pull/1321)
+  - implementation of EOF validation and execution,
+  - implementation of DUPN, SWAPN and EXCHANGE instructions,
+  - "initcodes" transaction type,
+  - additional testing tools: eofparse, eoftest and eofparsefuzz,
+  - unit tests, integration tests, benchmarks and test helpers.
+
 ## [0.17.0] — 2025-10-29
 
 This release provides full [Osaka] compatibility by implementing 3 remaining EIPs.
@@ -1104,6 +1119,7 @@ It delivers fully-compatible and high-speed EVM implementation.
 - Exposes [EVMC] 6 ABI.
 - The [intx 0.2.0](https://github.com/chfast/intx/releases/tag/v0.2.0) library is used for 256-bit precision arithmetic. 
 
+[0.18.0]: https://github.com/ethereum/evmone/releases/tag/v0.18.0
 [0.17.0]: https://github.com/ethereum/evmone/releases/tag/v0.17.0
 [0.16.0]: https://github.com/ethereum/evmone/releases/tag/v0.16.0
 [0.15.0]: https://github.com/ethereum/evmone/releases/tag/v0.15.0
