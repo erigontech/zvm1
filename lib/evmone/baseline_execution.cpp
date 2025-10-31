@@ -50,36 +50,37 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     //     !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
     //     "undefined instructions must not be handled by check_requirements()");
 
-        gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
-        if constexpr (!instr::has_const_gas_cost(Op))
-        {
-            gas_cost = cost_table[Op];  // If not, load the cost from the table.
+    auto gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
+    if constexpr (!instr::has_const_gas_cost(Op))
+    {
+        gas_cost = cost_table[Op];  // If not, load the cost from the current revision cost table.
 
-            // Negative cost marks an undefined instruction.
-            // This check must be first to produce correct error code.
+        // Negative cost marks an undefined instruction.
+        // This check must be the first to produce the correct error code.
+        // By definition not possible if defined since the first revision.
+        if constexpr (instr::traits[Op].since != EVMC_FRONTIER)
+        {
             if (INTX_UNLIKELY(gas_cost < 0))
-            {
-                gas_cost = 0;
                 return EVMC_UNDEFINED_INSTRUCTION;
-            }
         }
+    }
 
-        // Check stack requirements first. This is order is not required,
-        // but it is nicer because complete gas check may need to inspect operands.
-        if constexpr (instr::traits[Op].stack_height_change > 0)
-        {
-            // static_assert(instr::traits[Op].stack_height_change == 1,
-            // "unexpected instruction with multiple results");
-            if (INTX_UNLIKELY(stack_top == stack_bottom + StackSpace::limit))
-                return EVMC_STACK_OVERFLOW;
-        }
-        if constexpr (instr::traits[Op].stack_height_required > 0)
-        {
-            // Check stack underflow using pointer comparison <= (better optimization).
-            static constexpr auto min_offset = instr::traits[Op].stack_height_required - 1;
-            if (INTX_UNLIKELY(stack_top <= stack_bottom + min_offset))
-                return EVMC_STACK_UNDERFLOW;
-        }
+    // Check stack requirements first. This order is not required,
+    // but it is nicer because a complete gas check may need to inspect operands.
+    if constexpr (instr::traits[Op].stack_height_change > 0)
+    {
+        static_assert(instr::traits[Op].stack_height_change == 1,
+            "unexpected instruction with multiple results");
+        if (INTX_UNLIKELY(stack_top == stack_bottom + StackSpace::limit))
+            return EVMC_STACK_OVERFLOW;
+    }
+    if constexpr (instr::traits[Op].stack_height_required > 0)
+    {
+        // Check stack underflow using pointer comparison <= (better optimization).
+        static constexpr auto min_offset = instr::traits[Op].stack_height_required - 1;
+        if (INTX_UNLIKELY(stack_top <= stack_bottom + min_offset))
+            return EVMC_STACK_UNDERFLOW;
+    }
 
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
