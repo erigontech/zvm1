@@ -603,9 +603,8 @@ ExecutionResult bls12_g1add_execute(const uint8_t* input, size_t input_size, uin
 ExecutionResult bls12_g1msm_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    if (input_size % BLS12_G1_MUL_INPUT_SIZE != 0)
-        return {EVMC_PRECOMPILE_FAILURE, 0};
-
+    // Checked in `_analyze` function which must be called before.
+    // assert(input_size % BLS12_G1_MUL_INPUT_SIZE == 0);
     // assert(output_size == BLS12_G1_POINT_SIZE);
 
     if (input_size == BLS12_G1_MUL_INPUT_SIZE)
@@ -640,9 +639,8 @@ ExecutionResult bls12_g2add_execute(const uint8_t* input, size_t input_size, uin
 ExecutionResult bls12_g2msm_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    if (input_size % BLS12_G2_MUL_INPUT_SIZE != 0)
-        return {EVMC_PRECOMPILE_FAILURE, 0};
-
+    // Checked in `_analyze` function which must be called before.
+    // assert(input_size % BLS12_G2_MUL_INPUT_SIZE == 0);
     // assert(output_size == BLS12_G2_POINT_SIZE);
 
     if (input_size == BLS12_G2_MUL_INPUT_SIZE)
@@ -663,9 +661,8 @@ ExecutionResult bls12_g2msm_execute(const uint8_t* input, size_t input_size, uin
 ExecutionResult bls12_pairing_check_execute(const uint8_t* input, size_t input_size,
     uint8_t* output, [[maybe_unused]] size_t output_size) noexcept
 {
-    if (input_size % (BLS12_G1_POINT_SIZE + BLS12_G2_POINT_SIZE) != 0)
-        return {EVMC_PRECOMPILE_FAILURE, 0};
-
+    // Checked in `_analyze` function which must be called before.
+    // assert(input_size % (BLS12_G1_POINT_SIZE + BLS12_G2_POINT_SIZE) == 0);
     // assert(output_size == 32);
 
     if (!crypto::bls::pairing_check(output, input, input_size))
