@@ -297,6 +297,9 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
         // TODO: Untested and untestable via precompile call (for secp256k1 and secp256r1).
         return p;
 
+    if (p == q)
+        return dbl(p);
+
     // Use the "add-1998-cmo-2" formula for curve in Jacobian coordinates.
     // The cost is 12M + 4S + 6add + 1*2.
     // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian.html#addition-add-1998-cmo-2
@@ -417,11 +420,9 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         const auto t4 = d + d;
         const auto x3 = f - t4;
         const auto t6 = d - x3;
-        const auto yyyy2 = yyyy + yyyy;
-        const auto yyyy4 = yyyy2 + yyyy2;
-        const auto yyyy8 = yyyy4 + yyyy4;
+        const auto t8 = yyyy + yyyy + yyyy + yyyy + yyyy + yyyy + yyyy + yyyy;
         const auto t9 = e * t6;
-        const auto y3 = t9 - yyyy8;
+        const auto y3 = t9 - t8;
         const auto t10 = y1 * z1;
         const auto z3 = t10 + t10;
         return {x3, y3, z3};
@@ -439,21 +440,18 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         const auto t2 = t0 * t1;
         const auto alpha = t2 + t2 + t2;
         const auto t3 = alpha * alpha;
-        const auto xyy2 = xyy + xyy;
-        const auto xyy4 = xyy2 + xyy2;
-        const auto xyy8 = xyy4 + xyy4;
-        const auto x3 = t3 - xyy8;
+        const auto t4 = xyy + xyy + xyy + xyy + xyy + xyy + xyy + xyy;
+        const auto x3 = t3 - t4;
         const auto t5 = y1 + z1;
         const auto t6 = t5 * t5;
         const auto t7 = t6 - yy;
         const auto z3 = t7 - zz;
-        const auto t9 = xyy4 - x3;
-        const auto yyyy = yy * yy;
-        const auto yyyy2 = yyyy + yyyy;
-        const auto yyyy4 = yyyy2 + yyyy2;
-        const auto yyyy8 = yyyy4 + yyyy4;
+        const auto t8 = xyy + xyy + xyy + xyy;
+        const auto t9 = t8 - x3;
+        const auto t10 = yy * yy;
+        const auto t11 = t10 + t10 + t10 + t10 + t10 + t10 + t10 + t10;
         const auto t12 = alpha * t9;
-        const auto y3 = t12 - yyyy8;
+        const auto y3 = t12 - t11;
         return {x3, y3, z3};
     }
     else
@@ -497,7 +495,7 @@ ProjPoint<Curve> mul(const AffinePoint<Curve>& p, typename Curve::uint_type c) n
     for (auto i = bit_width; i != 0; --i)
     {
         r = ecc::dbl(r);
-        if (test_bit(c, i - 1))
+        if (bit_test(c, i - 1))
             r = ecc::add(r, p);
     }
     return r;

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "block.hpp"
+#include "rlp.hpp"
 #include "transaction.hpp"
 
 namespace evmone::state

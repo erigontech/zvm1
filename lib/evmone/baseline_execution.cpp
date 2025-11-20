@@ -6,8 +6,8 @@
 #include "baseline_instruction_table.hpp"
 #include "execution_state.hpp"
 #include "instructions.hpp"
-#include "zilk_core/print.hpp"
 #include "vm.hpp"
+#include "zilk_core/print.hpp"
 
 #include <memory>
 
@@ -46,9 +46,13 @@ template <Opcode Op>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
     const uint256* stack_top, const uint256* stack_bottom) noexcept
 {
-    // static_assert(
-    //     !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
-    //     "undefined instructions must not be handled by check_requirements()");
+    static_assert(
+        !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
+        "undefined instructions must not be handled by check_requirements()");
+
+    static_assert(
+        !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
+        "undefined instructions must not be handled by check_requirements()");
 
     auto gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
     if constexpr (!instr::has_const_gas_cost(Op))

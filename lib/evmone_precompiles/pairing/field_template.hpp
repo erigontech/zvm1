@@ -5,6 +5,13 @@
 
 #include <array>
 
+
+
+namespace evmmax::bn254
+{
+struct Fq2Config;
+}
+
 namespace evmmax::ecc
 {
 /// Implements extension field over the base field or other extension fields.

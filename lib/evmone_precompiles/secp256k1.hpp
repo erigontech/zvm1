@@ -49,7 +49,8 @@ using AffinePoint = ecc::AffinePoint<Curve>;
 std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept;
 
 /// Calculate y coordinate of a point having x coordinate and y parity.
-std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept;
+std::optional<uint256> calculate_y(
+    const ModArith<uint256>& m, const uint256& x, bool y_parity) noexcept;
 
 /// Convert the secp256k1 point (uncompressed public key) to Ethereum address.
 evmc::address to_address(const AffinePoint& pt) noexcept;

@@ -23,10 +23,9 @@ std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept
     if (!opt_y.has_value())
         return std::nullopt;
 
-    // Negate if different parity requested.
-    const auto& y = *opt_y;
-    const auto candidate_parity = (y.value() & 1) != 0;
-    return (candidate_parity == y_parity) ? y : -y;
+    // Negate if different parity requested
+    const auto candidate_parity = (m.from_mont(*y) & 1) != 0;
+    return (candidate_parity == y_parity) ? *y : m.sub(0, *y);
 }
 
 evmc::address to_address(const AffinePoint& pt) noexcept
@@ -79,9 +78,13 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     if (!y.has_value())
         return std::nullopt;
 
-    // 6. Calculate public key point Q = u1×G + u2×R.
-    const auto R = AffinePoint{r_mont, *y};
-    const auto Q = msm(u1.value(), G, u2.value(), R);
+    // 6. Calculate public key point Q.
+    const auto R = AffinePoint{AffinePoint::FE::wrap(r_mont), AffinePoint::FE::wrap(*y_mont)};
+    // u1 and u2 are less than `Curve::ORDER`, so the multiplications will not reduce.
+    const auto T1 = ecc::mul(G, u1);
+    const auto T2 = ecc::mul(R, u2);
+    assert(T2 != 0);  // Because u2 != 0 and R != 0.
+    const auto pQ = ecc::add(T1, T2);
 
     // The public key mustn't be the point at infinity. This check is cheaper on a non-affine point.
     if (Q == 0) [[unlikely]]

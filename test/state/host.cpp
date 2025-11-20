@@ -5,6 +5,7 @@
 #include "host.hpp"
 #include "precompiles.hpp"
 #include <evmone/constants.hpp>
+#include <evmone/vm.hpp>
 
 namespace evmone::state
 {
@@ -258,8 +259,7 @@ std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
 
 evmc::Result Host::create(const evmc_message& msg) noexcept
 {
-    assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2);
-    //assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE);
+    // assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2);
 
     auto* new_acc = m_state.find(msg.recipient);
     const bool new_acc_exists = new_acc != nullptr;
@@ -301,10 +301,6 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
     const bytes_view code{result.output_data, result.output_size};
 
-    // for EOFCREATE successful result is guaranteed to be non-empty
-    // because container section is not allowed to be empty
-    //assert(msg.kind != EVMC_EOFCREATE || result.status_code != EVMC_SUCCESS || !code.empty());
-
     if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > MAX_CODE_SIZE)
         return evmc::Result{EVMC_FAILURE};
 
@@ -323,23 +319,6 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
         // EIP-3541: Reject new contract code starting with the 0xEF byte.
         if (m_rev >= EVMC_LONDON && code[0] == 0xEF)
             return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-        if (code[0] == 0xEF)
-        {
-            if (m_rev >= EVMC_EXPERIMENTAL)
-            {
-                // Only EOFCREATE/TXCREATE is allowed to deploy code starting with
-                // EF. It must be valid EOF, which was validated before execution.
-                if (msg.kind != EVMC_EOFCREATE)
-                    return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-                //assert(validate_eof(m_rev, ContainerKind::runtime, code) ==
-                    //    EOFValidationError::success);
-            }
-            else if (m_rev >= EVMC_LONDON)
-            {
-                // EIP-3541: Reject EF code.
-                return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-            }
-        }
 
         new_acc->code_hash = keccak256(code);
         new_acc->code = code;

@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "blob_schedule.hpp"
+#include "../state/block.hpp"
+#include "../state/errors.hpp"
+#include "../state/test_state.hpp"
+#include "../state/transaction.hpp"
+#include "../utils/blob_schedule.hpp"
 #include <nlohmann/json.hpp>
 #include <test/state/block.hpp>
 #include <test/state/errors.hpp>
