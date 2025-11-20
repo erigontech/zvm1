@@ -21,7 +21,7 @@ evmc_result execute(AdvancedExecutionState& state, const AdvancedCodeAnalysis& a
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
 
     assert(state.output_size != 0 || state.output_offset == 0);
-    return evmc::make_result(state.status, gas_left, gas_refund,
+    return evmc::make_result(state.status, gas_left, gas_refund, state.gas_cost,
         state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size);
 }
 

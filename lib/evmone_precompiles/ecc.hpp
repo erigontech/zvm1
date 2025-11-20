@@ -420,6 +420,35 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
     }
 }
 
+        const auto zz = z1 * z1;
+        const auto yy = y1 * y1;
+        const auto xyy = x1 * yy;
+        const auto t0 = x1 - zz;
+        const auto t1 = x1 + zz;
+        const auto t2 = t0 * t1;
+        const auto alpha = t2 + t2 + t2;
+        const auto t3 = alpha * alpha;
+        const auto t4 = xyy + xyy + xyy + xyy + xyy + xyy + xyy + xyy;
+        const auto x3 = t3 - t4;
+        const auto t5 = y1 + z1;
+        const auto t6 = t5 * t5;
+        const auto t7 = t6 - yy;
+        const auto z3 = t7 - zz;
+        const auto t8 = xyy + xyy + xyy + xyy;
+        const auto t9 = t8 - x3;
+        const auto t10 = yy * yy;
+        const auto t11 = t10 + t10 + t10 + t10 + t10 + t10 + t10 + t10;
+        const auto t12 = alpha * t9;
+        const auto y3 = t12 - t11;
+        return {x3, y3, z3};
+    }
+    else
+    {
+        // TODO(c++23): Use fake always-false condition for older compilers.
+        static_assert(Curve::A == 0, "unsupported Curve::A value");
+    }
+}
+
 template <typename Curve>
 ProjPoint<Curve> mul(const AffinePoint<Curve>& p, typename Curve::uint_type c) noexcept
 {

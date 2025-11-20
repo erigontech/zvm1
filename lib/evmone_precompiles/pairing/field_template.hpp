@@ -5,6 +5,11 @@
 
 #include <array>
 
+namespace evmmax::bn254
+{
+struct Fq2Config;
+}
+
 namespace evmmax::ecc
 {
 /// Implements computations over base field defined by prime number.

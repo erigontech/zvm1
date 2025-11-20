@@ -5,6 +5,7 @@
 #include "host.hpp"
 #include "precompiles.hpp"
 #include <evmone/constants.hpp>
+#include <evmone/vm.hpp>
 
 namespace evmone::state
 {
@@ -258,7 +259,7 @@ std::optional<evmc_message> Host::prepare_message(evmc_message msg) noexcept
 
 evmc::Result Host::create(const evmc_message& msg) noexcept
 {
-    //assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2 || msg.kind == EVMC_EOFCREATE);
+    assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2);
 
     auto* new_acc = m_state.find(msg.recipient);
     const bool new_acc_exists = new_acc != nullptr;
@@ -299,10 +300,6 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     //assert(gas_left >= 0);
 
     const bytes_view code{result.output_data, result.output_size};
-
-    // for EOFCREATE successful result is guaranteed to be non-empty
-    // because container section is not allowed to be empty
-    //assert(msg.kind != EVMC_EOFCREATE || result.status_code != EVMC_SUCCESS || !code.empty());
 
     if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > MAX_CODE_SIZE)
         return evmc::Result{EVMC_FAILURE};

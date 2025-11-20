@@ -8,7 +8,6 @@
 
 constexpr int64_t CALL_VALUE_COST = 9000;
 constexpr int64_t ACCOUNT_CREATION_COST = 25000;
-constexpr int64_t CALL_STIPEND = 2300;
 
 namespace evmone::instr::core
 {
@@ -65,8 +64,8 @@ consteval evmc_call_kind to_call_kind(Opcode op) noexcept
 template <Opcode Op>
 Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
-    // static_assert(
-        // Op == OP_CALL || Op == OP_CALLCODE || Op == OP_DELEGATECALL || Op == OP_STATICCALL);
+    static_assert(
+        Op == OP_CALL || Op == OP_CALLCODE || Op == OP_DELEGATECALL || Op == OP_STATICCALL);
 
     static constexpr bool HAS_VALUE_ARG = Op == OP_CALL || Op == OP_CALLCODE;
 
@@ -79,68 +78,51 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     const auto output_offset_u256 = stack.pop();
     const auto output_size_u256 = stack.pop();
 
-        stack.push(0);  // Assume failure.
-        state.return_data.clear();
+    stack.push(0);  // Assume failure.
+    state.return_data.clear();
 
-        auto& gas_cost = state.last_opcode_gas_cost;
-        if (state.rev >= EVMC_BERLIN && state.host.access_account(dst) == EVMC_ACCESS_COLD)
-        {
-            gas_cost += instr::additional_cold_account_access_cost;
-            if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
-                return {EVMC_OUT_OF_GAS, gas_left};
-        }
-
-        const auto target_addr_or_result = get_target_address(dst, gas_left, state);
-        if (const auto* result = std::get_if<Result>(&target_addr_or_result))
-            return *result;
-
-        const auto& code_addr = std::get<evmc::address>(target_addr_or_result);
-
-        if (!check_memory(gas_left, gas_cost, state.memory, input_offset_u256, input_size_u256))
+    if (state.rev >= EVMC_BERLIN && state.host.access_account(dst) == EVMC_ACCESS_COLD)
+    {
+        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
+    }
 
-        if (!check_memory(gas_left, gas_cost, state.memory, output_offset_u256, output_size_u256))
-            return {EVMC_OUT_OF_GAS, gas_left};
+    const auto target_addr_or_result = get_target_address(dst, gas_left, state);
+    if (const auto* result = std::get_if<Result>(&target_addr_or_result))
+        return *result;
 
-        const auto input_offset = static_cast<size_t>(input_offset_u256);
-        const auto input_size = static_cast<size_t>(input_size_u256);
-        const auto output_offset = static_cast<size_t>(output_offset_u256);
-        const auto output_size = static_cast<size_t>(output_size_u256);
+    const auto& code_addr = std::get<evmc::address>(target_addr_or_result);
 
-        evmc_message msg{.kind = to_call_kind(Op)};
-        msg.flags = (Op == OP_STATICCALL) ? uint32_t{EVMC_STATIC} : state.msg->flags;
-        if (dst != code_addr)
-            msg.flags |= EVMC_DELEGATED;
-        else
-            msg.flags &= ~std::underlying_type_t<evmc_flags>{EVMC_DELEGATED};
-        msg.depth = state.msg->depth + 1;
-        msg.recipient = (Op == OP_CALL || Op == OP_STATICCALL) ? dst : state.msg->recipient;
-        msg.code_address = code_addr;
-        msg.sender = (Op == OP_DELEGATECALL) ? state.msg->sender : state.msg->recipient;
-        msg.value =
-            (Op == OP_DELEGATECALL) ? state.msg->value : intx::be::store<evmc::uint256be>(value);
+    if (!check_memory(gas_left, state.memory, input_offset_u256, input_size_u256))
+        return {EVMC_OUT_OF_GAS, gas_left};
 
-        if (input_size > 0)
-        {
-            // input_offset may be garbage if input_size == 0.
-            msg.input_data = &state.memory[input_offset];
-            msg.input_size = input_size;
-        }
+    if (!check_memory(gas_left, state.memory, output_offset_u256, output_size_u256))
+        return {EVMC_OUT_OF_GAS, gas_left};
 
-        auto cost = has_value ? CALL_VALUE_COST : 0;
+    const auto input_offset = static_cast<size_t>(input_offset_u256);
+    const auto input_size = static_cast<size_t>(input_size_u256);
+    const auto output_offset = static_cast<size_t>(output_offset_u256);
+    const auto output_size = static_cast<size_t>(output_size_u256);
 
-        if constexpr (Op == OP_CALL)
-        {
-            if (has_value && state.in_static_mode())
-                return {EVMC_STATIC_MODE_VIOLATION, gas_left};
+    evmc_message msg{.kind = to_call_kind(Op)};
+    msg.flags = (Op == OP_STATICCALL) ? uint32_t{EVMC_STATIC} : state.msg->flags;
+    if (dst != code_addr)
+        msg.flags |= EVMC_DELEGATED;
+    else
+        msg.flags &= ~std::underlying_type_t<evmc_flags>{EVMC_DELEGATED};
+    msg.depth = state.msg->depth + 1;
+    msg.recipient = (Op == OP_CALL || Op == OP_STATICCALL) ? dst : state.msg->recipient;
+    msg.code_address = code_addr;
+    msg.sender = (Op == OP_DELEGATECALL) ? state.msg->sender : state.msg->recipient;
+    msg.value =
+        (Op == OP_DELEGATECALL) ? state.msg->value : intx::be::store<evmc::uint256be>(value);
 
-            if ((has_value || state.rev < EVMC_SPURIOUS_DRAGON) && !state.host.account_exists(dst))
-                cost += ACCOUNT_CREATION_COST;
-        }
-        msg.gas = std::numeric_limits<int64_t>::max();
-        bool gas_on_stack = false;
-        if ((gas_on_stack = gas < msg.gas))
-            msg.gas = static_cast<int64_t>(gas);
+    if (input_size > 0)
+    {
+        // input_offset may be garbage if input_size == 0.
+        msg.input_data = &state.memory[input_offset];
+        msg.input_size = input_size;
+    }
 
     if constexpr (HAS_VALUE_ARG)
     {
@@ -186,8 +168,8 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         }
     }
 
-        if (const auto copy_size = std::min(output_size, result.output_size); copy_size > 0)
-            std::memcpy(&state.memory[output_offset], result.output_data, copy_size);
+    if (state.msg->depth >= 1024)
+        return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
     const auto result = state.host.call(msg);
     state.return_data.assign(result.output_data, result.output_size);
@@ -214,7 +196,7 @@ template Result call_impl<OP_CALLCODE>(
 template <Opcode Op>
 Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
-    // static_assert(Op == OP_CREATE || Op == OP_CREATE2);
+    static_assert(Op == OP_CREATE || Op == OP_CREATE2);
 
     if (state.in_static_mode())
         return {EVMC_STATIC_MODE_VIOLATION, gas_left};
@@ -227,8 +209,7 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     stack.push(0);  // Assume failure.
     state.return_data.clear();
 
-    if (!check_memory(gas_left, state.last_opcode_gas_cost, state.memory, init_code_offset_u256,
-            init_code_size_u256))
+    if (!check_memory(gas_left, state.memory, init_code_offset_u256, init_code_size_u256))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto init_code_offset = static_cast<size_t>(init_code_offset_u256);
@@ -239,8 +220,6 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
 
     const auto init_code_word_cost = 6 * (Op == OP_CREATE2) + 2 * (state.rev >= EVMC_SHANGHAI);
     const auto init_code_cost = num_words(init_code_size) * init_code_word_cost;
-    state.last_opcode_gas_cost += init_code_cost;
-
     if ((gas_left -= init_code_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
@@ -266,7 +245,6 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     msg.depth = state.msg->depth + 1;
     msg.create2_salt = intx::be::store<evmc::bytes32>(salt);
     msg.value = intx::be::store<evmc::uint256be>(endowment);
-    msg.gas_cost = state.last_opcode_gas_cost;
 
     const auto result = state.host.call(msg);
     gas_left -= msg.gas - result.gas_left;

@@ -77,5 +77,5 @@ TEST_F(state_transition, eip7516_blob_base_fee)
     tx.to = To;
     pre[*tx.to] = {.code = sstore(0x4a, OP_BLOBBASEFEE)};
 
-        expect.post[To].storage[0x4a_bytes32] = bytes32(price);
+    expect.post[To].storage[0x4a_bytes32] = bytes32(price);
 }

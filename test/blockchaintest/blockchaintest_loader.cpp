@@ -164,6 +164,7 @@ BlockchainTest load_blockchain_test_case(const std::string& name, const json::js
 
             auto test_block = load_test_block(el.at("rlp_decoded"), bt.network, bt.blob_schedule);
             test_block.valid = false;
+            test_block.rlp_size = from_json<bytes>(el.at("rlp")).size();
             bt.test_blocks.emplace_back(test_block);
         }
         else

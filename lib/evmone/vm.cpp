@@ -137,11 +137,7 @@ std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revis
     if (p == nullptr)
     {
         const auto code = get_code(msg.code_address);
-
-        if (is_eof_container(code))
-            return {};  // EOF not supported because CodeAnalysis don't have a copy of the code.
-
-        p = std::make_shared<baseline::CodeAnalysis>(baseline::analyze(code, rev >= EVMC_PRAGUE));
+        p = std::make_shared<baseline::CodeAnalysis>(baseline::analyze(code));
         m_code_cache.put(code_hash, p);
     }
 

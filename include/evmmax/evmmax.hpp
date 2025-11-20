@@ -24,6 +24,22 @@ constexpr uint64_t compute_mod_inv(uint64_t mod0) noexcept
     return result;
 }
 
+/// Compute the modulus inverse for Montgomery multiplication, i.e. N': mod⋅N' = 2⁶⁴-1.
+///
+/// @param mod0  The least significant word of the modulus.
+constexpr uint64_t compute_mod_inv(uint64_t mod0) noexcept
+{
+    // TODO: Find what is this algorithm and why it works.
+    uint64_t base = 0 - mod0;
+    uint64_t result = 1;
+    for (auto i = 0; i < 64; ++i)
+    {
+        result *= base;
+        base *= base;
+    }
+    return result;
+}
+
 /// The modular arithmetic operations for EVMMAX (EVM Modular Arithmetic Extensions).
 template <typename UintT>
 class ModArith
@@ -82,11 +98,13 @@ public:
         if constexpr (!BN)
             assert(mod != 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47_u256);
 
+#ifdef SP1
         if constexpr (BN)
         {
             if (!std::is_constant_evaluated())
                 std::puts("m");
         }
+#endif
 
         // Coarsely Integrated Operand Scanning (CIOS) Method
         // Based on 2.3.2 from
@@ -129,11 +147,13 @@ public:
         if constexpr (!BN)
             assert(mod != 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47_u256);
 
+#ifdef SP1
         if constexpr (BN)
         {
             if (!std::is_constant_evaluated())
                 std::puts("a");
         }
+#endif
 
         const auto s = addc(x, y);  // TODO: cannot overflow if modulus is sparse (e.g. 255 bits).
         const auto d = subc(s.value, mod);
@@ -147,11 +167,13 @@ public:
         if constexpr (!BN)
             assert(mod != 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47_u256);
 
+#ifdef SP1
         if constexpr (BN)
         {
             if (!std::is_constant_evaluated())
                 std::puts("s");
         }
+#endif
 
         const auto d = subc(x, y);
         const auto s = d.value + mod;
