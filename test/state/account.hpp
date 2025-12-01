@@ -6,7 +6,7 @@
 #include <evmc/evmc.hpp>
 #include <intx/intx.hpp>
 
-#include <silkworm/core/common/hash_maps.hpp>
+#include <zilk_core/core/common/hash_maps.hpp>
 
 namespace evmone::state
 {
