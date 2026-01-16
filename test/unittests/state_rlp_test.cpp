@@ -4,9 +4,9 @@
 
 #include <gmock/gmock.h>
 #include <test/state/hash_utils.hpp>
-#include <test/state/mpt_hash.hpp>
-#include <test/state/rlp.hpp>
-#include <test/state/state.hpp>
+#include <test/utils/mpt_hash.hpp>
+#include <test/utils/rlp.hpp>
+#include <test/utils/rlp_encode.hpp>
 #include <test/utils/utils.hpp>
 #include <bit>
 
@@ -63,12 +63,6 @@ TEST(state_rlp, encode_string_long)
     const auto r4 = rlp::encode({buffer.get(), 0xffffff});
     EXPECT_EQ(r4.size(), 0xffffff + 4);
     EXPECT_EQ(hex({r4.data(), 10}), "baffffff000000000000");
-}
-
-TEST(state_rlp, encode_c_array)
-{
-    const uint64_t a[]{1, 2, 3};
-    EXPECT_EQ(hex(rlp::encode(a)), "c3010203");
 }
 
 TEST(state_rlp, encode_vector)

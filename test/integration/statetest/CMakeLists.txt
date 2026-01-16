@@ -7,7 +7,6 @@
 set(PREFIX ${PREFIX}/statetest)
 set(TESTS1 ${CMAKE_CURRENT_SOURCE_DIR}/tests1)
 set(TESTS2 ${CMAKE_CURRENT_SOURCE_DIR}/tests2)
-set(TESTS_EOF ${CMAKE_CURRENT_SOURCE_DIR}/eof)
 set(TESTS_TX ${CMAKE_CURRENT_SOURCE_DIR}/tx)
 set(TESTS_FILTER ${CMAKE_CURRENT_SOURCE_DIR}/filter)
 
@@ -42,7 +41,7 @@ add_test(
 set_tests_properties(
     ${PREFIX}/single_file_list PROPERTIES
     PASS_REGULAR_EXPRESSION [[
-.*test/integration/statetest/tests1/SuiteA\.
+.*test/integration/statetest/tests1/SuiteA/test1\.json\.
   test1
 ]]
 )
@@ -60,8 +59,6 @@ SuiteA\.
   test1
   test2_multi
   test1
-.*test/integration/statetest/tests1/B\.
-  T
 \.
   test1
   test2_multi
@@ -108,15 +105,6 @@ string(REPLACE "]" "\\]" EXPECTED_TRACE ${EXPECTED_TRACE})
 set_tests_properties(
     ${PREFIX}/trace PROPERTIES
     PASS_REGULAR_EXPRESSION ${EXPECTED_TRACE}
-)
-
-add_test(
-    NAME ${PREFIX}/invalid_eof_in_state
-    COMMAND evmone-statetest ${TESTS_EOF}/invalid_eof_in_state.json
-)
-set_tests_properties(
-    ${PREFIX}/invalid_eof_in_state PROPERTIES
-    PASS_REGULAR_EXPRESSION "EOF container at 0x0000000000000000000000000000000000bade0f is invalid"
 )
 
 add_test(

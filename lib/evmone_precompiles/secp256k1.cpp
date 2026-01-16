@@ -8,31 +8,25 @@ namespace evmmax::secp256k1
 {
 namespace
 {
-constexpr auto B = Curve::Fp.to_mont(7);
+constexpr auto B = Curve::Fp{7};
 
 constexpr AffinePoint G{0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256,
     0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8_u256};
 }  // namespace
 
 // FIXME: Change to "uncompress_point".
-std::optional<uint256> calculate_y(
-    const ModArith<uint256>& m, const uint256& x, bool y_parity) noexcept
+std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept
 {
-    // Calculate sqrt(x^3 + 7)
-    const auto x3 = m.mul(m.mul(x, x), x);
-    const auto y = field_sqrt(m, m.add(x3, B));
-    if (!y.has_value())
+    // Calculate y = √(x³ + 7).
+    const auto xxx = x * x * x;
+    const auto opt_y = field_sqrt(xxx + B);
+    if (!opt_y.has_value())
         return std::nullopt;
 
-    // Negate if different parity requested
-    const auto candidate_parity = (m.from_mont(*y) & 1) != 0;
-    return (candidate_parity == y_parity) ? *y : m.sub(0, *y);
-}
-
-AffinePoint mul(const AffinePoint& p, const uint256& c) noexcept
-{
-    const auto r = ecc::mul(p, c);
-    return ecc::to_affine<Curve>(r);
+    // Negate if different parity requested.
+    const auto& y = *opt_y;
+    const auto candidate_parity = (y.value() & 1) != 0;
+    return (candidate_parity == y_parity) ? y : -y;
 }
 
 evmc::address to_address(const AffinePoint& pt) noexcept
@@ -48,74 +42,67 @@ evmc::address to_address(const AffinePoint& pt) noexcept
     return ret;
 }
 
-std::optional<AffinePoint> secp256k1_ecdsa_recover(
-    const ethash::hash256& e, const uint256& r, const uint256& s, bool v) noexcept
+std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> hash,
+    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
+    bool parity) noexcept
 {
-    // Follows
+    // Follows "Elliptic Curve Digital Signature Algorithm - Public key recovery"
     // https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm#Public_key_recovery
 
     // 1. Validate r and s are within [1, n-1].
-    if (r == 0 || r >= Curve::ORDER || s == 0 || s >= Curve::ORDER)
+    const auto opt_r = Curve::Fr::from_bytes(r_bytes);
+    if (!opt_r.has_value() || *opt_r == 0) [[unlikely]]
         return std::nullopt;
+
+    const auto opt_s = Curve::Fr::from_bytes(s_bytes);
+    if (!opt_s.has_value() || *opt_s == 0) [[unlikely]]
+        return std::nullopt;
+
+    const auto& r = *opt_r;
+    const auto& s = *opt_s;
 
     // 3. Hash of the message is already calculated in e.
     // 4. Convert hash e to z field element by doing z = e % n.
     //    https://www.rfc-editor.org/rfc/rfc6979#section-2.3.2
-    //    We can do this by n - e because n > 2^255.
-    static_assert(Curve::ORDER > 1_u256 << 255);
-    auto z = intx::be::load<uint256>(e.bytes);
-    if (z >= Curve::ORDER)
-        z -= Curve::ORDER;
-
-    const ModArith n{Curve::ORDER};
+    //    Converting to Montgomery form performs the e % n reduction.
+    const auto z = Curve::Fr{intx::be::unsafe::load<uint256>(hash.data())};
 
     // 5. Calculate u1 and u2.
-    const auto r_n = n.to_mont(r);
-    const auto r_inv = n.inv(r_n);
-
-    const auto z_mont = n.to_mont(z);
-    const auto z_neg = n.sub(0, z_mont);
-    const auto u1_mont = n.mul(z_neg, r_inv);
-    const auto u1 = n.from_mont(u1_mont);
-
-    const auto s_mont = n.to_mont(s);
-    const auto u2_mont = n.mul(s_mont, r_inv);
-    const auto u2 = n.from_mont(u2_mont);
+    const auto r_inv = 1 / r;
+    const auto u1 = -z * r_inv;
+    const auto u2 = s * r_inv;
     assert(u2 != 0);  // Because s != 0 and r_inv != 0.
 
     // 2. Calculate y coordinate of R from r and v.
-    static constexpr auto& Fp = Curve::Fp;
-    const auto r_mont = Fp.to_mont(r);
-    const auto y_mont = calculate_y(Fp, r_mont, v);
-    if (!y_mont.has_value())
+    const auto r_mont = Curve::Fp{r.value()};
+    const auto y = calculate_y(r_mont, parity);
+    if (!y.has_value())
         return std::nullopt;
 
-    // 6. Calculate public key point Q.
-    const auto R = AffinePoint{AffinePoint::FE::wrap(r_mont), AffinePoint::FE::wrap(*y_mont)};
-    const auto T1 = ecc::mul(G, u1);
-    const auto T2 = ecc::mul(R, u2);
-    assert(T2 != 0);  // Because u2 != 0 and R != 0.
-    const auto pQ = ecc::add(T1, T2);
+    // 6. Calculate public key point Q = u1×G + u2×R.
+    const auto R = AffinePoint{r_mont, *y};
+    const auto Q = msm(u1.value(), G, u2.value(), R);
 
-    const auto Q = ecc::to_affine<Curve>(pQ);
-
-    if (Q == 0)
+    // The public key mustn't be the point at infinity. This check is cheaper on a non-affine point.
+    if (Q == 0) [[unlikely]]
         return std::nullopt;
 
-    return Q;
+    return to_affine(Q);
 }
 
-std::optional<evmc::address> ecrecover(
-    const ethash::hash256& e, const uint256& r, const uint256& s, bool v) noexcept
+std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
+    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
+    bool parity) noexcept
 {
-    const auto point = secp256k1_ecdsa_recover(e, r, s, v);
-    if (!point.has_value())
+    // TODO(C++23): use std::optional::and_then.
+    const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity);
+    if (!pubkey.has_value())
         return std::nullopt;
 
-    return to_address(*point);
+    return to_address(*pubkey);
 }
 
-std::optional<uint256> field_sqrt(const ModArith<uint256>& m, const uint256& x) noexcept
+std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
 {
     // Computes modular exponentiation
     // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
@@ -146,115 +133,115 @@ std::optional<uint256> field_sqrt(const ModArith<uint256>& m, const uint256& x) 
     // return     ((x223 << 23 + x22) << 6 + _11) << 2
 
     // Allocate Temporaries.
-    uint256 z;
-    uint256 t0;
-    uint256 t1;
-    uint256 t2;
-    uint256 t3;
+    Curve::Fp z;
+    Curve::Fp t0;
+    Curve::Fp t1;
+    Curve::Fp t2;
+    Curve::Fp t3;
 
 
     // Step 1: z = x^0x2
-    z = m.mul(x, x);
+    z = x * x;
 
     // Step 2: z = x^0x3
-    z = m.mul(x, z);
+    z = x * z;
 
     // Step 4: t0 = x^0xc
-    t0 = m.mul(z, z);
+    t0 = z * z;
     for (int i = 1; i < 2; ++i)
-        t0 = m.mul(t0, t0);
+        t0 = t0 * t0;
 
     // Step 5: t0 = x^0xf
-    t0 = m.mul(z, t0);
+    t0 = z * t0;
 
     // Step 6: t1 = x^0x1e
-    t1 = m.mul(t0, t0);
+    t1 = t0 * t0;
 
     // Step 7: t2 = x^0x1f
-    t2 = m.mul(x, t1);
+    t2 = x * t1;
 
     // Step 9: t1 = x^0x7c
-    t1 = m.mul(t2, t2);
+    t1 = t2 * t2;
     for (int i = 1; i < 2; ++i)
-        t1 = m.mul(t1, t1);
+        t1 = t1 * t1;
 
     // Step 10: t1 = x^0x7f
-    t1 = m.mul(z, t1);
+    t1 = z * t1;
 
     // Step 14: t3 = x^0x7f0
-    t3 = m.mul(t1, t1);
+    t3 = t1 * t1;
     for (int i = 1; i < 4; ++i)
-        t3 = m.mul(t3, t3);
+        t3 = t3 * t3;
 
     // Step 15: t0 = x^0x7ff
-    t0 = m.mul(t0, t3);
+    t0 = t0 * t3;
 
     // Step 26: t3 = x^0x3ff800
-    t3 = m.mul(t0, t0);
+    t3 = t0 * t0;
     for (int i = 1; i < 11; ++i)
-        t3 = m.mul(t3, t3);
+        t3 = t3 * t3;
 
     // Step 27: t0 = x^0x3fffff
-    t0 = m.mul(t0, t3);
+    t0 = t0 * t3;
 
     // Step 32: t3 = x^0x7ffffe0
-    t3 = m.mul(t0, t0);
+    t3 = t0 * t0;
     for (int i = 1; i < 5; ++i)
-        t3 = m.mul(t3, t3);
+        t3 = t3 * t3;
 
     // Step 33: t2 = x^0x7ffffff
-    t2 = m.mul(t2, t3);
+    t2 = t2 * t3;
 
     // Step 60: t3 = x^0x3ffffff8000000
-    t3 = m.mul(t2, t2);
+    t3 = t2 * t2;
     for (int i = 1; i < 27; ++i)
-        t3 = m.mul(t3, t3);
+        t3 = t3 * t3;
 
     // Step 61: t2 = x^0x3fffffffffffff
-    t2 = m.mul(t2, t3);
+    t2 = t2 * t3;
 
     // Step 115: t3 = x^0xfffffffffffffc0000000000000
-    t3 = m.mul(t2, t2);
+    t3 = t2 * t2;
     for (int i = 1; i < 54; ++i)
-        t3 = m.mul(t3, t3);
+        t3 = t3 * t3;
 
     // Step 116: t2 = x^0xfffffffffffffffffffffffffff
-    t2 = m.mul(t2, t3);
+    t2 = t2 * t3;
 
     // Step 224: t3 = x^0xfffffffffffffffffffffffffff000000000000000000000000000
-    t3 = m.mul(t2, t2);
+    t3 = t2 * t2;
     for (int i = 1; i < 108; ++i)
-        t3 = m.mul(t3, t3);
+        t3 = t3 * t3;
 
     // Step 225: t2 = x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    t2 = m.mul(t2, t3);
+    t2 = t2 * t3;
 
     // Step 232: t2 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffff80
     for (int i = 0; i < 7; ++i)
-        t2 = m.mul(t2, t2);
+        t2 = t2 * t2;
 
     // Step 233: t1 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    t1 = m.mul(t1, t2);
+    t1 = t1 * t2;
 
     // Step 256: t1 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffff800000
     for (int i = 0; i < 23; ++i)
-        t1 = m.mul(t1, t1);
+        t1 = t1 * t1;
 
     // Step 257: t0 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
-    t0 = m.mul(t0, t1);
+    t0 = t0 * t1;
 
     // Step 263: t0 = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc0
     for (int i = 0; i < 6; ++i)
-        t0 = m.mul(t0, t0);
+        t0 = t0 * t0;
 
     // Step 264: z = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
-    z = m.mul(z, t0);
+    z = z * t0;
 
     // Step 266: z = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
     for (int i = 0; i < 2; ++i)
-        z = m.mul(z, z);
+        z = z * z;
 
-    if (m.mul(z, z) != x)
+    if (z * z != x)
         return std::nullopt;  // Computed value is not the square root.
 
     return z;

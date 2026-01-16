@@ -5,7 +5,8 @@
 #include <gtest/gtest.h>
 #include <test/state/errors.hpp>
 #include <test/state/state.hpp>
-#include <test/state/test_state.hpp>
+#include <test/utils/blob_schedule.hpp>
+#include <test/utils/test_state.hpp>
 #include <test/utils/utils.hpp>
 
 using namespace evmc::literals;
@@ -87,7 +88,8 @@ TEST(state_tx, validate_blob_tx)
     };
     const TestState state{{tx.sender, {.balance = 1'000'000}}};
 
-    const auto blob_gas_limit = static_cast<int64_t>(max_blob_gas_per_block(EVMC_CANCUN));
+    const auto blob_gas_limit =
+        static_cast<int64_t>(max_blob_gas_per_block(get_blob_params(EVMC_CANCUN)));
     EXPECT_EQ(std::get<std::error_code>(validate_transaction(
                   state, block, tx, EVMC_SHANGHAI, block.gas_limit, blob_gas_limit)),
         make_error_code(ErrorCode::TX_TYPE_NOT_SUPPORTED));
@@ -214,7 +216,8 @@ TEST(state_tx, max_blob_count)
         .to = 0x01_address,
     };
     const TestState state{{tx.sender, {.balance = 1'000'000}}};
-    const auto blob_gas_limit = static_cast<int64_t>(max_blob_gas_per_block(EVMC_CANCUN));
+    const auto blob_gas_limit =
+        static_cast<int64_t>(max_blob_gas_per_block(get_blob_params(EVMC_CANCUN)));
 
     // Add MAX_TX_BLOB_COUNT blobs
     for (size_t i = 0; i < MAX_TX_BLOB_COUNT; ++i)

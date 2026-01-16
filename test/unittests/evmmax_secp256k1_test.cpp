@@ -10,11 +10,22 @@ using namespace evmmax::secp256k1;
 using namespace evmc::literals;
 using namespace evmone::test;
 
+namespace
+{
+/// Scalar multiplication in secp256k1.
+///
+/// Computes [c]P for a point in affine coordinate on the secp256k1 curve.
+/// Convenience wrapper for point multiplication test.
+AffinePoint mul(const AffinePoint& p, const uint256& c) noexcept
+{
+    const auto r = evmmax::ecc::mul(p, c);
+    return evmmax::ecc::to_affine<Curve>(r);
+}
+}  // namespace
+
 TEST(secp256k1, field_sqrt)
 {
-    const auto& m = Curve::Fp;
-
-    for (const auto& t : std::array{
+    for (const auto& t : {
              1_u256,
              0x6e140df17432311190232a91a38daed3ee9ed7f038645dd0278da7ca6e497de_u256,
              0xf3b9accc43dc8919ba3b4f1e14c8f7c72e7c4c013a404e9fd35e9c9a5b7b228_u256,
@@ -30,21 +41,18 @@ TEST(secp256k1, field_sqrt)
              Curve::FIELD_PRIME - 1,
          })
     {
-        const auto a = m.to_mont(t);
-        const auto a2 = m.mul(a, a);
-        const auto a2_sqrt = field_sqrt(m, a2);
+        const auto a = Curve::Fp{t};
+        const auto a2_sqrt = field_sqrt(a * a);
         ASSERT_TRUE(a2_sqrt.has_value()) << to_string(t);
-        EXPECT_TRUE(a2_sqrt == a || a2_sqrt == m.sub(0, a)) << to_string(t);
+        EXPECT_TRUE(a2_sqrt == a || a2_sqrt == -a) << to_string(t);
     }
 }
 
 TEST(secp256k1, field_sqrt_invalid)
 {
-    const auto& m = Curve::Fp;
-
-    for (const auto& t : std::array{3_u256, Curve::FIELD_PRIME - 1})
+    for (const auto& t : {3_u256, Curve::FIELD_PRIME - 1})
     {
-        EXPECT_FALSE(field_sqrt(m, m.to_mont(t)).has_value());
+        EXPECT_FALSE(field_sqrt(Curve::Fp{t}).has_value());
     }
 }
 
@@ -52,7 +60,7 @@ TEST(secp256k1, scalar_inv)
 {
     const evmmax::ModArith n{Curve::ORDER};
 
-    for (const auto& t : std::array{
+    for (const auto& t : {
              1_u256,
              0x6e140df17432311190232a91a38daed3ee9ed7f038645dd0278da7ca6e497de_u256,
              Curve::ORDER - 1,
@@ -68,8 +76,6 @@ TEST(secp256k1, scalar_inv)
 
 TEST(secp256k1, calculate_y)
 {
-    const auto& m = Curve::Fp;
-
     struct TestCase
     {
         uint256 x;
@@ -97,33 +103,31 @@ TEST(secp256k1, calculate_y)
 
     for (const auto& t : test_cases)
     {
-        const auto x = m.to_mont(t.x);
+        const auto x = Curve::Fp{t.x};
 
-        const auto y_even = calculate_y(m, x, false);
+        const auto y_even = calculate_y(x, false);
         ASSERT_TRUE(y_even.has_value());
-        EXPECT_EQ(m.from_mont(*y_even), t.y_even);
+        EXPECT_EQ(y_even->value(), t.y_even);
 
-        const auto y_odd = calculate_y(m, x, true);
+        const auto y_odd = calculate_y(x, true);
         ASSERT_TRUE(y_odd.has_value());
-        EXPECT_EQ(m.from_mont(*y_odd), t.y_odd);
+        EXPECT_EQ(y_odd->value(), t.y_odd);
     }
 }
 
 TEST(secp256k1, calculate_y_invalid)
 {
-    const auto& m = Curve::Fp;
-
-    for (const auto& t : std::array{
+    for (const auto& t : {
              0x207ea538f1835f6de40c793fc23d22b14da5a80015a0fecddf56f146b21d7949_u256,
              Curve::FIELD_PRIME - 1,
          })
     {
-        const auto x = m.to_mont(t);
+        const auto x = Curve::Fp{t};
 
-        const auto y_even = calculate_y(m, x, false);
+        const auto y_even = calculate_y(x, false);
         ASSERT_FALSE(y_even.has_value());
 
-        const auto y_odd = calculate_y(m, x, true);
+        const auto y_odd = calculate_y(x, true);
         ASSERT_FALSE(y_odd.has_value());
     }
 }
@@ -134,39 +138,6 @@ TEST(secp256k1, point_to_address)
     // https://www.google.com/search?q=0x3f17f1962B36e491b30A40b2405849e597Ba5FB5
     // https://etherscan.io/address/0x3f17f1962b36e491b30a40b2405849e597ba5fb5
     EXPECT_EQ(to_address({}), 0x3f17f1962B36e491b30A40b2405849e597Ba5FB5_address);
-}
-
-TEST(evmmax, secp256k1_calculate_u1)
-{
-    // u1 = -zr^(-1)
-    const auto z = 0x31d6fb860f6d12cee6e5b640646089bd5883d586e43de3dedc75695c11ac2da9_u256;
-    const auto r = 0x71cd6bfc24665312ff489aba9279710a560eda74aca333bf298785dc3cd72f6e_u256;
-    const auto expected = 0xd80ea4db5200c96e969270ab7c105e16abb9fc18a6e01cc99575dd3f5ce41eed_u256;
-
-    const auto& m = Curve::Fp;
-    const auto z_mont = m.to_mont(z);
-    const auto r_mont = m.to_mont(r);
-    const auto r_inv = m.inv(r_mont);
-    const auto z_neg = m.sub(0, z_mont);
-    const auto u1_mont = m.mul(z_neg, r_inv);
-    const auto u1 = m.from_mont(u1_mont);
-    EXPECT_EQ(u1, expected);
-}
-
-TEST(evmmax, secp256k1_calculate_u2)
-{
-    // u2 = sr^(-1)
-    const auto r = 0x27bc00995393e969525f2d02e731437402aa12a9a09125d1e322d62f05a2b54f_u256;
-    const auto s = 0x7ce91fc325f28e78a016fa674a80d85581cc278d15453ea2fede2471b1adaada_u256;
-    const auto expected = 0xf888ea06899abc190fa37a165c98e6d4b00b13c50db1d1c34f38f0ab8fd9c29b_u256;
-
-    const auto& m = Curve::Fp;
-    const auto s_mont = m.to_mont(s);
-    const auto r_mont = m.to_mont(r);
-    const auto r_inv = m.inv(r_mont);
-    const auto u2_mont = m.mul(s_mont, r_inv);
-    const auto u2 = m.from_mont(u2_mont);
-    EXPECT_EQ(u2, expected);
 }
 
 TEST(evmmax, secp256k1_hash_to_number)
@@ -186,9 +157,9 @@ TEST(evmmax, secp256k1_pt_add_inf)
     const AffinePoint inf;
     ASSERT_TRUE(inf == 0);
 
-    EXPECT_EQ(add(p1, inf), p1);
-    EXPECT_EQ(add(inf, p1), p1);
-    EXPECT_EQ(add(inf, inf), inf);
+    EXPECT_EQ(add_affine(p1, inf), p1);
+    EXPECT_EQ(add_affine(inf, p1), p1);
+    EXPECT_EQ(add_affine(inf, inf), inf);
 }
 
 TEST(evmmax, secp256k1_pt_add)
@@ -205,22 +176,22 @@ TEST(evmmax, secp256k1_pt_add)
     {
         const AffinePoint e{0x40468d7704db3d11961ab9c222e35919d7e5d1baef59e0f46255d66bec3bd1d3_u256,
             0x6fff88d9f575236b6cc5c74e7d074832a460c2792fba888aea7b9986429dd7f7_u256};
-        EXPECT_EQ(add(p1, p2), e);
+        EXPECT_EQ(add_affine(p1, p2), e);
     }
     {
         const AffinePoint e{0xd8e7b42b8c82e185bf0669ce0754697a6eb46c156497d5d1971bd6a23f38ed9e_u256,
             0x628c3107fc73c92e7b8c534e239257fb2de95bd6b965dc1021f636da086a7e99_u256};
-        EXPECT_EQ(add(p1, p1), e);
+        EXPECT_EQ(add_affine(p1, p1), e);
     }
     {
         const AffinePoint e{0xdf592d726f42759020da10d3106db3880e514c783d6970d2a9085fb16879b37f_u256,
             0x10aa0ef9fe224e3797792b4b286b9f63542d4c11fe26d449a845b9db0f5993f9_u256};
-        EXPECT_EQ(add(p1, p3), e);
+        EXPECT_EQ(add_affine(p1, p3), e);
     }
     {
         const AffinePoint e{0x12a5fd099bcd30e7290e58d63f8d5008287239500e6d0108020040497c5cb9c9_u256,
             0x7f6bd83b5ac46e3b59e24af3bc9bfbb213ed13e21d754e4950ae635961742574_u256};
-        EXPECT_EQ(add(p1, p4), e);
+        EXPECT_EQ(add_affine(p1, p4), e);
     }
 }
 
@@ -270,110 +241,101 @@ TEST(evmmax, secp256k1_pt_mul)
     }
 }
 
-
-struct TestCaseECR
+namespace
 {
-    evmc::bytes32 hash;
-    uint256 r;
-    uint256 s;
-    bool parity = false;
-    AffinePoint pubkey;
+struct TestCase
+{
+    std::string_view input;
+    std::string_view expected_output;
 };
 
-static const TestCaseECR test_cases_ecr[] = {
-    {
-        0x18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c_bytes32,
-        0x7af9e73057870458f03c143483bc5fcb6f39d01c9b26d28ed9f3fe23714f6628_u256,
-        0x3134a4ba8fafe11b351a720538398a5635e235c0b3258dce19942000731079ec_u256,
-        false,
-        {
-            0x43ec87f8ee6f58605d947dac51b5e4cfe26705f509e5dad058212aadda180835_u256,
-            0x90ebad786ce091f5af1719bf30ee236a4e6ce8a7ab6c36a16c93c6177aa109df_u256,
-        },
-    },
-};
-
-TEST(evmmax, ecr)
-{
-    for (const auto& t : test_cases_ecr)
-    {
-        const auto h = std::bit_cast<ethash::hash256>(t.hash);
-        const auto result = secp256k1_ecdsa_recover(h, t.r, t.s, t.parity);
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result->x, t.pubkey.x);
-        EXPECT_EQ(result->y, t.pubkey.y);
-        EXPECT_EQ(*result, t.pubkey);
-    }
-}
-
-
-struct TestCaseECRecovery
-{
-    bytes input;
-    bytes expected_output;
-};
-
-static const TestCaseECRecovery test_cases[] = {
-    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c000000000000000000000000000000000000000000000000000000000000001c73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75feeb940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549"_hex,
-        "000000000000000000000000a94f5374fce5edbc8e2a8697c15331677e6ebf0b"_hex},
-    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c000000000000000000000000000000000000000000000000000000000000001b7af9e73057870458f03c143483bc5fcb6f39d01c9b26d28ed9f3fe23714f66283134a4ba8fafe11b351a720538398a5635e235c0b3258dce19942000731079ec"_hex,
-        "0000000000000000000000009a04aede774152f135315670f562c19c5726df2c"_hex},
-    // z >= Order
-    {"fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141000000000000000000000000000000000000000000000000000000000000001b7af9e73057870458f03c143483bc5fcb6f39d01c9b26d28ed9f3fe23714f66283134a4ba8fafe11b351a720538398a5635e235c0b3258dce19942000731079ec"_hex,
-        "000000000000000000000000b32CF3C8616537a28583FC00D29a3e8C9614cD61"_hex},
-    {"6b8d2c81b11b2d699528dde488dbdf2f94293d0d33c32e347f255fa4a6c1f0a9000000000000000000000000000000000000000000000000000000000000001b79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817986b8d2c81b11b2d699528dde488dbdf2f94293d0d33c32e347f255fa4a6c1f0a9"_hex,
+const TestCase TEST_CASES[]{
+    // clang-format off
+    //
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c 73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75f eeb940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549",
+        "000000000000000000000000a94f5374fce5edbc8e2a8697c15331677e6ebf0b"},
+    //
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001b 7af9e73057870458f03c143483bc5fcb6f39d01c9b26d28ed9f3fe23714f6628 3134a4ba8fafe11b351a720538398a5635e235c0b3258dce19942000731079ec",
+        "0000000000000000000000009a04aede774152f135315670f562c19c5726df2c"},
+    // z == Order
+    {"fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141 000000000000000000000000000000000000000000000000000000000000001b 7af9e73057870458f03c143483bc5fcb6f39d01c9b26d28ed9f3fe23714f6628 3134a4ba8fafe11b351a720538398a5635e235c0b3258dce19942000731079ec",
+        "000000000000000000000000b32cf3c8616537a28583fc00d29a3e8c9614cd61"},
+    //
+    {"6b8d2c81b11b2d699528dde488dbdf2f94293d0d33c32e347f255fa4a6c1f0a9 000000000000000000000000000000000000000000000000000000000000001b 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 6b8d2c81b11b2d699528dde488dbdf2f94293d0d33c32e347f255fa4a6c1f0a9",
         {}},
-    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c000000000000000000000000000000000000000000000000000000000000001c0000000000000000000000000000000000000000000000000000000000000000eeb940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549"_hex,
+    // r == 0
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c 0000000000000000000000000000000000000000000000000000000000000000 eeb940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549",
         {}},
-    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c000000000000000000000000000000000000000000000000000000000000001c73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75f0000000000000000000000000000000000000000000000000000000000000000"_hex,
+    // s == 0
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c 73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75f 0000000000000000000000000000000000000000000000000000000000000000",
         {}},
     // r >= Order
-    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c000000000000000000000000000000000000000000000000000000000000001cfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141eeb940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549"_hex,
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141 eeb940b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549",
         {}},
     // s >= Order
-    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c000000000000000000000000000000000000000000000000000000000000001c73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75ffffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"_hex,
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c 73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75f fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
         {}},
     // u1 == u2 && R == G
-    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001b 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 3a2db9fe7908dcc36d81824d2338fc3dd5ae2692e4c6790043d7868872b09cd1"_hex,
-        "0000000000000000000000002e4db28b1f03ec8acfc2865e0c08308730e7ddf2"_hex},
+    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001b 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 3a2db9fe7908dcc36d81824d2338fc3dd5ae2692e4c6790043d7868872b09cd1",
+        "0000000000000000000000002e4db28b1f03ec8acfc2865e0c08308730e7ddf2"},
     // u1 == -u2 && R == -G
-    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001c 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"_hex,
-        "0000000000000000000000002e4db28b1f03ec8acfc2865e0c08308730e7ddf2"_hex},
+    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001c 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        "0000000000000000000000002e4db28b1f03ec8acfc2865e0c08308730e7ddf2"},
     // 13u1 == u2 && R == -13G
-    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001b f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8 533e9827446324ac92450a05ef04622bc0081f8d5b394e4d7b514ed35c946ee9"_hex,
+    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001b f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8 533e9827446324ac92450a05ef04622bc0081f8d5b394e4d7b514ed35c946ee9",
         {}},
     // 13u1 == u2 && R == 13G
-    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001c f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8 533e9827446324ac92450a05ef04622bc0081f8d5b394e4d7b514ed35c946ee9"_hex,
-        "000000000000000000000000fc4b7e97f115ac81f9a6997254892b45e8159d46"_hex},
+    {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001c f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8 533e9827446324ac92450a05ef04622bc0081f8d5b394e4d7b514ed35c946ee9",
+        "000000000000000000000000fc4b7e97f115ac81f9a6997254892b45e8159d46"},
+    // R == 2G, low s
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5 000000000000000000000000000000000000000000000000000000000000000b",
+        "000000000000000000000000a77cc0129dba3df2c0e27f2bfe79a18b498f8934"},
+    // R == 2G, high s
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5 fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd036413b",
+        "000000000000000000000000bbb10a3b5835400b63ca00372c16db781220fb0b"},
+    // R == 3G, low s
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9 0000000000000000000000000000000000000000000000000000000000000010",
+        "000000000000000000000000620833dce54ca9329f13a22c3831b102f15df27c"},
+    // R == 3G, high s
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9 fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd036412a",
+        "000000000000000000000000b0e0b5974d71cd6d9142451cc94291dec4191b8b"},
+    // R == 4G, low s
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13 0000000000000000000000000000000000000000000000000000000000000020",
+        "0000000000000000000000009d39e4bd10915d73b7d6ba205c1aefd814710aaa"},
+    // R == 4G, high s
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13 fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364112",
+        "0000000000000000000000000a6fe081a013109d981bad2c5143d7a1fd3bfef7"},
+    // clang-format on
 };
+}  // namespace
 
 TEST(evmmax, ecrecovery)
 {
-    for (const auto& t : test_cases)
+    for (const auto& [input_hex, expected_output_hex] : TEST_CASES)
     {
-        ASSERT_EQ(t.input.size(), 128);
+        const auto input = from_spaced_hex(input_hex).value();
+        ASSERT_EQ(input.size(), 128);
 
-        ethash::hash256 hash;
-        std::memcpy(hash.bytes, t.input.data(), 32);
-        const auto v{be::unsafe::load<uint256>(&t.input[32])};
+        const std::span<const uint8_t, 128> input_span{input};
+        const auto hash = input_span.subspan<0, 32>();
+        const auto v_bytes = input_span.subspan<32, 32>();
+        const auto r_bytes = input_span.subspan<64, 32>();
+        const auto s_bytes = input_span.subspan<96, 32>();
+
+        const auto v = be::unsafe::load<uint256>(v_bytes.data());
         ASSERT_TRUE(v == 27 || v == 28);
-        const auto r{be::unsafe::load<uint256>(&t.input[64])};
-        const auto s{be::unsafe::load<uint256>(&t.input[96])};
         const bool parity = v == 28;
 
-        const auto result = ecrecover(hash, r, s, parity);
+        const auto result = ecrecover(hash, r_bytes, s_bytes, parity);
 
-        if (t.expected_output.empty())
+        if (expected_output_hex.empty())
         {
             EXPECT_FALSE(result.has_value());
         }
         else
         {
-            ASSERT_EQ(t.expected_output.size(), 32);
-            evmc::address e;
-            memcpy(&e.bytes[0], &t.expected_output[12], 20);
             ASSERT_TRUE(result.has_value());
-            EXPECT_EQ(*result, e);
+            EXPECT_EQ(std::string(24, '0') + hex(*result), expected_output_hex);
         }
     }
 }

@@ -2,7 +2,7 @@
 // Copyright 2019 The evmone Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "../statetest/statetest.hpp"
+#include "../utils/statetest.hpp"
 #include "helpers.hpp"
 #include "synthetic_benchmarks.hpp"
 #include <benchmark/benchmark.h>
@@ -61,7 +61,7 @@ BenchmarkCase load_benchmark(const fs::path& path, const std::string& name_prefi
     auto state_test = std::move(load_state_tests(f).at(0));
 
     const auto name = name_prefix + path.stem().string();
-    const auto code = state_test.pre_state.get(state_test.multi_tx.to.value()).code;
+    const auto code = state_test.pre_state[state_test.multi_tx.to.value()].code;
     const auto inputs = load_inputs(state_test);
 
     return BenchmarkCase{name, code, inputs};

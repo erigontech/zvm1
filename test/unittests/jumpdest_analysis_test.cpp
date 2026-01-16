@@ -17,7 +17,7 @@ constexpr auto CODE_PADDING_CHECK_SIZE = 100;
 
 auto baseline_analyze(bytes_view code)
 {
-    return baseline::analyze(code, false);
+    return baseline::analyze(code);
 }
 
 /// The set of test cases for jumpdest analysis.
@@ -47,7 +47,7 @@ const bytecode bytecode_test_cases[]{
 
 /// Wrapper for jumpdest analysis implementations suitable for typed tests.
 template <typename T, T Fn(bytes_view)>
-struct I
+struct Impl
 {
     static constexpr auto analyze = Fn;
 };
@@ -55,9 +55,9 @@ struct I
 template <typename>
 class jumpdest_analysis_test : public testing::Test
 {};
-using test_types = testing::Types<                //
-    I<baseline::CodeAnalysis, baseline_analyze>,  //
-    I<JumpdestBitset, speculate_push_data_size>   //
+using test_types = testing::Types<                   //
+    Impl<baseline::CodeAnalysis, baseline_analyze>,  //
+    Impl<JumpdestBitset, speculate_push_data_size>   //
     >;
 TYPED_TEST_SUITE(jumpdest_analysis_test, test_types);
 

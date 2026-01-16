@@ -43,7 +43,6 @@ class VM : public evmc_vm
 {
 public:
     bool cgoto = EVMONE_CGOTO_SUPPORTED;
-    bool validate_eof = false;
 
 private:
     std::vector<ExecutionState> m_execution_states;

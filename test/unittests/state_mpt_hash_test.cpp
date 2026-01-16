@@ -4,11 +4,10 @@
 
 #include <gtest/gtest.h>
 #include <test/state/bloom_filter.hpp>
-#include <test/state/mpt.hpp>
-#include <test/state/mpt_hash.hpp>
-#include <test/state/rlp.hpp>
 #include <test/state/state.hpp>
-#include <test/state/test_state.hpp>
+#include <test/utils/mpt.hpp>
+#include <test/utils/mpt_hash.hpp>
+#include <test/utils/test_state.hpp>
 #include <test/utils/utils.hpp>
 #include <array>
 
@@ -49,17 +48,6 @@ TEST(state_mpt_hash, two_accounts)
     accounts[0x01_address] = acc2;
     EXPECT_EQ(mpt_hash(accounts),
         0xd3e845156fca75de99712281581304fbde104c0fc5a102b09288c07cdde0b666_bytes32);
-}
-
-TEST(state_mpt_hash, deleted_storage)
-{
-    TestAccount acc;
-    acc.storage[0x01_bytes32] = {};
-    acc.storage[0x02_bytes32] = {0xfd_bytes32};
-    acc.storage[0x03_bytes32] = {};
-    const TestState accounts{{0x07_address, acc}};
-    EXPECT_EQ(mpt_hash(accounts),
-        0x4e7338c16731491e0fb5d1623f5265c17699c970c816bab71d4d717f6071414d_bytes32);
 }
 
 TEST(state_mpt_hash, one_transactions)

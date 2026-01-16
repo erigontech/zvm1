@@ -43,6 +43,8 @@ template <>
 constexpr auto analyze<PrecompileId::ecpairing> = ecpairing_analyze;
 template <>
 constexpr auto analyze<PrecompileId::point_evaluation> = point_evaluation_analyze;
+template <>
+constexpr auto analyze<PrecompileId::p256verify> = p256verify_analyze;
 
 template <PrecompileId>
 const inline std::array inputs{0};
@@ -168,6 +170,21 @@ const inline std::array inputs<PrecompileId::point_evaluation>{
     "01ff83fbe4488061b695d9e4632e9ab23c5b9dfb046241fac921659c2e3b6a4e5e88a0c20ef27ae5dea6e83a748115df152b207362c022a43c8ebbfbec73ea2a2b38376a1de4ed9abd35175ac422af7df2c6ddf1503979964b1d217747c108978969cc0fcbd47dba8b1e3cbba16920f3fc694fadbf203b55aa66aaf138a38ace946a7ccddc20f45d796cd60268df8a2487d06c11cdc50247c580c5dd25f6fb486053b73868038cb92c2ae6d429a7bde850177f31c9fde00ca824c8c59cd4ef49"_hex,
 };
 
+template <>
+const inline std::array inputs<PrecompileId::p256verify>{
+    // Inputs taken from EEST positive test cases.
+    "00000000690ed426ccf17803ebe2bd0884bcd58a1bb5e7477ead3645f356e7a916aea964a2f6506d6f78c81c91fc7e8bded7d397738448de1e19a0ec580bf266252cd762130c6667cfe8b7bc47d27d78391e8e80c578d1cd38c3ff033be928e92927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e"_hex,
+    "0eaae8641084fa979803efbfb8140732f4cdcf66c3f78a000000003c278a6b215291deaf24659ffbbce6e3c26f6021097a74abdbb69be4fb10419c0c496c946665d6fcf336d27cc7cdb982bb4e4ecef5827f84742f29f10abf83469270a03dc32927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e"_hex,
+    "2c3f26f96a3ac0051df4989bffffffff9fd64886c1dc4f9924d8fd6f0edb048481f2359c4faba6b53d3e8c8c3fcc16a948350f7ab3a588b28c17603a431e39a8cd6f6a5cc3b55ead0ff695d06c6860b509e46d99fccefb9f7f9e101857f743002927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e"_hex,
+    "2f77668a9dfbf8d5848b9eeb4a7145ca94c6ed9236e4a773f6dcafa5132b2f9131230428405560dcb88fb5a646836aea9b23a23dd973dcbe8014c87b8b20eb070f9344d6e812ce166646747694a41b0aaf97374e19f3c5fb8bd7ae3d9bd0beffbcbb2914c79f045eaa6ecbbc612816b3be5d2d6796707d8125e9f851c18af015000000001352bb4a0fa2ea4cceb9ab63dd684ade5a1127bcf300a698a7193bc2"_hex,
+    "2f77668a9dfbf8d5848b9eeb4a7145ca94c6ed9236e4a773f6dcafa5132b2f9196843dd03c22abd2f3b782b170239f90f277921becc117d0404a8e4e36230c28f2be378f526f74a543f67165976de9ed9a31214eb4d7e6db19e1ede123dd991d2829c31faa2e400e344ed94bca3fcd0545956ebcfe8ad0f6dfa5ff8effffffffa01aafaf000e52585855afa7676ade284113099052df57e7eb3bd37ebeb9222e"_hex,
+    "532eaabd9574880dbf76b9b8cc00832c20a6ec113d682299550d7a6e0f345e25000000000000000000000000000000004319055358e8617b0c46353d039cdaabffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254ed705d16f80987e2d9b1a6957d29ce22febf7d10fa515153182415c8361baaca4b1fc105ee5ce80d514ec1238beae2037a6f83625593620d460819e8682160926"_hex,
+    "532eaabd9574880dbf76b9b8cc00832c20a6ec113d682299550d7a6e0f345e2530e782f964b2e2ff065a051bc7adc20615d8c43a1365713c88268822c253bcce5b16df652aa1ecb2dc8b46c515f9604e2e84cacfa7c6eec30428d2d3f4e08ed504aaec73635726f213fb8a9e64da3b8632e41495a944d0045b522eba7240fad587d9315798aaa3a5ba01775787ced05eaaf7b4e09fc81d6d1aa546e8365d525d"_hex,
+    "532eaabd9574880dbf76b9b8cc00832c20a6ec113d682299550d7a6e0f345e25ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254fffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254e3cd8d2f81d6953b0844c09d7b560d527cd2ef67056893eadafa52c8501387d59ee41fdb4d10402ce7a0c5e3b747adfa3a490b62a6b7719068903485c0bb6dc2d"_hex,
+    "bb5a52f42f9c9261ed4361f59422a1e30036e7c32b270c8807a419feca6050237cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997849249248db6db6dbb6db6db6db6db6db5a8b230d0b2b51dcd7ebf0c9fef7c185501421277be45a5eefec6c639930d636032565af420cf3373f557faa7f8a06438673d6cb6076e1cfcdc7dfe7384c8e5cac08d74501f2ae6e89cad195d0aa1371"_hex,
+    "dc1921946f4af96a2856e7be399007c9e807bdf4c5332f19f59ec9dd1bb8c7b3530bd6b0c9af2d69ba897f6b5fb59695cfbf33afe66dbadcf5b8d2a2a6538e23d85e489cb7a161fd55ededcedbf4cc0c0987e3e3f0f242cae934c72caa3f43e904aaec73635726f213fb8a9e64da3b8632e41495a944d0045b522eba7240fad587d9315798aaa3a5ba01775787ced05eaaf7b4e09fc81d6d1aa546e8365d525d"_hex,
+};
+
 template <PrecompileId Id, ExecuteFn Fn>
 void precompile(benchmark::State& state)
 {
@@ -205,6 +222,8 @@ void precompile(benchmark::State& state)
 template <ExecuteFn Fn>
 void modexp(benchmark::State& state)
 {
+    static constexpr auto REV = EVMC_OSAKA;
+
     const auto base_mod_len = static_cast<size_t>(state.range(0));
     const auto exp_bits = static_cast<size_t>(state.range(1));
     const auto exp_len = (exp_bits + 7) / 8;
@@ -225,7 +244,7 @@ void modexp(benchmark::State& state)
 
     const auto output = std::make_unique_for_overwrite<uint8_t[]>(base_mod_len);
 
-    const auto gas_cost = expmod_analyze({input.get(), input_len}, EVMC_PRAGUE).gas_cost;
+    const auto gas_cost = expmod_analyze({input.get(), input_len}, REV).gas_cost;
     int64_t total_gas_used = 0;
     for ([[maybe_unused]] auto _ : state)
     {
@@ -240,22 +259,22 @@ void modexp(benchmark::State& state)
 }
 #define MODEXP_ARGS                     \
     ->ArgNames({"mod_len", "exp_bits"}) \
-        ->Args({1 * 8, 604})            \
-        ->Args({2 * 8, 152})            \
-        ->Args({3 * 8, 68})             \
-        ->Args({4 * 8, 39})             \
-        ->Args({5 * 8, 25})             \
-        ->Args({6 * 8, 18})             \
-        ->Args({7 * 8, 13})             \
-        ->Args({8 * 8, 10})             \
-        ->Args({9 * 8, 8})              \
-        ->Args({10 * 8, 7})             \
-        ->Args({11 * 8, 6})             \
-        ->Args({12 * 8, 5})             \
+        ->Args({1 * 8, 33})             \
+        ->Args({2 * 8, 33})             \
+        ->Args({3 * 8, 33})             \
+        ->Args({4 * 8, 33})             \
+        ->Args({5 * 8, 11})             \
+        ->Args({6 * 8, 8})              \
+        ->Args({7 * 8, 6})              \
+        ->Args({8 * 8, 5})              \
+        ->Args({9 * 8, 4})              \
+        ->Args({10 * 8, 4})             \
+        ->Args({11 * 8, 4})             \
+        ->Args({12 * 8, 4})             \
         ->Args({14 * 8, 4})             \
         ->Args({17 * 8, 3})             \
         ->Args({24 * 8, 2})             \
-        ->Args({25 * 8, 1})             \
+        ->Args({25 * 8, 2})             \
         ->Args({32 * 8, 2})             \
         ->Args({33 * 8, 2})             \
         ->Args({63 * 8, 2})             \
@@ -332,5 +351,11 @@ BENCHMARK_TEMPLATE(precompile, PrecompileId::point_evaluation, evmone_blst);
 }  // namespace bench_kzg
 
 }  // namespace
+
+namespace bench_p256verify
+{
+constexpr auto evmone_cpp = p256verify_execute;
+BENCHMARK_TEMPLATE(precompile, PrecompileId::p256verify, evmone_cpp);
+}  // namespace bench_p256verify
 
 BENCHMARK_MAIN();

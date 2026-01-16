@@ -2,16 +2,24 @@
 // Copyright 2023 The evmone Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "../state/mpt_hash.hpp"
-#include "../state/requests.hpp"
-#include "../state/rlp.hpp"
-#include "../state/system_contracts.hpp"
-#include "../test/statetest/statetest.hpp"
-#include "blockchaintest.hpp"
+#include "blockchaintest_runner.hpp"
 #include <gtest/gtest.h>
+#include <test/state/ethash_difficulty.hpp>
+#include <test/state/requests.hpp>
+#include <test/utils/mpt_hash.hpp>
+#include <test/utils/rlp.hpp>
+#include <test/utils/rlp_encode.hpp>
+#include <test/utils/statetest.hpp>
 
 namespace evmone::test
 {
+
+/// The CL gossip protocol constraint of the maximum block size (EIP-7934).
+constexpr size_t MAX_BLOCK_SIZE = 10 * 1024 * 1024;
+/// The safety margin for beacon block content (EIP-7934).
+constexpr size_t SAFETY_MARGIN = 2 * 1024 * 1024;
+/// The maximum EL block size when RLP encoded (EIP-7934).
+constexpr size_t MAX_RLP_BLOCK_SIZE = MAX_BLOCK_SIZE - SAFETY_MARGIN;
 
 struct RejectedTransaction
 {
@@ -107,13 +115,16 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
         bloom, blob_gas_left, std::move(block_state)};
 }
 
-bool validate_block(
-    evmc_revision rev, const TestBlock& test_block, const BlockHeader* parent_header) noexcept
+bool validate_block(evmc_revision rev, state::BlobParams blob_params, const TestBlock& test_block,
+    const BlockHeader* parent_header, bool parent_has_ommers) noexcept
 {
     // NOTE: includes only block validity unrelated to individual txs. See `apply_block`.
 
     // Fail if parent header was not found.
     if (parent_header == nullptr)
+        return false;
+
+    if (test_block.block_info.number != parent_header->block_number + 1)
         return false;
 
     if (test_block.block_info.gas_used > test_block.block_info.gas_limit)
@@ -133,6 +144,17 @@ bool validate_block(
     if (test_block.block_info.gas_limit < 5000)
         return false;
 
+    // FIXME: Some tests have timestamp not fitting into int64_t, type has to be uint64_t.
+    if (static_cast<uint64_t>(test_block.block_info.timestamp) <=
+        static_cast<uint64_t>(parent_header->timestamp))
+        return false;
+
+    if (test_block.block_info.difficulty != state::calculate_difficulty(parent_header->difficulty,
+                                                parent_has_ommers, parent_header->timestamp,
+                                                test_block.block_info.timestamp,
+                                                test_block.block_info.number, rev))
+        return false;
+
     if (rev >= EVMC_PARIS && !test_block.block_info.ommers.empty())
         return false;
 
@@ -145,9 +167,7 @@ bool validate_block(
             return false;
     }
 
-    // FIXME: Some tests have timestamp not fitting into int64_t, type has to be uint64_t.
-    if (static_cast<uint64_t>(test_block.block_info.timestamp) <=
-        static_cast<uint64_t>(parent_header->timestamp))
+    if (test_block.block_info.extra_data.size() > 32)
         return false;
 
     if (rev >= EVMC_LONDON)
@@ -166,16 +186,18 @@ bool validate_block(
             return false;
 
         // Check that the excess blob gas was updated correctly.
+        // According to EIP-7918 current blocks params (`rev`) should be used for parent base fee
+        // calculation.
         const auto parent_blob_base_fee =
-            state::compute_blob_gas_price(rev, parent_header->excess_blob_gas.value_or(0));
+            state::compute_blob_gas_price(blob_params, parent_header->excess_blob_gas.value_or(0));
         if (*test_block.block_info.excess_blob_gas !=
-            state::calc_excess_blob_gas(rev, parent_header->blob_gas_used.value_or(0),
+            state::calc_excess_blob_gas(rev, blob_params, parent_header->blob_gas_used.value_or(0),
                 parent_header->excess_blob_gas.value_or(0), parent_header->base_fee_per_gas,
                 parent_blob_base_fee))
             return false;
 
         // Ensure the total blob gas spent is at most equal to the limit
-        if (*test_block.block_info.blob_gas_used > state::max_blob_gas_per_block(rev))
+        if (*test_block.block_info.blob_gas_used > state::max_blob_gas_per_block(blob_params))
             return false;
     }
     else
@@ -187,6 +209,9 @@ bool validate_block(
 
     // Block is invalid if some of the withdrawal fields failed to be parsed.
     if (!test_block.withdrawals_parse_success)
+        return false;
+
+    if (rev >= EVMC_OSAKA && test_block.rlp_size > MAX_RLP_BLOCK_SIZE)
         return false;
 
     return true;
@@ -234,7 +259,8 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
     for (size_t case_index = 0; case_index != tests.size(); ++case_index)
     {
         const auto& c = tests[case_index];
-        SCOPED_TRACE(std::string{evmc::to_string(c.rev.get_revision(0))} + '/' +
+        const auto rev_schedule = to_rev_schedule(c.network);
+        SCOPED_TRACE(std::string{evmc::to_string(rev_schedule.get_revision(0))} + '/' +
                      std::to_string(case_index) + '/' + c.name);
 
         // Validate the genesis block header.
@@ -243,7 +269,7 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
         EXPECT_EQ(c.genesis_block_header.transactions_root, state::EMPTY_MPT_HASH);
         EXPECT_EQ(c.genesis_block_header.receipts_root, state::EMPTY_MPT_HASH);
         EXPECT_EQ(c.genesis_block_header.withdrawal_root,
-            c.rev.get_revision(c.genesis_block_header.timestamp) >= EVMC_SHANGHAI ?
+            rev_schedule.get_revision(c.genesis_block_header.timestamp) >= EVMC_SHANGHAI ?
                 state::EMPTY_MPT_HASH :
                 bytes32{});
         EXPECT_EQ(c.genesis_block_header.logs_bloom, bytes_view{state::BloomFilter{}});
@@ -254,11 +280,12 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
         struct BlockData
         {
             const BlockHeader* header;
+            bool has_ommers = false;
             TestState post_state;
             intx::uint256 total_difficulty;
         };
         std::unordered_map<hash256, BlockData> block_data{{{c.genesis_block_header.hash,
-            {&c.genesis_block_header, c.pre_state, c.genesis_block_header.difficulty}}}};
+            {&c.genesis_block_header, false, c.pre_state, c.genesis_block_header.difficulty}}}};
         const auto* canonical_state = &c.pre_state;
         intx::uint256 max_total_difficulty = c.genesis_block_header.difficulty;
 
@@ -270,15 +297,19 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
             const auto parent_data_it = block_data.find(test_block.block_info.parent_hash);
             const auto* parent_header =
                 parent_data_it != block_data.end() ? parent_data_it->second.header : nullptr;
+            const auto parent_has_ommers =
+                parent_data_it != block_data.end() && parent_data_it->second.has_ommers;
 
-            const auto rev = c.rev.get_revision(bi.timestamp);
+            const auto rev = rev_schedule.get_revision(bi.timestamp);
+            const auto blob_params = get_blob_params(c.network, c.blob_schedule, bi.timestamp);
 
             SCOPED_TRACE(std::string{evmc::to_string(rev)} + '/' + std::to_string(case_index) +
                          '/' + c.name + '/' + std::to_string(test_block.block_info.number));
 
             if (test_block.valid)
             {
-                ASSERT_TRUE(validate_block(rev, test_block, parent_header))
+                ASSERT_TRUE(
+                    validate_block(rev, blob_params, test_block, parent_header, parent_has_ommers))
                     << "Expected block to be valid (validate_block)";
 
                 // Block being valid guarantees its parent was found.
@@ -293,9 +324,13 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
                 block_hashes[test_block.expected_block_header.block_number] =
                     test_block.expected_block_header.hash;
                 const auto [inserted_it, _] = block_data.insert({test_block.block_info.hash,
-                    {&test_block.expected_block_header, std::move(res.block_state),
-                        parent_data_it->second.total_difficulty +
-                            test_block.block_info.difficulty}});
+                    {
+                        .header = &test_block.expected_block_header,
+                        .has_ommers = !test_block.block_info.ommers.empty(),
+                        .post_state = std::move(res.block_state),
+                        .total_difficulty = parent_data_it->second.total_difficulty +
+                                            test_block.block_info.difficulty,
+                    }});
                 if (inserted_it->second.total_difficulty >= max_total_difficulty)
                 {
                     canonical_state = &inserted_it->second.post_state;
@@ -331,7 +366,7 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
             }
             else
             {
-                if (!validate_block(rev, test_block, parent_header))
+                if (!validate_block(rev, blob_params, test_block, parent_header, parent_has_ommers))
                     continue;
 
                 // Block being valid guarantees its parent was found.
@@ -382,7 +417,6 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
                            print_state(std::get<TestState>(c.expectation.post_state)) :
                        "");
     }
-    // TODO: Add difficulty calculation verification.
 }
 
 }  // namespace evmone::test

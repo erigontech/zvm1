@@ -4,7 +4,6 @@
 
 #include "baseline.hpp"
 #include "baseline_instruction_table.hpp"
-#include "eof.hpp"
 #include "execution_state.hpp"
 #include "instructions.hpp"
 #include "vm.hpp"
@@ -16,7 +15,7 @@
 #define release_inline
 #endif
 
-#if defined(__GNUC__)
+#ifdef __GNUC__
 #define ASM_COMMENT(COMMENT) asm("# " #COMMENT)  // NOLINT(hicpp-no-assembler)
 #else
 #define ASM_COMMENT(COMMENT)
@@ -49,39 +48,43 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     //     !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
     //     "undefined instructions must not be handled by check_requirements()");
 
-        gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
-        if constexpr (!instr::has_const_gas_cost(Op))
-        {
-            gas_cost = cost_table[Op];  // If not, load the cost from the table.
+    auto gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
+    if constexpr (!instr::has_const_gas_cost(Op))
+    {
+        gas_cost = cost_table[Op];  // If not, load the cost from the current revision cost table.
 
-            // Negative cost marks an undefined instruction.
-            // This check must be first to produce correct error code.
+        // Negative cost marks an undefined instruction.
+        // This check must be the first to produce the correct error code.
+        // By definition not possible if defined since the first revision.
+        if constexpr (instr::traits[Op].since != EVMC_FRONTIER)
+        {
             if (INTX_UNLIKELY(gas_cost < 0))
-            {
-                gas_cost = 0;
                 return EVMC_UNDEFINED_INSTRUCTION;
-            }
         }
+    }
 
-        // Check stack requirements first. This is order is not required,
-        // but it is nicer because complete gas check may need to inspect operands.
-        if constexpr (instr::traits[Op].stack_height_change > 0)
-        {
-            // static_assert(instr::traits[Op].stack_height_change == 1,
-            // "unexpected instruction with multiple results");
-            if (INTX_UNLIKELY(stack_top == stack_bottom + StackSpace::limit))
-                return EVMC_STACK_OVERFLOW;
-        }
-        if constexpr (instr::traits[Op].stack_height_required > 0)
-        {
-            // Check stack underflow using pointer comparison <= (better optimization).
-            static constexpr auto min_offset = instr::traits[Op].stack_height_required - 1;
-            if (INTX_UNLIKELY(stack_top <= stack_bottom + min_offset))
-                return EVMC_STACK_UNDERFLOW;
-        }
+    // Check stack requirements first. This order is not required,
+    // but it is nicer because a complete gas check may need to inspect operands.
+    if constexpr (instr::traits[Op].stack_height_change > 0)
+    {
+        static_assert(instr::traits[Op].stack_height_change == 1,
+            "unexpected instruction with multiple results");
+        if (INTX_UNLIKELY(stack_top == stack_bottom + StackSpace::limit))
+            return EVMC_STACK_OVERFLOW;
+    }
+    if constexpr (instr::traits[Op].stack_height_required > 0)
+    {
+        // Check stack underflow using pointer comparison <= (better optimization).
+        static constexpr auto min_offset = instr::traits[Op].stack_height_required - 1;
+        if (INTX_UNLIKELY(stack_top <= stack_bottom + min_offset))
+            return EVMC_STACK_UNDERFLOW;
+    }
 
+    if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
+    {
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
+    }
 
         return EVMC_SUCCESS;
 }
@@ -132,41 +135,10 @@ struct Position
 }
 
 [[release_inline]] inline code_iterator invoke(
-    code_iterator (*instr_fn)(StackTop, code_iterator) noexcept, Position pos, int64_t& /*gas*/,
-    ExecutionState& /*state*/) noexcept
-{
-    return instr_fn(pos.stack_end, pos.code_it);
-}
-
-[[release_inline]] inline code_iterator invoke(
     TermResult (*instr_fn)(StackTop, int64_t, ExecutionState&) noexcept, Position pos, int64_t& gas,
     ExecutionState& state) noexcept
 {
     const auto result = instr_fn(pos.stack_end, gas, state);
-    gas = result.gas_left;
-    state.status = result.status;
-    return nullptr;
-}
-
-[[release_inline]] inline code_iterator invoke(
-    Result (*instr_fn)(StackTop, int64_t, ExecutionState&, code_iterator&) noexcept, Position pos,
-    int64_t& gas, ExecutionState& state) noexcept
-{
-    const auto result = instr_fn(pos.stack_end, gas, state, pos.code_it);
-    gas = result.gas_left;
-    if (result.status != EVMC_SUCCESS)
-    {
-        state.status = result.status;
-        return nullptr;
-    }
-    return pos.code_it;
-}
-
-[[release_inline]] inline code_iterator invoke(
-    TermResult (*instr_fn)(StackTop, int64_t, ExecutionState&, code_iterator) noexcept,
-    Position pos, int64_t& gas, ExecutionState& state) noexcept
-{
-    const auto result = instr_fn(pos.stack_end, gas, state, pos.code_it);
     gas = result.gas_left;
     state.status = result.status;
     return nullptr;
@@ -326,7 +298,7 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 
-    const auto& cost_table = get_baseline_cost_table(state.rev, analysis.eof_header().version);
+    const auto& cost_table = get_baseline_cost_table(state.rev);
 
     auto* tracer = vm.get_tracer();
     // if (INTX_UNLIKELY(tracer != nullptr))
@@ -347,14 +319,9 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
     const auto gas_left = (state.status == EVMC_SUCCESS || state.status == EVMC_REVERT) ? gas : 0;
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
 
-//     // assert(state.output_size != 0 || state.output_offset == 0);
-    const auto result =
-        (state.deploy_container.has_value() ?
-                evmc::make_result(state.status, gas_left, gas_refund, state.last_opcode_gas_cost,
-                    state.deploy_container->data(), state.deploy_container->size()) :
-                evmc::make_result(state.status, gas_left, gas_refund, state.last_opcode_gas_cost,
-                    state.output_size != 0 ? &state.memory[state.output_offset] : nullptr,
-                    state.output_size));
+    assert(state.output_size != 0 || state.output_offset == 0);
+    const auto result = evmc::make_result(state.status, gas_left, gas_refund,
+        state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size);
 
     // if (INTX_UNLIKELY(tracer != nullptr))
     //     tracer->notify_execution_end(result);
@@ -367,22 +334,8 @@ evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_co
 {
     auto vm = static_cast<VM*>(c_vm);
     const bytes_view container{code, code_size};
-    const auto eof_enabled = rev >= instr::REV_EOF1;
 
-    // Since EOF validation recurses into subcontainers, it only makes sense to do for top level
-    // message calls. The condition for `msg->kind` inside differentiates between creation tx code
-    // (initcode) and already deployed code (runtime).
-    if (vm->validate_eof && eof_enabled && is_eof_container(container) && msg->depth == 0)
-    {
-        const auto container_kind =
-            (msg->kind == EVMC_EOFCREATE ? ContainerKind::initcode : ContainerKind::runtime);
-        if (validate_eof(rev, container_kind, container) != EOFValidationError::success)
-            return evmc_make_result(
-                EVMC_CONTRACT_VALIDATION_FAILURE, 0, 0, msg->gas_cost, nullptr, 0);
-    }
-
-    const auto code_analysis = analyze(container, false);
-
+    const auto code_analysis = analyze(container);
     return execute(*vm, *host, ctx, rev, *msg, code_analysis);
     // return evmc_result{EVMC_SUCCESS, msg->gas};
 }

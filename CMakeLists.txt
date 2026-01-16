@@ -2,7 +2,7 @@
 # Copyright 2019 The evmone Authors.
 # SPDX-License-Identifier: Apache-2.0
 
-cmake_minimum_required(VERSION 3.18...3.27)
+cmake_minimum_required(VERSION 3.19...4.0)
 
 if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/evmc/.git)
     message(FATAL_ERROR "Git submodules not initialized, execute:\n  git submodule update --init")
@@ -26,7 +26,7 @@ cable_set_build_type(DEFAULT Release CONFIGURATION_TYPES Release Debug)
 include(Hunter/init)
 
 project(evmone LANGUAGES CXX C)
-set(PROJECT_VERSION 0.15.0)
+set(PROJECT_VERSION 0.18.0)
 
 string(REGEX MATCH "([0-9]+)\\.([0-9]+)" _ ${PROJECT_VERSION})
 set(PROJECT_VERSION_MAJOR ${CMAKE_MATCH_1})
@@ -131,6 +131,9 @@ if(EVMONE_FUZZING)
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${fuzzing_flags}")
     endif()
 endif()
+
+hunter_add_package(intx)
+find_package(intx CONFIG REQUIRED)
 
 set(include_dir ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

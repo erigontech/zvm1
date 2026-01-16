@@ -2,10 +2,10 @@
 // Copyright 2022 The evmone Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "../state/mpt_hash.hpp"
-#include "../state/rlp.hpp"
-#include "statetest.hpp"
 #include <gtest/gtest.h>
+#include <test/utils/mpt_hash.hpp>
+#include <test/utils/rlp.hpp>
+#include <test/utils/statetest.hpp>
 
 namespace evmone::test
 {
@@ -26,12 +26,17 @@ void run_state_test(const StateTransitionTest& test, evmc::VM& vm, bool trace_su
             const auto& expected = cases[case_index];
             const auto tx = test.multi_tx.get(expected.indexes);
             auto state = test.pre_state;
+            const auto blob_params = get_blob_params(rev, test.blob_schedule);
 
-            const auto res = test::transition(state, block, test.block_hashes, tx, rev, vm,
-                block.gas_limit, static_cast<int64_t>(state::max_blob_gas_per_block(rev)));
+            const auto res = transition(state, block, test.block_hashes, tx, rev, vm,
+                block.gas_limit, static_cast<int64_t>(state::max_blob_gas_per_block(blob_params)));
 
-            // Finalize block with reward 0.
-            test::finalize(state, rev, block.coinbase, 0, {}, {});
+            if (holds_alternative<state::TransactionReceipt>(res))
+            {
+                // If the transaction is valid, follow the state test convention and do minimal
+                // block post-processing with the block reward of 0.
+                finalize(state, rev, block.coinbase, 0, {}, {});
+            }
 
             const auto state_root = state::mpt_hash(state);
 
