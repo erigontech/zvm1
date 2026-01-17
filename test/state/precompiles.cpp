@@ -459,7 +459,7 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
         const auto res = evmmax::ecc::add(p, q);
         const std::span<uint8_t, 64> output_span{output, 64};
         res.to_bytes(output_span);
-        return {EVMC_SUCCESS, output_span.size()};
+        return {EVMC_SUCCESS, 64};
     }
     else
         return {EVMC_PRECOMPILE_FAILURE, 0};
@@ -486,7 +486,7 @@ ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* 
         const auto res = evmmax::bn254::mul(p, c);
         const std::span<uint8_t, 64> output_span{output, 64};
         res.to_bytes(output_span);
-        return {EVMC_SUCCESS, output_span.size()};
+        return {EVMC_SUCCESS, 64};
     }
     else
         return {EVMC_PRECOMPILE_FAILURE, 0};
