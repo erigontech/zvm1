@@ -315,24 +315,22 @@ void sp1_mul(sp1_AffinePoint r, const sp1_AffinePoint p, uint256 c) noexcept
     }
 }
 
-/// Shamir's trick: compute u1*P1 + u2*P2 in a single scalar-multiplication pass.
-/// Pre-computes P1+P2, then scans bits of both scalars from MSB to LSB simultaneously.
-/// Result: ~256 doubles + ~192 adds (statistically) instead of ~512 doubles + ~256 adds.
-void sp1_shamir_mul(sp1_AffinePoint r,
-    const sp1_AffinePoint P1, const uint256& u1,
-    const sp1_AffinePoint P2, const uint256& u2) noexcept
+/// SP1 version of ecc::msm() — computes multi-scalar multiplication u×P ⊕ v×Q
+/// using SP1 syscalls for point operations.
+/// See: ecc.hpp::msm(), https://eprint.iacr.org/2003/257.pdf#page=7.
+void sp1_msm(sp1_AffinePoint r,
+    const uint256& u, const sp1_AffinePoint p,
+    const uint256& v, const sp1_AffinePoint q) noexcept
 {
-    // Pre-compute P1+P2 (safe add handles P1==P2, P1==-P2, and zero points)
-    sp1_AffinePoint P1P2;
-    std::copy_n(P1, SP1_POINT_SIZE, P1P2);
-    sp1_secp256k1_add(P1P2, P2);
+    // Precompute affine P + Q (safe add handles P==Q, P==-Q, and zero points).
+    sp1_AffinePoint h;
+    std::copy_n(p, SP1_POINT_SIZE, h);
+    sp1_secp256k1_add(h, q);
 
-    // Table: index by (u1_bit << 1 | u2_bit), 0 = identity (no add)
-    // 1 = P2, 2 = P1, 3 = P1+P2
-    const uint64_t* table[4] = {nullptr, P2, P1, P1P2};
+    // Create lookup table for points. The index 0 is unused.
+    const uint64_t* points[4] = {nullptr, p, q, h};
 
-    // Find the highest set bit across both scalars
-    const auto bit_width = std::max(intx::bit_width(u1), intx::bit_width(u2));
+    const auto bit_width = std::max(intx::bit_width(u), intx::bit_width(v));
 
     if (bit_width == 0)
     {
@@ -345,18 +343,18 @@ void sp1_shamir_mul(sp1_AffinePoint r,
 
     for (size_t i = bit_width; i != 0; --i)
     {
-        const auto idx = (unsigned{intx::bit_test(u1, i - 1)} << 1) |
-                          unsigned{intx::bit_test(u2, i - 1)};
+        const auto idx = 2 * unsigned{intx::bit_test(v, i - 1)} +
+                              unsigned{intx::bit_test(u, i - 1)};
 
         if (initialized)
         {
             syscall_secp256k1_double(r);
             if (idx != 0)
-                sp1_secp256k1_add(r, table[idx]);
+                sp1_secp256k1_add(r, points[idx]);
         }
         else if (idx != 0)
         {
-            std::copy_n(table[idx], SP1_POINT_SIZE, r);
+            std::copy_n(points[idx], SP1_POINT_SIZE, r);
             initialized = true;
         }
     }
@@ -460,7 +458,7 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
 
     // Shamir's trick: compute u1*G + u2*R in a single pass
     sp1_AffinePoint sp1_Q;
-    sp1_shamir_mul(sp1_Q, sp1_G, u1, sp1_R, u2);
+    sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
 
     if (is_zero(sp1_Q)) [[unlikely]]
         return std::nullopt;
