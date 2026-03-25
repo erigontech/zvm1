@@ -298,26 +298,10 @@ void sp1_secp256k1_add(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
     syscall_secp256k1_add(r, p);
 }
 
-void sp1_mul(sp1_AffinePoint r, const sp1_AffinePoint p, uint256 c) noexcept
-{
-    std::fill_n(r, SP1_POINT_SIZE, 0);
-    const auto bit_width = sizeof(c) * 8 - intx::clz(c);
-
-    if (bit_width == 0)
-        return;
-
-    std::copy_n(p, SP1_POINT_SIZE, r);  // r = p
-    for (auto i = bit_width - 1; i != 0; --i)
-    {
-        syscall_secp256k1_double(r);
-        if (evmmax::ecc::test_bit(c, i - 1))
-            syscall_secp256k1_add(r, p);
-    }
-}
-
-/// SP1 version of ecc::msm() — computes multi-scalar multiplication u×P ⊕ v×Q
+/// SP1 version of ecc::msm() — computes multi-scalar multiplication u×P + v×Q
 /// using SP1 syscalls for point operations.
 /// See: ecc.hpp::msm(), https://eprint.iacr.org/2003/257.pdf#page=7.
+__attribute__((flatten))
 void sp1_msm(sp1_AffinePoint r,
     const uint256& u, const sp1_AffinePoint p,
     const uint256& v, const sp1_AffinePoint q) noexcept
@@ -327,36 +311,41 @@ void sp1_msm(sp1_AffinePoint r,
     std::copy_n(p, SP1_POINT_SIZE, h);
     sp1_secp256k1_add(h, q);
 
-    // Create lookup table for points. The index 0 is unused.
+    // Lookup table: index = (v_bit << 1) | u_bit.
     const uint64_t* points[4] = {nullptr, p, q, h};
 
-    const auto bit_width = std::max(intx::bit_width(u), intx::bit_width(v));
+    // Find the bit width across both scalars simultaneously.
+    const auto bw = std::max(intx::bit_width(u), intx::bit_width(v));
 
-    if (bit_width == 0)
+    if (bw == 0)
     {
         std::fill_n(r, SP1_POINT_SIZE, 0);
         return;
     }
 
-    // Scan bits from MSB to LSB. The first non-zero index initializes the accumulator.
-    bool initialized = false;
-
-    for (size_t i = bit_width; i != 0; --i)
+    // Find the first non-zero index to initialize the accumulator.
+    size_t i = bw;
+    for (; i != 0; --i)
     {
         const auto idx = 2 * unsigned{intx::bit_test(v, i - 1)} +
                               unsigned{intx::bit_test(u, i - 1)};
-
-        if (initialized)
-        {
-            syscall_secp256k1_double(r);
-            if (idx != 0)
-                sp1_secp256k1_add(r, points[idx]);
-        }
-        else if (idx != 0)
+        if (idx != 0)
         {
             std::copy_n(points[idx], SP1_POINT_SIZE, r);
-            initialized = true;
+            --i;
+            break;
         }
+    }
+
+    // Main loop: double-and-add with direct syscalls (no zero-point checks needed
+    // because the accumulator is always a valid non-zero point after initialization).
+    for (; i != 0; --i)
+    {
+        const auto idx = 2 * unsigned{intx::bit_test(v, i - 1)} +
+                              unsigned{intx::bit_test(u, i - 1)};
+        syscall_secp256k1_double(r);
+        if (idx != 0)
+            syscall_secp256k1_add(r, points[idx]);
     }
 }
 
