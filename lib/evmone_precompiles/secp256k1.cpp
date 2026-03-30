@@ -270,6 +270,30 @@ constexpr sp1_AffinePoint sp1_G = {
 };
 #endif
 
+/// Add non-zero p to non-zero r with first-limb fast reject on x-coordinate.
+[[gnu::always_inline]] inline void sp1_secp256k1_add_nz(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
+{
+    // Quick reject on first limb of x-coordinate (~1/2^64 false positive).
+    if (r[0] != p[0]) [[likely]]
+    {
+        syscall_secp256k1_add(r, p);
+        return;
+    }
+    // Full x-coordinate comparison (only reached ~1/2^64 of the time).
+    if (reinterpret_cast<const uint256&>(r[0]) != reinterpret_cast<const uint256&>(p[0])) [[likely]]
+    {
+        syscall_secp256k1_add(r, p);
+        return;
+    }
+
+    const auto& ry = reinterpret_cast<const uint256&>(r[SP1_POINT_SIZE / 2]);
+    const auto& py = reinterpret_cast<const uint256&>(p[SP1_POINT_SIZE / 2]);
+    if (ry == py)
+        syscall_secp256k1_double(r);
+    else  // r == -p
+        std::fill_n(r, SP1_POINT_SIZE, 0);
+}
+
 /// Add p to r, handling edge cases that SP1 syscall doesn't support:
 /// zero points (infinity) and points with the same x-coordinate.
 void sp1_secp256k1_add(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
@@ -282,20 +306,7 @@ void sp1_secp256k1_add(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
         return;
     }
 
-    const auto& rx = reinterpret_cast<const uint256&>(r[0]);
-    const auto& px = reinterpret_cast<const uint256&>(p[0]);
-    if (rx == px) [[unlikely]]
-    {
-        const auto& ry = reinterpret_cast<const uint256&>(r[SP1_POINT_SIZE / 2]);
-        const auto& py = reinterpret_cast<const uint256&>(p[SP1_POINT_SIZE / 2]);
-        if (ry == py)
-            syscall_secp256k1_double(r);
-        else  // r == -p
-            std::fill_n(r, SP1_POINT_SIZE, 0);
-        return;
-    }
-
-    syscall_secp256k1_add(r, p);
+    sp1_secp256k1_add_nz(r, p);
 }
 
 /// SP1 version of ecc::msm() — computes multi-scalar multiplication u×P + v×Q
@@ -337,40 +348,15 @@ void sp1_msm(sp1_AffinePoint r,
         }
     }
 
-    // Main loop: double-and-add with direct syscalls.
-    // Zero-point checks are unnecessary (accumulator is always non-zero after init),
-    // but same-x check is needed because the multi-point table can cause collisions.
+    // Main loop: double-and-add. Zero-point checks skipped (accumulator and
+    // table points are always non-zero), only same-x check via _nz helper.
     for (; i != 0; --i)
     {
         const auto idx = 2 * unsigned{intx::bit_test(v, i - 1)} +
                               unsigned{intx::bit_test(u, i - 1)};
         syscall_secp256k1_double(r);
         if (idx != 0)
-        {
-            // Quick reject on first 8-bytes of x-coordinate (~1/2^64 false positive).
-            if (r[0] != points[idx][0]) [[likely]]
-            {
-                syscall_secp256k1_add(r, points[idx]);
-            }
-            else
-            {
-                const auto& rx = reinterpret_cast<const uint256&>(r[0]);
-                const auto& px = reinterpret_cast<const uint256&>(points[idx][0]);
-                if (rx != px) [[likely]]
-                {
-                    syscall_secp256k1_add(r, points[idx]);
-                }
-                else
-                {
-                    const auto& ry = reinterpret_cast<const uint256&>(r[SP1_POINT_SIZE / 2]);
-                    const auto& py = reinterpret_cast<const uint256&>(points[idx][SP1_POINT_SIZE / 2]);
-                    if (ry == py)
-                        syscall_secp256k1_double(r);
-                    else  // r == -p
-                        std::fill_n(r, SP1_POINT_SIZE, 0);
-                }
-            }
-        }
+            sp1_secp256k1_add_nz(r, points[idx]);
     }
 }
 
