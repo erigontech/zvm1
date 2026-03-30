@@ -337,15 +337,40 @@ void sp1_msm(sp1_AffinePoint r,
         }
     }
 
-    // Main loop: double-and-add with direct syscalls (no zero-point checks needed
-    // because the accumulator is always a valid non-zero point after initialization).
+    // Main loop: double-and-add with direct syscalls.
+    // Zero-point checks are unnecessary (accumulator is always non-zero after init),
+    // but same-x check is needed because the multi-point table can cause collisions.
     for (; i != 0; --i)
     {
         const auto idx = 2 * unsigned{intx::bit_test(v, i - 1)} +
                               unsigned{intx::bit_test(u, i - 1)};
         syscall_secp256k1_double(r);
         if (idx != 0)
-            syscall_secp256k1_add(r, points[idx]);
+        {
+            // Quick reject on first 8-bytes of x-coordinate (~1/2^64 false positive).
+            if (r[0] != points[idx][0]) [[likely]]
+            {
+                syscall_secp256k1_add(r, points[idx]);
+            }
+            else
+            {
+                const auto& rx = reinterpret_cast<const uint256&>(r[0]);
+                const auto& px = reinterpret_cast<const uint256&>(points[idx][0]);
+                if (rx != px) [[likely]]
+                {
+                    syscall_secp256k1_add(r, points[idx]);
+                }
+                else
+                {
+                    const auto& ry = reinterpret_cast<const uint256&>(r[SP1_POINT_SIZE / 2]);
+                    const auto& py = reinterpret_cast<const uint256&>(points[idx][SP1_POINT_SIZE / 2]);
+                    if (ry == py)
+                        syscall_secp256k1_double(r);
+                    else  // r == -p
+                        std::fill_n(r, SP1_POINT_SIZE, 0);
+                }
+            }
+        }
     }
 }
 
