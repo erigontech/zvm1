@@ -318,7 +318,7 @@ void sp1_secp256k1_add(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
 /// SP1 version of ecc::msm() — computes multi-scalar multiplication u×P + v×Q
 /// using SP1 syscalls for point operations.
 /// See: ecc.hpp::msm(), https://eprint.iacr.org/2003/257.pdf#page=7.
-__attribute__((flatten)) void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
+void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     const uint256& v, const sp1_AffinePoint q) noexcept
 {
     // Precompute affine P + Q (safe add handles P==Q, P==-Q, and zero points).
