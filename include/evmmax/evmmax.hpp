@@ -165,7 +165,14 @@ public:
                 // Then conditional subtract mod.
 
                 alignas(32) UintT A{};     // t_hi = 0 -> result
-                alignas(32) UintT D = x;   // m = x * N' (will be computed in place)
+                alignas(32) UintT D;       // m = x * N' (will be computed in place)
+                // MEMCOPY x -> D
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
 
                 // 1. m = MUL_LOW(x, N') -> D = m (use aligned mod_inv_full_ directly)
                 {
