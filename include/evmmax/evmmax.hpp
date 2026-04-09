@@ -260,12 +260,11 @@ public:
                 //   if result >= N: result -= N
                 //
                 // Class members mod_, mod_inv_full_ are aligned, used directly as x11.
-                // Eliminates buffer B entirely — saves 2 copies of 32 bytes each.
+                // Only 3 stack buffers needed: A (result), B (y then m/mn_hi), C (t_lo).
 
                 alignas(32) UintT A = x;   // x -> t_hi -> result
+                alignas(32) UintT B = y;   // y -> (reused for m -> mn_hi)
                 alignas(32) UintT C = x;   // x -> t_lo (kept for carry check)
-                alignas(32) UintT D;       // t_lo -> m -> mn_hi
-                alignas(32) UintT B = y;   // y (used only for MUL_HIGH and MUL_LOW)
 
                 // 1. T_hi = MUL_HIGH(x, y)  →  A = t_hi
                 {
@@ -283,25 +282,23 @@ public:
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 3. m = MUL_LOW(t_lo, N')  →  D = m
-                //    Use aligned mod_inv_full_ directly as x11 (no copy needed).
+                // 3. m = MUL_LOW(t_lo, N')  →  B = m (reuse B, copy C -> B first)
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&C);
-                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY C -> D
+                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY C -> B
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_inv_full_);
                     register uint32_t a2 asm("x12") = 0x08; // MUL_LOW
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 4. mN_hi = MUL_HIGH(m, N)  →  D = mN_hi
-                //    Use aligned mod_ directly as x11 (no copy needed).
+                // 4. mN_hi = MUL_HIGH(m, N)  →  B = mN_hi
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
                     register uint32_t a2 asm("x12") = 0x10;
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
@@ -310,11 +307,11 @@ public:
                 // 5. Carry from low half: t_lo + mN_lo = 0 mod 2^256 by construction.
                 const uint32_t low_carry = (C != UintT{0}) ? 1u : 0u;
 
-                // 6. result = ADD(t_hi + mN_hi + carry)  →  A += D
+                // 6. result = ADD(t_hi + mN_hi + carry)  →  A += B
                 uint32_t carry;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
                     register uint32_t a2 asm("x12") = 0x01 | (low_carry << 6);
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     carry = a2;
