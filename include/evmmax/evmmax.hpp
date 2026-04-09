@@ -337,6 +337,56 @@ public:
         }
 #endif
 
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (UintT::num_bits == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // add = x + y, then try subtract mod. 2 CSR calls.
+                alignas(32) UintT res = x;
+                alignas(32) UintT b = y;
+                uint32_t add_carry;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                    register uint32_t a2 asm("x12") = 0x01; // ADD
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    add_carry = a2;
+                }
+                // Try subtract mod
+                b = mod_;
+                if (add_carry)
+                {
+                    // Definitely >= mod, subtract unconditionally
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                    register uint32_t a2 asm("x12") = 0x02; // SUB
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+                else
+                {
+                    // Try subtract; if borrow, undo with ADD
+                    uint32_t borrow;
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                        register uint32_t a2 asm("x12") = 0x02; // SUB
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                        borrow = a2;
+                    }
+                    if (borrow)
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                        register uint32_t a2 asm("x12") = 0x01; // ADD
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+                }
+                return res;
+            }
+        }
+#endif
+
         const auto s = addc(x, y);  // TODO: cannot overflow if modulus is sparse (e.g. 255 bits).
         const auto d = subc(s.value, mod_);
         return (!s.carry && d.carry) ? s.value : d.value;
@@ -353,6 +403,35 @@ public:
             syscall_bn254_fp_submod(
                 reinterpret_cast<size_t*>(&res), reinterpret_cast<const size_t*>(&y));
             return res;
+        }
+#endif
+
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (UintT::num_bits == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // sub = x - y; if borrow, add mod back. 1-2 CSR calls.
+                alignas(32) UintT res = x;
+                alignas(32) UintT b = y;
+                uint32_t borrow;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                    register uint32_t a2 asm("x12") = 0x02; // SUB
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    borrow = a2;
+                }
+                if (borrow)
+                {
+                    b = mod_;
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                    register uint32_t a2 asm("x12") = 0x01; // ADD
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+                return res;
+            }
         }
 #endif
 
