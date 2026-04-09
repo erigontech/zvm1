@@ -260,35 +260,42 @@ public:
                 //   if result >= N: result -= N
                 //
                 // Class members mod_, mod_inv_full_ are aligned, used directly as x11.
-                // Only 3 stack buffers needed: A (result), B (y then m/mn_hi), C (t_lo).
+                // FieldElement value_ is aligned, so y can be used directly as x11.
+                // Only 2 stack buffers needed: A (x10 mutable), B (scratch).
 
-                alignas(32) UintT A = x;   // x -> t_hi -> result
-                alignas(32) UintT B = y;   // y -> (reused for m -> mn_hi)
-                alignas(32) UintT C = x;   // x -> t_lo (kept for carry check)
+                alignas(32) UintT A = x;   // x -> t_lo -> t_hi -> result
+                alignas(32) UintT B;       // scratch: t_lo saved -> m -> mn_hi
 
-                // 1. T_hi = MUL_HIGH(x, y)  →  A = t_hi
+                // 1. T_lo = MUL_LOW(x, y)  →  A = t_lo (y used directly as x11)
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
-                    register uint32_t a2 asm("x12") = 0x10;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 2. T_lo = MUL_LOW(x, y)  →  C = t_lo
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&C);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
                     register uint32_t a2 asm("x12") = 0x08;
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 3. m = MUL_LOW(t_lo, N')  →  B = m (reuse B, copy C -> B first)
+                // 2. Save t_lo: MEMCOPY A -> B, then compute m in B
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&C);
-                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY C -> B
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&A);
+                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY A -> B
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
+
+                // 3. Reload x and compute T_hi
+                A = x;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+                    register uint32_t a2 asm("x12") = 0x10; // MUL_HIGH
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+                // Now A = t_hi, B = t_lo
+
+                // 4. Carry from low half (before overwriting B)
+                const uint32_t low_carry = (B != UintT{0}) ? 1u : 0u;
+
+                // 5. m = MUL_LOW(t_lo, N')  →  B = m
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_inv_full_);
@@ -296,7 +303,7 @@ public:
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 4. mN_hi = MUL_HIGH(m, N)  →  B = mN_hi
+                // 6. mN_hi = MUL_HIGH(m, N)  →  B = mN_hi
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
@@ -304,10 +311,7 @@ public:
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 5. Carry from low half: t_lo + mN_lo = 0 mod 2^256 by construction.
-                const uint32_t low_carry = (C != UintT{0}) ? 1u : 0u;
-
-                // 6. result = ADD(t_hi + mN_hi + carry)  →  A += B
+                // 7. result = ADD(t_hi + mN_hi + carry)  →  A += B
                 uint32_t carry;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);

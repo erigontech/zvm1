@@ -33,7 +33,11 @@ class FieldElement
     static constexpr bool is_bn_accel = requires { Spec::BN_ACCELERATED; };
     static constexpr ModArith<uint_type, is_bn_accel> Fp{Spec::ORDER};
 
+#if defined(AIRBENDER) && defined(__riscv)
+    alignas(32) uint_type value_;
+#else
     uint_type value_;
+#endif
 
     /// Wraps a value into the Element type assuming it is already in the internal ModArith form.
     [[gnu::always_inline]] static constexpr FieldElement wrap(const uint_type& v) noexcept
