@@ -56,6 +56,23 @@ constexpr uint64_t compute_mont_mod_inv(const UintT& mod) noexcept
     return -modinv(mod[0]);
 }
 
+#if defined(AIRBENDER) && defined(__riscv)
+/// Compute the full 256-bit Montgomery inverse: N' such that mod⋅N' ≡ -1 (mod 2²⁵⁶).
+/// Uses Newton-Raphson starting from the 64-bit inverse, doubling bits each step.
+template <typename UintT>
+constexpr UintT compute_mont_mod_inv_full(const UintT& mod) noexcept
+{
+    // Start with 64-bit inverse
+    UintT inv{};
+    inv[0] = compute_mont_mod_inv(mod);
+    // Newton-Raphson: for N' where N*N' ≡ -1 (mod R), step is N' * (2 + N*N')
+    // Each iteration doubles the number of correct bits: 64 → 128 → 256
+    inv = inv * (UintT{2} + mod * inv);  // 128 bits correct
+    inv = inv * (UintT{2} + mod * inv);  // 256 bits correct
+    return inv;
+}
+#endif
+
 constexpr std::pair<uint64_t, uint64_t> addmul(
     uint64_t t, uint64_t a, uint64_t b, uint64_t c) noexcept
 {
@@ -74,6 +91,11 @@ class ModArith
     /// The modulus inversion, i.e. the number N' such that mod⋅N' = 2⁶⁴-1.
     const uint64_t mod_inv_;
 
+#if defined(AIRBENDER) && defined(__riscv)
+    /// Full 256-bit Montgomery inverse: mod⋅mod_inv_full_ ≡ -1 (mod 2²⁵⁶).
+    const UintT mod_inv_full_;
+#endif
+
     /// Compute R² % mod.
     static constexpr UintT compute_r_squared(const UintT& mod) noexcept
     {
@@ -89,6 +111,10 @@ public:
 #if defined SP1 || defined SP1TURBO
         r_squared_{BN ? 1 : compute_r_squared(mod)},
         mod_inv_{BN ? 0 : compute_mont_mod_inv(mod)}
+#elif defined(AIRBENDER) && defined(__riscv)
+        r_squared_{compute_r_squared(mod)},
+        mod_inv_{compute_mont_mod_inv(mod)},
+        mod_inv_full_{compute_mont_mod_inv_full(mod)}
 #else
         r_squared_{compute_r_squared(mod)},
         mod_inv_{compute_mont_mod_inv(mod)}
@@ -143,6 +169,125 @@ public:
         }
 #endif
 
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (UintT::num_bits == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // BigInt CSR Montgomery multiplication using 5 aligned buffers (A-E):
+                //   T = x*y  (512-bit)
+                //   m = T_lo * N'  (mod 2^256)
+                //   result = (T + m*N) >> 256
+                //   if result >= N: result -= N
+                //
+                // 7 CSR calls total: 2 for x*y, 1 for m, 2 for m*N, 1 ADD, 1 SUB
+
+                alignas(32) UintT A = x;   // will hold t_hi, then result
+                alignas(32) UintT B = y;   // scratch: y, then inv, then mod
+                alignas(32) UintT C;       // t_lo, then used for ADD
+                alignas(32) UintT D;       // m, then mn_hi
+                alignas(32) UintT E;       // mn_lo
+
+                // 1. T_hi = MUL_HIGH(x, y)  →  A = t_hi
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x10;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 2. T_lo = MUL_LOW(x, y)  →  C = t_lo  (B=y still intact)
+                C = x;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&C);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x08;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 3. m = MUL_LOW(t_lo, N')  →  D = m
+                D = C;  // copy t_lo
+                B = mod_inv_full_;  // reuse B for inv
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x08;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 4. mN_lo = MUL_LOW(m, N)  →  E = mN_lo
+                E = D;  // copy m
+                B = mod_;  // reuse B for mod
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&E);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x08;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 5. mN_hi = MUL_HIGH(m, N)  →  D = mN_hi  (D still has m, B has mod)
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x10;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 6. carry = ADD(t_lo, mN_lo)  →  C += E (low half cancels)
+                uint32_t carry;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&C);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&E);
+                    register uint32_t a2 asm("x12") = 0x01;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    carry = a2;
+                }
+
+                // 7. result = ADD(t_hi, mN_hi + carry)  →  A += D
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&D);
+                    register uint32_t a2 asm("x12") = 0x01 | (carry << 6);
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    carry = a2;
+                }
+
+                // 8. Conditional subtract: try SUB(A, mod), keep if no borrow
+                //    B still has mod_ from step 4.
+                //    If carry from step 7, result definitely >= mod → always subtract.
+                //    Otherwise, try subtract; if borrow → revert by adding back.
+                if (carry)
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x02; // SUB
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+                else
+                {
+                    // Try subtract: SUB(A, mod). If borrow (a2=1), undo with ADD.
+                    uint32_t borrow;
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                        register uint32_t a2 asm("x12") = 0x02;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                        borrow = a2;
+                    }
+                    if (borrow)
+                    {
+                        // Undo: ADD back mod
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                        register uint32_t a2 asm("x12") = 0x01;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+                }
+
+                return A;
+            }
+        }
+#endif
 
         // Coarsely Integrated Operand Scanning (CIOS) Method
         // Based on 2.3.2 from
