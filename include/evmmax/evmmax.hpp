@@ -282,8 +282,13 @@ public:
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 3. Reload x and compute T_hi
-                A = x;
+                // 3. Reload x via MEMCOPY (1 cycle vs 16 instructions for word-by-word)
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY x -> A
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
