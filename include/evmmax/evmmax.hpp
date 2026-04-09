@@ -263,8 +263,16 @@ public:
                 // FieldElement value_ is aligned, so y can be used directly as x11.
                 // Only 2 stack buffers needed: A (x10 mutable), B (scratch).
 
-                alignas(32) UintT A = x;   // x -> t_lo -> t_hi -> result
+                alignas(32) UintT A;       // x -> t_lo -> t_hi -> result
                 alignas(32) UintT B;       // scratch: t_lo saved -> m -> mn_hi
+
+                // 0. Copy x -> A using MEMCOPY CSR
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
 
                 // 1. T_lo = MUL_LOW(x, y)  →  A = t_lo (y used directly as x11)
                 {
