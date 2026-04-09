@@ -149,6 +149,87 @@ public:
             return x;
         else
 #endif
+
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (UintT::num_bits == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // Optimized from_mont: mul(x, 1) means T = x*1, so t_lo = x, t_hi = 0.
+                // Skip the two MUL CSR calls for x*y entirely.
+                // m = t_lo * N' mod 2^256 = x * N' mod 2^256
+                // result = (0 + mN_hi + carry) where carry = (x != 0)
+                // Then conditional subtract mod.
+
+                alignas(32) UintT A{};     // t_hi = 0 -> result
+                alignas(32) UintT B;       // scratch: inv, then mod
+                alignas(32) UintT D = x;   // m = x * N' (will be computed in place)
+
+                // 1. m = MUL_LOW(x, N') -> D = m
+                B = mod_inv_full_;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x08; // MUL_LOW
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 2. Load mod -> B
+                B = mod_;
+
+                // 3. mN_hi = MUL_HIGH(m, N) -> D = mN_hi
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x10; // MUL_HIGH
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+
+                // 4. carry = (x != 0) since t_lo = x and t_lo + mN_lo = 0 or 2^256
+                const uint32_t low_carry = (x != UintT{0}) ? 1u : 0u;
+
+                // 5. result = 0 + mN_hi + carry -> A += D
+                uint32_t carry;
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&D);
+                    register uint32_t a2 asm("x12") = 0x01 | (low_carry << 6);
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    carry = a2;
+                }
+
+                // 6. Conditional subtract mod
+                if (carry)
+                {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                    register uint32_t a2 asm("x12") = 0x02;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                }
+                else
+                {
+                    uint32_t borrow;
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                        register uint32_t a2 asm("x12") = 0x02;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                        borrow = a2;
+                    }
+                    if (borrow)
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                        register uint32_t a2 asm("x12") = 0x01;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+                }
+
+                return A;
+            }
+        }
+#endif
+
             return mul(x, 1);
     }
 
