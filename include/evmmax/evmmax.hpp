@@ -408,13 +408,12 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // add = x + y, then try subtract mod. 2-3 CSR calls.
-                // Uses aligned mod_ directly as x11 (no copy needed).
+                // Uses aligned mod_ and y directly as x11.
                 alignas(32) UintT res = x;
-                alignas(32) UintT b = y;
                 uint32_t add_carry;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
                     register uint32_t a2 asm("x12") = 0x01; // ADD
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     add_carry = a2;
@@ -475,12 +474,12 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // sub = x - y; if borrow, add mod back. 1-2 CSR calls.
+                // Uses aligned y and mod_ directly as x11.
                 alignas(32) UintT res = x;
-                alignas(32) UintT b = y;
                 uint32_t borrow;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
                     register uint32_t a2 asm("x12") = 0x02; // SUB
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     borrow = a2;
