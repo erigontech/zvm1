@@ -148,6 +148,11 @@ struct AffinePoint
       : x{x_value}, y{y_value}
     {}
 
+    friend constexpr AffinePoint operator-(const AffinePoint& p) noexcept
+    {
+        return {p.x, -p.y};
+    }
+
     friend constexpr bool operator==(const AffinePoint&, const AffinePoint&) = default;
 
     friend constexpr bool operator==(const AffinePoint& p, zero_t) noexcept

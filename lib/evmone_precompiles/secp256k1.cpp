@@ -61,6 +61,146 @@ ecc::ProjPoint<Curve> msm_with_g_table(
     return result;
 }
 
+/// Precomputed phi(G) = (BETA * G.x, G.y) for GLV endomorphism.
+/// phi(P) = (BETA*P.x, P.y) satisfies phi(P) = [LAMBDA]*P on secp256k1.
+constexpr auto make_phi_g() noexcept
+{
+    const auto beta = Curve::Fp{Curve::BETA};
+    return AffinePoint{beta * G.x, G.y};
+}
+constexpr AffinePoint PHI_G = make_phi_g();
+
+/// GLV 4-way MSM: computes u1*G + u2*R using scalar decomposition and endomorphism.
+///
+/// Decomposes each 256-bit scalar into two ~128-bit half-scalars via the GLV lattice,
+/// then runs a 4-way Shamir scan over ~128 bits instead of ~256 bits.
+/// Uses batch inversion (Montgomery's trick) to build the 15-entry lookup table
+/// with only 2 field inversions instead of 11.
+ecc::ProjPoint<Curve> ecrecover_msm_glv(
+    const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
+{
+    using FE = Curve::Fp;
+
+    // 1. Decompose scalars: u1 = k1a + k1b*lambda, u2 = k2a + k2b*lambda
+    auto [sk1a, sk1b] = ecc::decompose<Curve>(u1);
+    auto [sk2a, sk2b] = ecc::decompose<Curve>(u2);
+
+    // Compute phi(R) = (BETA * R.x, R.y)
+    const FE beta{Curve::BETA};
+    const AffinePoint phi_R{beta * R.x, R.y};
+
+    // Handle signs: negate point if scalar is negative.
+    AffinePoint P1 = sk1a.sign ? -G : G;
+    AffinePoint P2 = sk1b.sign ? -PHI_G : PHI_G;
+    AffinePoint P3 = sk2a.sign ? -R : R;
+    AffinePoint P4 = sk2b.sign ? -phi_R : phi_R;
+
+    const auto& k1a = sk1a.value;
+    const auto& k1b = sk1b.value;
+    const auto& k2a = sk2a.value;
+    const auto& k2b = sk2b.value;
+
+    // 2. Build 15-entry Shamir lookup table using batch inversion.
+    //    Indexed by 4-bit mask: bit0=k1a, bit1=k1b, bit2=k2a, bit3=k2b.
+    AffinePoint table[15];
+    table[0]  = P1;  // 0001
+    table[1]  = P2;  // 0010
+    table[3]  = P3;  // 0100
+    table[7]  = P4;  // 1000
+
+    // Helper for batch inversion point addition.
+    struct AddData { FE dx; FE dy; FE x1; FE y1; FE x2; };
+
+    auto compute_add = [](const AddData& d, const FE& inv_dx) -> AffinePoint {
+        const auto slope = d.dy * inv_dx;
+        const auto xr = slope * slope - d.x1 - d.x2;
+        const auto yr = slope * (d.x1 - xr) - d.y1;
+        return {xr, yr};
+    };
+
+    // --- Batch 1: 6 independent pairwise additions ---
+    AddData b1[6];
+    b1[0] = {P2.x - P1.x, P2.y - P1.y, P1.x, P1.y, P2.x};  // P1+P2
+    b1[1] = {P3.x - P1.x, P3.y - P1.y, P1.x, P1.y, P3.x};  // P1+P3
+    b1[2] = {P3.x - P2.x, P3.y - P2.y, P2.x, P2.y, P3.x};  // P2+P3
+    b1[3] = {P4.x - P1.x, P4.y - P1.y, P1.x, P1.y, P4.x};  // P1+P4
+    b1[4] = {P4.x - P2.x, P4.y - P2.y, P2.x, P2.y, P4.x};  // P2+P4
+    b1[5] = {P4.x - P3.x, P4.y - P3.y, P3.x, P3.y, P4.x};  // P3+P4
+
+    FE acc1[6];
+    acc1[0] = b1[0].dx;
+    for (int i = 1; i < 6; ++i)
+        acc1[i] = acc1[i - 1] * b1[i].dx;
+
+    FE inv_a1 = 1 / acc1[5];
+
+    FE i1[6];
+    for (int i = 5; i > 0; --i)
+    {
+        i1[i] = inv_a1 * acc1[i - 1];
+        inv_a1 = inv_a1 * b1[i].dx;
+    }
+    i1[0] = inv_a1;
+
+    table[2]  = compute_add(b1[0], i1[0]); // P1+P2
+    table[4]  = compute_add(b1[1], i1[1]); // P1+P3
+    table[5]  = compute_add(b1[2], i1[2]); // P2+P3
+    table[8]  = compute_add(b1[3], i1[3]); // P1+P4
+    table[9]  = compute_add(b1[4], i1[4]); // P2+P4
+    table[11] = compute_add(b1[5], i1[5]); // P3+P4
+
+    // --- Batch 2: 5 additions depending on batch 1 results ---
+    AddData b2[5];
+    b2[0] = {P3.x - table[2].x, P3.y - table[2].y, table[2].x, table[2].y, P3.x};
+    b2[1] = {P4.x - table[2].x, P4.y - table[2].y, table[2].x, table[2].y, P4.x};
+    b2[2] = {P4.x - table[4].x, P4.y - table[4].y, table[4].x, table[4].y, P4.x};
+    b2[3] = {P4.x - table[5].x, P4.y - table[5].y, table[5].x, table[5].y, P4.x};
+    b2[4] = {table[5].x - table[8].x, table[5].y - table[8].y,
+             table[8].x, table[8].y, table[5].x};
+
+    FE acc2[5];
+    acc2[0] = b2[0].dx;
+    for (int i = 1; i < 5; ++i)
+        acc2[i] = acc2[i - 1] * b2[i].dx;
+
+    FE inv_a2 = 1 / acc2[4];
+
+    FE i2[5];
+    for (int i = 4; i > 0; --i)
+    {
+        i2[i] = inv_a2 * acc2[i - 1];
+        inv_a2 = inv_a2 * b2[i].dx;
+    }
+    i2[0] = inv_a2;
+
+    table[6]  = compute_add(b2[0], i2[0]); // (P1+P2)+P3
+    table[10] = compute_add(b2[1], i2[1]); // (P1+P2)+P4
+    table[12] = compute_add(b2[2], i2[2]); // (P1+P3)+P4
+    table[13] = compute_add(b2[3], i2[3]); // (P2+P3)+P4
+    table[14] = compute_add(b2[4], i2[4]); // (P1+P4)+(P2+P3) = P1+P2+P3+P4
+
+    // 3. 4-way Shamir scan over ~128 bits.
+    const auto bw = intx::bit_width(k1a | k1b | k2a | k2b);
+    if (bw == 0)
+        return {};
+
+    ecc::ProjPoint<Curve> result;
+    for (auto i = bw; i != 0; --i)
+    {
+        result = ecc::dbl(result);
+
+        const unsigned idx =
+            (unsigned{intx::bit_test(k1a, i - 1)} << 0) |
+            (unsigned{intx::bit_test(k1b, i - 1)} << 1) |
+            (unsigned{intx::bit_test(k2a, i - 1)} << 2) |
+            (unsigned{intx::bit_test(k2b, i - 1)} << 3);
+        if (idx != 0)
+            result = ecc::add(result, table[idx - 1]);
+    }
+
+    return result;
+}
+
 }  // namespace
 
 // FIXME: Change to "uncompress_point".
@@ -464,8 +604,8 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     // 6. Calculate public key point Q = u1×G + u2×R.
     const auto Rpt = AffinePoint{r_mont, *y};
 #if defined(AIRBENDER) && defined(__riscv)
-    // Use windowed MSM with precomputed G-table for better performance
-    const auto Q = msm_with_g_table(u1.value(), u2.value(), Rpt);
+    // Use GLV endomorphism for 4-way MSM over ~128-bit scalars
+    const auto Q = ecrecover_msm_glv(u1.value(), u2.value(), Rpt);
 #else
     const auto Q = msm(u1.value(), G, u2.value(), Rpt);
 #endif
