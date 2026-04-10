@@ -17,96 +17,42 @@ constexpr auto B = Curve::Fp{7};
 constexpr AffinePoint G{0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256,
     0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8_u256};
 
-/// Precomputed affine multiples of the generator G: G_TABLE[i] = (i+1)*G.
-/// Compile-time constants — zero runtime initialization cost.
-constexpr int G_TABLE_SIZE = 15;
-
+/// Precomputed window-8 table: G_TABLE[i] = (i+1)*G for i=0..254.
+/// 255 consteval AffinePoints = 16KB in .rodata.
+/// Window-8 is the sweet spot: ~30 G-additions vs ~128 binary.
+/// Larger windows (12, 15) cause memory access overhead that offsets savings.
+constexpr int G_TABLE_SIZE = 255;
+constexpr unsigned G_WINDOW = 8;
+constexpr unsigned G_WINDOW_MASK = 0xFF;
 // NOLINTNEXTLINE(*-avoid-c-arrays)
 constexpr AffinePoint G_TABLE[G_TABLE_SIZE] = {
-    // 1G
-    {0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256,
-     0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8_u256},
-    // 2G
-    {0xc6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5_u256,
-     0x1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a_u256},
-    // 3G
-    {0xf9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9_u256,
-     0x388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672_u256},
-    // 4G
-    {0xe493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13_u256,
-     0x51ed993ea0d455b75642e2098ea51448d967ae33bfbdfe40cfe97bdc47739922_u256},
-    // 5G
-    {0x2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4_u256,
-     0xd8ac222636e5e3d6d4dba9dda6c9c426f788271bab0d6840dca87d3aa6ac62d6_u256},
-    // 6G
-    {0xfff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556_u256,
-     0xae12777aacfbb620f3be96017f45c560de80f0f6518fe4a03c870c36b075f297_u256},
-    // 7G
-    {0x5cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc_u256,
-     0x6aebca40ba255960a3178d6d861a54dba813d0b813fde7b5a5082628087264da_u256},
-    // 8G
-    {0x2f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a01_u256,
-     0x5c4da8a741539949293d082a132d13b4c2e213d6ba5b7617b5da2cb76cbde904_u256},
-    // 9G
-    {0xacd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe_u256,
-     0xcc338921b0a7d9fd64380971763b61e9add888a4375f8e0f05cc262ac64f9c37_u256},
-    // 10G
-    {0xa0434d9e47f3c86235477c7b1ae6ae5d3442d49b1943c2b752a68e2a47e247c7_u256,
-     0x893aba425419bc27a3b6c7e693a24c696f794c2ed877a1593cbee53b037368d7_u256},
-    // 11G
-    {0x774ae7f858a9411e5ef4246b70c65aac5649980be5c17891bbec17895da008cb_u256,
-     0xd984a032eb6b5e190243dd56d7b7b365372db1e2dff9d6a8301d74c9c953c61b_u256},
-    // 12G
-    {0xd01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a_u256,
-     0xa9f34ffdc815e0d7a8b64537e17bd81579238c5dd9a86d526b051b13f4062327_u256},
-    // 13G
-    {0xf28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8_u256,
-     0xab0902e8d880a89758212eb65cdaf473a1a06da521fa91f29b5cb52db03ed81_u256},
-    // 14G
-    {0x499fdf9e895e719cfd64e67f07d38e3226aa7b63678949e6e49b241a60e823e4_u256,
-     0xcac2f6c4b54e855190f044e4a7b3d464464279c27a3f95bcc65f40d403a13f5b_u256},
-    // 15G
-    {0xd7924d4f7d43ea965a465ae3095ff41131e5946f3c85f79e44adbcf8e27e080e_u256,
-     0x581e2872a86c72a683842ec228cc6defea40af2bd896d3a5c504dc9ff6a26b58_u256},
+#include "secp256k1_g_table_w8.inc"
 };
 
-/// Windowed MSM using precomputed G-table: computes u*G + v*R.
-///
-/// Uses window-4 for the G scalar (precomputed table, no runtime cost) and
-/// standard binary for the R scalar (no runtime precomputation needed).
-/// Processes bits from MSB to LSB: at each bit, doubles and optionally adds R;
-/// at every 4th bit, also looks up the G-table for the 4-bit u window.
-///
-/// vs plain Shamir: same doublings (256), fewer total additions because
-/// window-4 for G has ~60 non-zero windows vs ~128 non-zero bits.
+/// Window-8 MSM using precomputed G-table: computes u*G + v*R.
 ecc::ProjPoint<Curve> msm_with_g_table(
     const uint256& u, const uint256& v, const AffinePoint& R) noexcept
 {
-    // G_TABLE[i] = (i+1)*G, compile-time constant, no runtime cost
-
     ecc::ProjPoint<Curve> result;
 
     const auto bit_width = intx::bit_width(u | v);
     if (bit_width == 0)
         return result;
 
-    // Round up to next multiple of 4 for G-window processing
-    const auto aligned_width = ((bit_width + 3) / 4) * 4;
+    const auto aligned_width =
+        ((bit_width + G_WINDOW - 1) / G_WINDOW) * G_WINDOW;
 
     for (auto i = aligned_width; i != 0; --i)
     {
         result = ecc::dbl(result);
 
-        // Binary addition for R (v scalar)
         if (i <= bit_width && intx::bit_test(v, i - 1))
             result = ecc::add(result, R);
 
-        // Window-4 addition for G (u scalar) at every window boundary
-        if ((i & 3) == 1)  // bits i-1, i, i+1, i+2 form a complete window
+        if (((i - 1) % G_WINDOW) == 0 && i <= bit_width)
         {
-            // Extract 4-bit window: bits (i-1) through (i+2)
             const auto shift = i - 1;
-            const auto u_win = static_cast<unsigned>((u >> shift) & 0xF);
+            const auto u_win = static_cast<unsigned>((u >> shift) & G_WINDOW_MASK);
             if (u_win != 0)
                 result = ecc::add(result, G_TABLE[u_win - 1]);
         }

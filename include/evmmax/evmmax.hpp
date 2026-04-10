@@ -82,7 +82,11 @@ constexpr std::pair<uint64_t, uint64_t> addmul(
 
 /// The modular arithmetic operations for EVMMAX (EVM Modular Arithmetic Extensions).
 template <typename UintT, bool BN = false>
+#if defined(AIRBENDER) && defined(__riscv)
+class alignas(32) ModArith  // Class-level alignment ensures constexpr instances in .rodata are aligned.
+#else
 class ModArith
+#endif
 {
 #if defined(AIRBENDER) && defined(__riscv)
     // Align members to 32 bytes for direct use with BigInt CSR (avoids copies).
