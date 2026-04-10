@@ -14,6 +14,33 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     register uint64_t a1 asm("a1") = 0;
     asm volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
+#elif defined(AIRBENDER)
+/// Keccak-f[1600] via airbender CSR 0x7CB delegation.
+/// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
+/// scans for exactly 649 contiguous csrrw instructions.
+static void syscall_keccak_permute(uint64_t state[25])
+{
+    /* Use static buffer to avoid stack alignment issues on rv32im. */
+    static uint64_t __attribute__((aligned(256))) buf[32];
+    int i;
+    for (i = 0; i < 25; i++)
+        buf[i] = state[i];
+    for (i = 25; i < 31; i++)
+        buf[i] = 0;
+
+    register uint32_t ctrl __asm__("x10") = 0;
+    register void*    sptr __asm__("x11") = (void*)buf;
+    __asm__ __volatile__(
+        ".rept 649\n"
+        "  csrrw x0, 0x7CB, x0\n"
+        ".endr\n"
+        : "+r"(ctrl)
+        : "r"(sptr)
+        : "memory"
+    );
+    for (i = 0; i < 25; i++)
+        state[i] = buf[i];
+}
 #endif
 
 // Provide __has_attribute macro if not defined.
@@ -305,7 +332,7 @@ static void keccakf1600_generic(uint64_t state[25])
 
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
 #define DEFAULT_keccakf1600 syscall_keccak_permute
 #else
 #define DEFAULT_keccakf1600 keccakf1600_generic

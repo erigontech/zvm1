@@ -169,14 +169,7 @@ public:
                 // Then conditional subtract mod.
 
                 alignas(32) UintT A{};     // t_hi = 0 -> result
-                alignas(32) UintT D;       // m = x * N' (will be computed in place)
-                // MEMCOPY x -> D
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
-                    register uint32_t a2 asm("x12") = 0x80;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
+                alignas(32) UintT D = x;   // m = x * N' (copy x, may be misaligned)
 
                 // 1. m = MUL_LOW(x, N') -> D = m (use aligned mod_inv_full_ directly)
                 {
@@ -276,24 +269,20 @@ public:
 
                 alignas(32) UintT A;       // x -> t_lo -> t_hi -> result
                 alignas(32) UintT B;       // scratch: t_lo saved -> m -> mn_hi
+                alignas(32) UintT Y = y;   // aligned copy of y (may be misaligned)
 
-                // 0. Copy x -> A using MEMCOPY CSR
+                // 0. Copy x -> A (x may be misaligned, use word copy)
+                A = x;
+
+                // 1. T_lo = MUL_LOW(x, y)  →  A = t_lo
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
-                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 1. T_lo = MUL_LOW(x, y)  →  A = t_lo (y used directly as x11)
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&Y);
                     register uint32_t a2 asm("x12") = 0x08;
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 2. Save t_lo: MEMCOPY A -> B, then compute m in B
+                // 2. Save t_lo: MEMCOPY A -> B
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&A);
@@ -301,16 +290,11 @@ public:
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
-                // 3. Reload x via MEMCOPY (1 cycle vs 16 instructions for word-by-word)
+                // 3. Reload x -> A, then MUL_HIGH(x, y) -> A = t_hi
+                A = x;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
-                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY x -> A
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&Y);
                     register uint32_t a2 asm("x12") = 0x10; // MUL_HIGH
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
@@ -432,12 +416,13 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // add = x + y, then try subtract mod. 2-3 CSR calls.
-                // Uses aligned mod_ and y directly as x11.
+                // Copy y to aligned buffer (y may be misaligned stack temp).
                 alignas(32) UintT res = x;
+                alignas(32) UintT yy = y;
                 uint32_t add_carry;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&yy);
                     register uint32_t a2 asm("x12") = 0x01; // ADD
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     add_carry = a2;
@@ -498,12 +483,13 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // sub = x - y; if borrow, add mod back. 1-2 CSR calls.
-                // Uses aligned y and mod_ directly as x11.
+                // Copy y to aligned buffer (y may be misaligned stack temp).
                 alignas(32) UintT res = x;
+                alignas(32) UintT yy = y;
                 uint32_t borrow;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&yy);
                     register uint32_t a2 asm("x12") = 0x02; // SUB
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     borrow = a2;
