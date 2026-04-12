@@ -472,10 +472,10 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
     {
         const auto begin = static_cast<size_t>(index);
         const auto end = std::min(begin + 32, state.msg->input_size);
+        const auto len = end - begin;
 
         uint8_t data[32] = {};
-        for (size_t i = 0; i < (end - begin); ++i)
-            data[i] = state.msg->input_data[begin + i];
+        std::memcpy(data, state.msg->input_data + begin, len);
 
         index = intx::be::load<uint256>(data);
     }
