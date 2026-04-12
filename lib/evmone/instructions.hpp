@@ -66,9 +66,10 @@ constexpr auto word_size = 32;
 
 /// Returns number of words what would fit to provided number of bytes,
 /// i.e. it rounds up the number bytes to number of words.
+/// Uses uint32_t shift for rv32im efficiency (sizes are bounded by max_buffer_size).
 constexpr int64_t num_words(uint64_t size_in_bytes) noexcept
 {
-    return static_cast<int64_t>((size_in_bytes + (word_size - 1)) / word_size);
+    return static_cast<int64_t>(static_cast<uint32_t>(size_in_bytes + 31) >> 5);
 }
 
 /// Computes gas cost of copying the given amount of bytes to/from EVM memory.
