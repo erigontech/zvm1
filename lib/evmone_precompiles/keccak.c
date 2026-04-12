@@ -419,6 +419,41 @@ static inline ALWAYS_INLINE void keccak(
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 {
     union ethash_hash256 hash;
+    // For keccak-256: block_size = (1600 - 256*2) / 8 = 136 bytes.
+    // Most EVM inputs are < 136 bytes (single block). Specialize.
+    if (size < 136)
+    {
+        size_t i;
+        uint64_t state[25] = {0};
+        uint64_t* state_iter = state;
+        const uint8_t* d = data;
+        size_t remaining = size;
+
+        while (remaining >= 8)
+        {
+            *state_iter++ ^= load_le(d);
+            d += 8;
+            remaining -= 8;
+        }
+
+        // Handle remaining bytes + padding byte 0x01
+        uint64_t last_word = 0;
+        uint8_t* lw = (uint8_t*)&last_word;
+        for (i = 0; i < remaining; ++i)
+            lw[i] = d[i];
+        lw[remaining] = 0x01;
+        *state_iter ^= to_le64(last_word);
+
+        state[16] ^= 0x8000000000000000ULL;  // block_size/8 - 1 = 16
+
+        keccakf1600_best(state);
+
+        hash.word64s[0] = to_le64(state[0]);
+        hash.word64s[1] = to_le64(state[1]);
+        hash.word64s[2] = to_le64(state[2]);
+        hash.word64s[3] = to_le64(state[3]);
+        return hash;
+    }
     keccak(hash.word64s, 256, data, size);
     return hash;
 }
