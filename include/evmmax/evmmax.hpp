@@ -516,6 +516,130 @@ public:
     /// If x is not invertible, the result is 0.
     constexpr UintT inv(const UintT& x) const noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (UintT::num_bits == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // Fermat inversion: x^{mod-2} mod p, using CSR-accelerated Montgomery muls.
+                // For the secp256k1 field prime, uses an optimized addition chain (266S+14M=280 muls).
+                // For other primes, uses generic square-and-multiply (~383 muls).
+                // Both are faster than the binary GCD (~512 iterations of non-CSR ops).
+
+                if (x == UintT{0}) [[unlikely]]
+                    return UintT{0};
+
+                // secp256k1 field prime p
+                constexpr UintT SECP256K1_P =
+                    intx::from_string<UintT>("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+
+                if (mod_ == SECP256K1_P)
+                {
+                    // Optimized addition chain for p-2 exponent.
+                    // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+                    //     = 2^256 - 2^32 - 979
+                    // Reuses the field_sqrt chain (253S+13M) up to x223, then 34S+3M for tail.
+                    // Total: 266S + 14M = 280 Montgomery muls.
+
+                    auto sq = [this](const UintT& a) noexcept { return mul(a, a); };
+
+                    UintT z, t0, t1, t2, t3, f;
+
+                    // Step 1: z = x^0x2
+                    z = sq(x);
+                    // Step 2: z = x^0x3
+                    z = mul(x, z);
+                    // Step 4: t0 = x^0xc
+                    t0 = sq(z);
+                    t0 = sq(t0);
+                    // Step 5: t0 = x^0xf
+                    t0 = mul(z, t0);
+                    // Save x^15 for computing x^45 later
+                    f = t0;
+                    // Step 6: t1 = x^0x1e
+                    t1 = sq(t0);
+                    // Step 7: t2 = x^0x1f
+                    t2 = mul(x, t1);
+                    // Step 9: t1 = x^0x7c
+                    t1 = sq(t2);
+                    t1 = sq(t1);
+                    // Step 10: t1 = x^0x7f
+                    t1 = mul(z, t1);
+                    // Step 14: t3 = x^0x7f0
+                    t3 = sq(t1);
+                    for (int i = 1; i < 4; ++i)
+                        t3 = sq(t3);
+                    // Step 15: t0 = x^0x7ff
+                    t0 = mul(t0, t3);
+                    // Step 26: t3 = x^0x3ff800
+                    t3 = sq(t0);
+                    for (int i = 1; i < 11; ++i)
+                        t3 = sq(t3);
+                    // Step 27: t0 = x^0x3fffff  (x22 = x^{2^22-1})
+                    t0 = mul(t0, t3);
+                    // Step 32: t3 = x^0x7ffffe0
+                    t3 = sq(t0);
+                    for (int i = 1; i < 5; ++i)
+                        t3 = sq(t3);
+                    // Step 33: t2 = x^0x7ffffff  (x27)
+                    t2 = mul(t2, t3);
+                    // Step 60: t3 = x^0x3ffffff8000000
+                    t3 = sq(t2);
+                    for (int i = 1; i < 27; ++i)
+                        t3 = sq(t3);
+                    // Step 61: t2 = x^0x3fffffffffffff  (x54)
+                    t2 = mul(t2, t3);
+                    // Step 115: t3 = x^0xfffffffffffffc0000000000000
+                    t3 = sq(t2);
+                    for (int i = 1; i < 54; ++i)
+                        t3 = sq(t3);
+                    // Step 116: t2 = x^0xfffffffffffffffffffffffffff  (x108)
+                    t2 = mul(t2, t3);
+                    // Step 224: t3 = x^{(2^108-1)*2^108}
+                    t3 = sq(t2);
+                    for (int i = 1; i < 108; ++i)
+                        t3 = sq(t3);
+                    // Step 225: t2 = x^{2^216-1}  (x216)
+                    t2 = mul(t2, t3);
+                    // Step 232: t2 = x^{(2^216-1)*2^7}
+                    for (int i = 0; i < 7; ++i)
+                        t2 = sq(t2);
+                    // Step 233: t1 = x^{2^223-1}  (x223)
+                    t1 = mul(t1, t2);
+
+                    // --- Tail for p-2 ---
+                    // Step 256: t1 = x^{(2^223-1)*2^23}
+                    for (int i = 0; i < 23; ++i)
+                        t1 = sq(t1);
+                    // Step 257: t0 = x^{2^246 - 2^22 - 1}
+                    t0 = mul(t0, t1);
+                    // Step 267: t0 = x^{2^256 - 2^32 - 2^10}
+                    for (int i = 0; i < 10; ++i)
+                        t0 = sq(t0);
+                    // x^45 = (x^15)^3 from saved f
+                    t3 = sq(f);       // x^30
+                    t3 = mul(t3, f);  // x^45
+                    // x^{p-2} = x^{2^256-2^32-979}
+                    return mul(t0, t3);
+                }
+                else
+                {
+                    // Generic Fermat: square-and-multiply over bits of (mod - 2).
+                    const UintT exp = mod_ - 2;
+                    const auto bw = intx::bit_width(exp);
+                    UintT result = x;
+                    for (size_t i = bw - 1; i != 0; --i)
+                    {
+                        result = mul(result, result);
+                        if (intx::bit_test(exp, i - 1))
+                            result = mul(result, x);
+                    }
+                    return result;
+                }
+            }
+        }
+#endif
+
         assert((mod_ & 1) == 1);
         assert(mod_ >= 3);
 
