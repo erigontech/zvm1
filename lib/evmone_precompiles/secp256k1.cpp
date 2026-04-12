@@ -113,6 +113,39 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     if (bw == 0)
         return {};
 
+    // Precompute R-Shamir index array and G-table windows to avoid
+    // repeated 256-bit bit_test and variable-shift in the hot loop.
+    // R-Shamir: 2 bits per position -> 1 byte per bit.
+    uint8_t r_idx_arr[128];
+    {
+        const auto* k2a_words = reinterpret_cast<const uint32_t*>(&k2a);
+        const auto* k2b_words = reinterpret_cast<const uint32_t*>(&k2b);
+        for (unsigned w = 0; w < 4; ++w)  // 4 x 32-bit words = 128 bits
+        {
+            uint32_t wa = k2a_words[w];
+            uint32_t wb = k2b_words[w];
+            for (unsigned b = 0; b < 32; ++b)
+            {
+                r_idx_arr[w * 32 + b] = static_cast<uint8_t>((wa & 1) | ((wb & 1) << 1));
+                wa >>= 1;
+                wb >>= 1;
+            }
+        }
+    }
+
+    // Precompute G-table window values (8-bit windows from k1a and k1b).
+    // Max 128/8 = 16 windows per scalar, 32 total.
+    uint8_t g_wins[32];  // g_wins[w] = window w of k1a, g_wins[w+16] = window w of k1b
+    {
+        const auto* k1a_bytes = reinterpret_cast<const uint8_t*>(&k1a);
+        const auto* k1b_bytes = reinterpret_cast<const uint8_t*>(&k1b);
+        for (unsigned w = 0; w < 16; ++w)
+        {
+            g_wins[w] = k1a_bytes[w];
+            g_wins[w + 16] = k1b_bytes[w];
+        }
+    }
+
     ecc::ProjPoint<Curve> result;
 
     // Round up to window-8 boundary for G-table processing
@@ -122,12 +155,10 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     {
         result = ecc::dbl(result);
 
-        // R-component: 2-way Shamir (binary, 1 bit each from k2a and k2b)
+        // R-component: precomputed index lookup (single byte load)
         if (i <= bw)
         {
-            const unsigned r_idx =
-                (unsigned{intx::bit_test(k2a, i - 1)} << 0) |
-                (unsigned{intx::bit_test(k2b, i - 1)} << 1);
+            const auto r_idx = r_idx_arr[i - 1];
             if (r_idx != 0)
                 result = ecc::add(result, *r_table[r_idx - 1]);
         }
@@ -135,12 +166,12 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
         // G-component: window-8 lookup (every 8th bit)
         if (((i - 1) % G_WINDOW) == 0)
         {
-            const auto shift = i - 1;
+            const auto win_idx = (i - 1) / G_WINDOW;
 
             // u1a window -> G_TABLE
-            if (shift < 256)
+            if (win_idx < 16)
             {
-                const auto u1a_win = static_cast<unsigned>((k1a >> shift) & G_WINDOW_MASK);
+                const auto u1a_win = static_cast<unsigned>(g_wins[win_idx]);
                 if (u1a_win != 0)
                 {
                     const auto& pt = G_TABLE[u1a_win - 1];
@@ -152,9 +183,9 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
             }
 
             // u1b window -> PHI_G_TABLE
-            if (shift < 256)
+            if (win_idx < 16)
             {
-                const auto u1b_win = static_cast<unsigned>((k1b >> shift) & G_WINDOW_MASK);
+                const auto u1b_win = static_cast<unsigned>(g_wins[win_idx + 16]);
                 if (u1b_win != 0)
                 {
                     const auto& pt = PHI_G_TABLE[u1b_win - 1];
