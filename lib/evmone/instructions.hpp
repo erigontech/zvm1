@@ -380,7 +380,16 @@ inline void sgt(StackTop stack) noexcept
 
 inline void eq(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // Stack items are 32-byte aligned — use BigInt CSR EQ directly, no copies.
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uint32_t r12 asm("x12") = 0x20;  // EQ
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    stack[1] = uint64_t{r12 != 0};
+#else
     stack[1] = uint64_t{stack[0] == stack[1]};
+#endif
 }
 
 inline void iszero(StackTop stack) noexcept

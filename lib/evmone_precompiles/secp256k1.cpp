@@ -92,15 +92,16 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     auto [sk1a, sk1b] = ecc::decompose<Curve>(u1);
     auto [sk2a, sk2b] = ecc::decompose<Curve>(u2);
 
-    // 2. Build R-Shamir table: 2 affine entries + 1 projective (saves 1 field inversion)
+    // 2. Build R-Shamir table for NAF-based Shamir.
+    // Apply signs from decomposition to get P_a = +/-R, P_b = +/-phi(R).
     const AffinePoint phi_R{FE{Curve::BETA} * R.x, R.y};
-    AffinePoint P3 = sk2a.sign ? -R : R;
-    AffinePoint P4 = sk2b.sign ? -phi_R : phi_R;
-    // P3+P4 kept in projective form (no inversion needed)
-    const auto P3_plus_P4_proj = ecc::add(ecc::ProjPoint<Curve>(P3), P4);
-    const AffinePoint* r_table_affine[2] = {&P3, &P4};
+    AffinePoint P_a = sk2a.sign ? -R : R;
+    AffinePoint P_b = sk2b.sign ? -phi_R : phi_R;
+    // P_a+P_b and P_a-P_b in Jacobian (no inversions needed).
+    const auto P_sum = ecc::add(ecc::ProjPoint<Curve>(P_a), P_b);     // P_a + P_b
+    const auto P_diff = ecc::add(ecc::ProjPoint<Curve>(P_a), -P_b);   // P_a - P_b
 
-    // 3. Signs for G/phi(G) table lookups — negation applied per-lookup
+    // 3. Signs for G/phi(G) table lookups -- negation applied per-lookup
     const bool g_neg = sk1a.sign;
     const bool phig_neg = sk1b.sign;
 
@@ -109,34 +110,57 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     const auto& k2a = sk2a.value;
     const auto& k2b = sk2b.value;
 
-    // 4. Main loop: shared ~128 doublings
+    // 4. Compute NAF for k2a and k2b, then build joint index array.
+    // NAF digits are in {-1, 0, 1}, encoded as signed int8_t.
+    // Joint index encodes (digit_a, digit_b) as a single byte:
+    //   high nibble = digit_b + 1, low nibble = digit_a + 1
+    //   so 0x00 = (-1,-1), 0x11 = (0,0), 0x22 = (1,1), etc.
+    // But for speed, we use a flat encoding: 3*da + db (shifted by +4 to avoid negatives)
+    // index = (da+1)*3 + (db+1) gives values 0..8 for the 9 combinations.
+    // 0=(−1,−1) 1=(−1,0) 2=(−1,1) 3=(0,−1) 4=(0,0) 5=(0,1) 6=(1,−1) 7=(1,0) 8=(1,1)
+
     const auto bw = intx::bit_width(k1a | k1b | k2a | k2b);
     if (bw == 0)
         return {};
 
-    // Precompute R-Shamir index array and G-table windows to avoid
-    // repeated 256-bit bit_test and variable-shift in the hot loop.
-    // R-Shamir: 2 bits per position -> 1 byte per bit.
-    uint8_t r_idx_arr[128];
+    // Compute NAF for k2a and k2b and build joint index array.
+    // NAF is computed LSB-first by the rule: if scalar is odd, digit = 2 - (scalar % 4),
+    // then scalar -= digit, scalar /= 2.
+    uint8_t r_naf_idx[130];  // joint NAF index, up to 129 digits (128 bits + 1 for NAF extension)
+    unsigned naf_len = 0;
     {
-        const auto* k2a_words = reinterpret_cast<const uint32_t*>(&k2a);
-        const auto* k2b_words = reinterpret_cast<const uint32_t*>(&k2b);
-        for (unsigned w = 0; w < 4; ++w)  // 4 x 32-bit words = 128 bits
+        // Work on copies (NAF modifies the scalars)
+        uint256 a = k2a;
+        uint256 b = k2b;
+        while (a != 0 || b != 0)
         {
-            uint32_t wa = k2a_words[w];
-            uint32_t wb = k2b_words[w];
-            for (unsigned b = 0; b < 32; ++b)
+            int8_t da = 0, db = 0;
+            if (a[0] & 1)  // a is odd
             {
-                r_idx_arr[w * 32 + b] = static_cast<uint8_t>((wa & 1) | ((wb & 1) << 1));
-                wa >>= 1;
-                wb >>= 1;
+                da = static_cast<int8_t>(2 - static_cast<int>(a[0] & 3));
+                if (da >= 0)
+                    a = a - static_cast<unsigned>(da);
+                else
+                    a = a + static_cast<unsigned>(-da);
             }
+            if (b[0] & 1)  // b is odd
+            {
+                db = static_cast<int8_t>(2 - static_cast<int>(b[0] & 3));
+                if (db >= 0)
+                    b = b - static_cast<unsigned>(db);
+                else
+                    b = b + static_cast<unsigned>(-db);
+            }
+            // Encode joint index: (da+1)*3 + (db+1), range [0,8], 4 = (0,0) = skip
+            r_naf_idx[naf_len] = static_cast<uint8_t>((da + 1) * 3 + (db + 1));
+            ++naf_len;
+            a >>= 1;
+            b >>= 1;
         }
     }
 
     // Precompute G-table window values (8-bit windows from k1a and k1b).
-    // Max 128/8 = 16 windows per scalar, 32 total.
-    uint8_t g_wins[32];  // g_wins[w] = window w of k1a, g_wins[w+16] = window w of k1b
+    uint8_t g_wins[32];
     {
         const auto* k1a_bytes = reinterpret_cast<const uint8_t*>(&k1a);
         const auto* k1b_bytes = reinterpret_cast<const uint8_t*>(&k1b);
@@ -149,21 +173,33 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
 
     ecc::ProjPoint<Curve> result;
 
-    // Round up to window-8 boundary for G-table processing
-    const auto aligned_bw = ((bw + G_WINDOW - 1) / G_WINDOW) * G_WINDOW;
+    // Determine the effective bit width including NAF extension
+    const auto effective_bw = std::max(static_cast<unsigned>(bw), naf_len);
+    const auto aligned_bw = ((effective_bw + G_WINDOW - 1) / G_WINDOW) * G_WINDOW;
 
     for (auto i = aligned_bw; i != 0; --i)
     {
         result = ecc::dbl(result);
 
-        // R-component: precomputed index lookup (single byte load)
-        if (i <= bw)
+        // R-component: NAF-based Shamir with signed digits
+        if (i <= effective_bw && (i - 1) < naf_len)
         {
-            const auto r_idx = r_idx_arr[i - 1];
-            if (r_idx == 3)
-                result = ecc::add(result, P3_plus_P4_proj);  // Jacobian-Jacobian
-            else if (r_idx != 0)
-                result = ecc::add(result, *r_table_affine[r_idx - 1]);  // mixed
+            const auto idx = r_naf_idx[i - 1];
+            // idx encodes (da+1)*3 + (db+1); 4 = (0,0) = no-op
+            // We decode da and db and use the lookup table.
+            // idx: 0=(-1,-1) 1=(-1,0) 2=(-1,1) 3=(0,-1) 4=(0,0) 5=(0,1) 6=(1,-1) 7=(1,0) 8=(1,1)
+            switch (idx)
+            {
+            case 4: break;  // (0,0): no addition
+            case 7: result = ecc::add(result, P_a); break;       // (1,0): +P_a
+            case 1: result = ecc::add(result, -P_a); break;      // (-1,0): -P_a (negate proj)
+            case 5: result = ecc::add(result, P_b); break;       // (0,1): +P_b
+            case 3: result = ecc::add(result, -P_b); break;      // (0,-1): -P_b
+            case 8: result = ecc::add(result, P_sum); break;     // (1,1): +P_sum (Jac+Jac)
+            case 0: result = ecc::add(result, -P_sum); break;    // (-1,-1): -P_sum
+            case 6: result = ecc::add(result, P_diff); break;    // (1,-1): +P_diff (Jac+Jac)
+            case 2: result = ecc::add(result, -P_diff); break;   // (-1,1): -P_diff
+            }
         }
 
         // G-component: window-8 lookup (every 8th bit)
