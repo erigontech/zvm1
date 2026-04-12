@@ -584,6 +584,53 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
     }
 #endif
 
+#if defined(AIRBENDER) && defined(__riscv)
+    // Fast path for 256-bit modexp using BigInt CSR Montgomery multiply.
+    if (mod_bytes.size() <= 32 && base_bytes.size() <= 32)
+    {
+        // Load big-endian bytes into uint256 (right-aligned, zero-padded).
+        auto load_u256 = [](std::span<const uint8_t> data) noexcept -> uint256 {
+            uint8_t tmp[32]{};
+            std::ranges::copy(data, &tmp[32 - data.size()]);
+            return intx::be::load<uint256>(tmp);
+        };
+
+        const auto mod = load_u256(mod_bytes);
+        if (mod == 0)
+        {
+            std::ranges::fill(std::span{output, mod_bytes.size()}, uint8_t{0});
+            return;
+        }
+        if (mod == 1 || exp.bit_width() == 0)
+        {
+            std::ranges::fill(std::span{output, mod_bytes.size()}, uint8_t{0});
+            if (exp.bit_width() == 0 && mod != 1)
+                output[mod_bytes.size() - 1] = 1;  // base^0 = 1 (mod != 1)
+            return;
+        }
+        if ((mod[0] & 1) != 0)  // Odd modulus — use CSR Montgomery multiply.
+        {
+            const auto base = load_u256(base_bytes);
+            const evmmax::ModArith<uint256> arith(mod);
+            auto r = arith.to_mont(base);
+            const auto base_mont = r;
+            for (auto i = exp.bit_width() - 1; i != 0; --i)
+            {
+                r = arith.mul(r, r);
+                if (exp[i - 1])
+                    r = arith.mul(r, base_mont);
+            }
+            const auto result = arith.from_mont(r);
+            uint8_t tmp[32];
+            intx::be::store(tmp, result);
+            const auto offset = 32 - mod_bytes.size();
+            std::copy_n(&tmp[offset], mod_bytes.size(), output);
+            return;
+        }
+        // Even modulus: fall through to the generic path.
+    }
+#endif
+
     const auto w = (std::max(mod_bytes.size(), base_bytes.size()) + 7) / 8;
     const auto storage = std::make_unique_for_overwrite<uint64_t[]>(w * 4);
     const auto base = std::span{storage.get(), w};
