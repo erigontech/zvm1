@@ -95,11 +95,13 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     // 2. Build R-Shamir table for NAF-based Shamir.
     // Apply signs from decomposition to get P_a = +/-R, P_b = +/-phi(R).
     const AffinePoint phi_R{FE{Curve::BETA} * R.x, R.y};
-    AffinePoint P_a = sk2a.sign ? -R : R;
-    AffinePoint P_b = sk2b.sign ? -phi_R : phi_R;
+    const AffinePoint P_a = sk2a.sign ? -R : R;
+    const AffinePoint P_b = sk2b.sign ? -phi_R : phi_R;
+    const AffinePoint neg_P_a = -P_a;
+    const AffinePoint neg_P_b = -P_b;
     // P_a+P_b and P_a-P_b in Jacobian (no inversions needed).
     const auto P_sum = ecc::add(ecc::ProjPoint<Curve>(P_a), P_b);     // P_a + P_b
-    const auto P_diff = ecc::add(ecc::ProjPoint<Curve>(P_a), -P_b);   // P_a - P_b
+    const auto P_diff = ecc::add(ecc::ProjPoint<Curve>(P_a), neg_P_b);   // P_a - P_b
 
     // 3. Signs for G/phi(G) table lookups -- negation applied per-lookup
     const bool g_neg = sk1a.sign;
@@ -130,11 +132,11 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     unsigned naf_len = 0;
     {
         // Work with 32-bit words directly for 128-bit scalars.
-        uint32_t aw[4], bw[4];
+        uint32_t aw[4], bww[4];
         {
             const auto* ka = reinterpret_cast<const uint32_t*>(&k2a);
             const auto* kb = reinterpret_cast<const uint32_t*>(&k2b);
-            for (int j = 0; j < 4; ++j) { aw[j] = ka[j]; bw[j] = kb[j]; }
+            for (int j = 0; j < 4; ++j) { aw[j] = ka[j]; bww[j] = kb[j]; }
         }
 
         auto is_zero4 = [](const uint32_t* w) {
@@ -166,7 +168,7 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
             }
         };
 
-        while (!is_zero4(aw) || !is_zero4(bw))
+        while (!is_zero4(aw) || !is_zero4(bww))
         {
             int8_t da = 0, db = 0;
             if (aw[0] & 1)
@@ -175,16 +177,16 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
                 if (da > 0) sub_small(aw, static_cast<uint32_t>(da));
                 else add_small(aw, static_cast<uint32_t>(-da));
             }
-            if (bw[0] & 1)
+            if (bww[0] & 1)
             {
-                db = static_cast<int8_t>(2 - static_cast<int>(bw[0] & 3));
-                if (db > 0) sub_small(bw, static_cast<uint32_t>(db));
-                else add_small(bw, static_cast<uint32_t>(-db));
+                db = static_cast<int8_t>(2 - static_cast<int>(bww[0] & 3));
+                if (db > 0) sub_small(bww, static_cast<uint32_t>(db));
+                else add_small(bww, static_cast<uint32_t>(-db));
             }
             r_naf_idx[naf_len] = static_cast<uint8_t>((da + 1) * 3 + (db + 1));
             ++naf_len;
             shr1(aw);
-            shr1(bw);
+            shr1(bww);
         }
     }
 
@@ -221,9 +223,9 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
             {
             case 4: break;  // (0,0): no addition
             case 7: result = ecc::add(result, P_a); break;       // (1,0): +P_a
-            case 1: result = ecc::add(result, -P_a); break;      // (-1,0): -P_a (negate proj)
+            case 1: result = ecc::add(result, neg_P_a); break;   // (-1,0): -P_a
             case 5: result = ecc::add(result, P_b); break;       // (0,1): +P_b
-            case 3: result = ecc::add(result, -P_b); break;      // (0,-1): -P_b
+            case 3: result = ecc::add(result, neg_P_b); break;   // (0,-1): -P_b
             case 8: result = ecc::add(result, P_sum); break;     // (1,1): +P_sum (Jac+Jac)
             case 0: result = ecc::add(result, -P_sum); break;    // (-1,-1): -P_sum
             case 6: result = ecc::add(result, P_diff); break;    // (1,-1): +P_diff (Jac+Jac)

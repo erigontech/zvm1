@@ -961,18 +961,14 @@ inline void dup(StackTop stack) noexcept
     static_assert(N >= 1 && N <= 16);
 #if defined(AIRBENDER) && defined(__riscv)
     // Use BigInt CSR MEMCOPY for single-cycle 256-bit copy.
-    // Source: stack[N-1] = m_end[-N], Destination: m_end (new top slot).
+    // Destination: stack.end() = m_end (the next free slot on the stack).
+    // Source: stack[N-1] = m_end[-N].
     // Both are 32-byte aligned and in RAM.
+    // The dispatch loop adjusts stack_end separately via stack_height_change (+1 for DUP).
     register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(stack.end());
     register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[N - 1]);
     register uint32_t r12 asm("x12") = 0x80;  // MEMCOPY
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-    // Advance stack pointer (push was successful).
-    stack.push(stack[N - 1]);  // This will be optimized away if compiler sees the copy already done.
-    // Actually, we need to advance the stack pointer without re-copying.
-    // The push() method does *m_end++ = value, but the copy is already done via CSR.
-    // Unfortunately, we can't just increment m_end since it's private.
-    // Fall back to the regular push which the compiler should optimize with the CSR copy.
 #else
     stack.push(stack[N - 1]);
 #endif
@@ -985,6 +981,35 @@ inline void swap(StackTop stack) noexcept
 {
     static_assert(N >= 1 && N <= 16);
 
+#if defined(AIRBENDER) && defined(__riscv)
+    // Use BigInt CSR MEMCOPY for 256-bit swap via temp buffer.
+    // 3 CSR calls vs ~32 rv32im instructions for manual word-by-word swap.
+    alignas(32) uint256 tmp;  // Temp buffer on stack (RAM, 32-byte aligned).
+    auto* t_ptr = &stack.top();
+    auto* a_ptr = &stack[N];
+
+    register uintptr_t r10 asm("x10");
+    register uintptr_t r11 asm("x11");
+    register uint32_t r12 asm("x12");
+
+    // Step 1: tmp = top
+    r10 = reinterpret_cast<uintptr_t>(&tmp);
+    r11 = reinterpret_cast<uintptr_t>(t_ptr);
+    r12 = 0x80;  // MEMCOPY
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+
+    // Step 2: top = a
+    r10 = reinterpret_cast<uintptr_t>(t_ptr);
+    r11 = reinterpret_cast<uintptr_t>(a_ptr);
+    r12 = 0x80;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+
+    // Step 3: a = tmp
+    r10 = reinterpret_cast<uintptr_t>(a_ptr);
+    r11 = reinterpret_cast<uintptr_t>(&tmp);
+    r12 = 0x80;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     // The simple std::swap(stack.top(), stack[N]) is not used to workaround
     // clang missed optimization: https://github.com/llvm/llvm-project/issues/59116
     // TODO(clang): Check if #59116 bug fix has been released.
@@ -1000,6 +1025,7 @@ inline void swap(StackTop stack) noexcept
     a[1] = t1;
     a[2] = t2;
     a[3] = t3;
+#endif
 }
 
 inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
