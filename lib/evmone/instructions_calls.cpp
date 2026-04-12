@@ -87,11 +87,19 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
-    const auto target_addr_or_result = get_target_address(dst, gas_left, state);
-    if (const auto* result = std::get_if<Result>(&target_addr_or_result))
-        return *result;
-
-    const auto& code_addr = std::get<evmc::address>(target_addr_or_result);
+    // Avoid std::variant overhead for pre-Prague revisions (the common case).
+    evmc::address code_addr;
+    if (state.rev < EVMC_PRAGUE) [[likely]]
+    {
+        code_addr = dst;
+    }
+    else
+    {
+        const auto target_addr_or_result = get_target_address(dst, gas_left, state);
+        if (const auto* result = std::get_if<Result>(&target_addr_or_result))
+            return *result;
+        code_addr = std::get<evmc::address>(target_addr_or_result);
+    }
 
     if (!check_memory(gas_left, state.memory, input_offset_u256, input_size_u256))
         return {EVMC_OUT_OF_GAS, gas_left};
