@@ -70,12 +70,19 @@ constexpr auto make_phi_g() noexcept
 }
 constexpr AffinePoint PHI_G = make_phi_g();
 
-/// GLV 4-way MSM: computes u1*G + u2*R using scalar decomposition and endomorphism.
+/// Precomputed window-8 table: PHI_G_TABLE[i] = (i+1)*phi(G) for i=0..254.
+/// 255 consteval AffinePoints = 16KB in .rodata.
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint PHI_G_TABLE[G_TABLE_SIZE] = {
+#include "secp256k1_phig_table_w8.inc"
+};
+
+/// Hybrid GLV MSM: computes u1*G + u2*R using precomputed tables for G and phi(G).
 ///
-/// Decomposes each 256-bit scalar into two ~128-bit half-scalars via the GLV lattice,
-/// then runs a 4-way Shamir scan over ~128 bits instead of ~256 bits.
-/// Uses batch inversion (Montgomery's trick) to build the 15-entry lookup table
-/// with only 2 field inversions instead of 11.
+/// Decomposes each 256-bit scalar into two ~128-bit half-scalars via the GLV lattice.
+/// For the G component (u1a*G + u1b*phi(G)), uses precomputed window-8 tables (zero inversions).
+/// For the R component (u2a*R + u2b*phi(R)), uses 2-way Shamir with a 3-entry table (1 inversion).
+/// This saves ~2 field inversions and ~30 field muls vs the previous 15-entry combined table.
 ecc::ProjPoint<Curve> ecrecover_msm_glv(
     const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
 {
@@ -85,117 +92,79 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     auto [sk1a, sk1b] = ecc::decompose<Curve>(u1);
     auto [sk2a, sk2b] = ecc::decompose<Curve>(u2);
 
-    // Compute phi(R) = (BETA * R.x, R.y)
-    const FE beta{Curve::BETA};
-    const AffinePoint phi_R{beta * R.x, R.y};
-
-    // Handle signs: negate point if scalar is negative.
-    AffinePoint P1 = sk1a.sign ? -G : G;
-    AffinePoint P2 = sk1b.sign ? -PHI_G : PHI_G;
+    // 2. Build R-Shamir table (only 3 entries, 1 inversion via add_affine)
+    const AffinePoint phi_R{FE{Curve::BETA} * R.x, R.y};
     AffinePoint P3 = sk2a.sign ? -R : R;
     AffinePoint P4 = sk2b.sign ? -phi_R : phi_R;
+    const auto P3_plus_P4 = ecc::add_affine(P3, P4);  // 1 field inversion
+    const AffinePoint* r_table[3] = {&P3, &P4, &P3_plus_P4};
+
+    // 3. Signs for G/phi(G) table lookups — negation applied per-lookup
+    const bool g_neg = sk1a.sign;
+    const bool phig_neg = sk1b.sign;
 
     const auto& k1a = sk1a.value;
     const auto& k1b = sk1b.value;
     const auto& k2a = sk2a.value;
     const auto& k2b = sk2b.value;
 
-    // 2. Build 15-entry Shamir lookup table using batch inversion.
-    //    Indexed by 4-bit mask: bit0=k1a, bit1=k1b, bit2=k2a, bit3=k2b.
-    AffinePoint table[15];
-    table[0]  = P1;  // 0001
-    table[1]  = P2;  // 0010
-    table[3]  = P3;  // 0100
-    table[7]  = P4;  // 1000
-
-    // Helper for batch inversion point addition.
-    struct AddData { FE dx; FE dy; FE x1; FE y1; FE x2; };
-
-    auto compute_add = [](const AddData& d, const FE& inv_dx) -> AffinePoint {
-        const auto slope = d.dy * inv_dx;
-        const auto xr = slope * slope - d.x1 - d.x2;
-        const auto yr = slope * (d.x1 - xr) - d.y1;
-        return {xr, yr};
-    };
-
-    // --- Batch 1: 6 independent pairwise additions ---
-    AddData b1[6];
-    b1[0] = {P2.x - P1.x, P2.y - P1.y, P1.x, P1.y, P2.x};  // P1+P2
-    b1[1] = {P3.x - P1.x, P3.y - P1.y, P1.x, P1.y, P3.x};  // P1+P3
-    b1[2] = {P3.x - P2.x, P3.y - P2.y, P2.x, P2.y, P3.x};  // P2+P3
-    b1[3] = {P4.x - P1.x, P4.y - P1.y, P1.x, P1.y, P4.x};  // P1+P4
-    b1[4] = {P4.x - P2.x, P4.y - P2.y, P2.x, P2.y, P4.x};  // P2+P4
-    b1[5] = {P4.x - P3.x, P4.y - P3.y, P3.x, P3.y, P4.x};  // P3+P4
-
-    FE acc1[6];
-    acc1[0] = b1[0].dx;
-    for (int i = 1; i < 6; ++i)
-        acc1[i] = acc1[i - 1] * b1[i].dx;
-
-    FE inv_a1 = 1 / acc1[5];
-
-    FE i1[6];
-    for (int i = 5; i > 0; --i)
-    {
-        i1[i] = inv_a1 * acc1[i - 1];
-        inv_a1 = inv_a1 * b1[i].dx;
-    }
-    i1[0] = inv_a1;
-
-    table[2]  = compute_add(b1[0], i1[0]); // P1+P2
-    table[4]  = compute_add(b1[1], i1[1]); // P1+P3
-    table[5]  = compute_add(b1[2], i1[2]); // P2+P3
-    table[8]  = compute_add(b1[3], i1[3]); // P1+P4
-    table[9]  = compute_add(b1[4], i1[4]); // P2+P4
-    table[11] = compute_add(b1[5], i1[5]); // P3+P4
-
-    // --- Batch 2: 5 additions depending on batch 1 results ---
-    AddData b2[5];
-    b2[0] = {P3.x - table[2].x, P3.y - table[2].y, table[2].x, table[2].y, P3.x};
-    b2[1] = {P4.x - table[2].x, P4.y - table[2].y, table[2].x, table[2].y, P4.x};
-    b2[2] = {P4.x - table[4].x, P4.y - table[4].y, table[4].x, table[4].y, P4.x};
-    b2[3] = {P4.x - table[5].x, P4.y - table[5].y, table[5].x, table[5].y, P4.x};
-    b2[4] = {table[5].x - table[8].x, table[5].y - table[8].y,
-             table[8].x, table[8].y, table[5].x};
-
-    FE acc2[5];
-    acc2[0] = b2[0].dx;
-    for (int i = 1; i < 5; ++i)
-        acc2[i] = acc2[i - 1] * b2[i].dx;
-
-    FE inv_a2 = 1 / acc2[4];
-
-    FE i2[5];
-    for (int i = 4; i > 0; --i)
-    {
-        i2[i] = inv_a2 * acc2[i - 1];
-        inv_a2 = inv_a2 * b2[i].dx;
-    }
-    i2[0] = inv_a2;
-
-    table[6]  = compute_add(b2[0], i2[0]); // (P1+P2)+P3
-    table[10] = compute_add(b2[1], i2[1]); // (P1+P2)+P4
-    table[12] = compute_add(b2[2], i2[2]); // (P1+P3)+P4
-    table[13] = compute_add(b2[3], i2[3]); // (P2+P3)+P4
-    table[14] = compute_add(b2[4], i2[4]); // (P1+P4)+(P2+P3) = P1+P2+P3+P4
-
-    // 3. 4-way Shamir scan over ~128 bits.
+    // 4. Main loop: shared ~128 doublings
     const auto bw = intx::bit_width(k1a | k1b | k2a | k2b);
     if (bw == 0)
         return {};
 
     ecc::ProjPoint<Curve> result;
-    for (auto i = bw; i != 0; --i)
+
+    // Round up to window-8 boundary for G-table processing
+    const auto aligned_bw = ((bw + G_WINDOW - 1) / G_WINDOW) * G_WINDOW;
+
+    for (auto i = aligned_bw; i != 0; --i)
     {
         result = ecc::dbl(result);
 
-        const unsigned idx =
-            (unsigned{intx::bit_test(k1a, i - 1)} << 0) |
-            (unsigned{intx::bit_test(k1b, i - 1)} << 1) |
-            (unsigned{intx::bit_test(k2a, i - 1)} << 2) |
-            (unsigned{intx::bit_test(k2b, i - 1)} << 3);
-        if (idx != 0)
-            result = ecc::add(result, table[idx - 1]);
+        // R-component: 2-way Shamir (binary, 1 bit each from k2a and k2b)
+        if (i <= bw)
+        {
+            const unsigned r_idx =
+                (unsigned{intx::bit_test(k2a, i - 1)} << 0) |
+                (unsigned{intx::bit_test(k2b, i - 1)} << 1);
+            if (r_idx != 0)
+                result = ecc::add(result, *r_table[r_idx - 1]);
+        }
+
+        // G-component: window-8 lookup (every 8th bit)
+        if (((i - 1) % G_WINDOW) == 0)
+        {
+            const auto shift = i - 1;
+
+            // u1a window -> G_TABLE
+            if (shift < 256)
+            {
+                const auto u1a_win = static_cast<unsigned>((k1a >> shift) & G_WINDOW_MASK);
+                if (u1a_win != 0)
+                {
+                    const auto& pt = G_TABLE[u1a_win - 1];
+                    if (g_neg)
+                        result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                    else
+                        result = ecc::add(result, pt);
+                }
+            }
+
+            // u1b window -> PHI_G_TABLE
+            if (shift < 256)
+            {
+                const auto u1b_win = static_cast<unsigned>((k1b >> shift) & G_WINDOW_MASK);
+                if (u1b_win != 0)
+                {
+                    const auto& pt = PHI_G_TABLE[u1b_win - 1];
+                    if (phig_neg)
+                        result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                    else
+                        result = ecc::add(result, pt);
+                }
+            }
+        }
     }
 
     return result;
