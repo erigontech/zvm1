@@ -426,6 +426,22 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
 {
     union ethash_hash256 hash;
-    keccak(hash.word64s, 256, data, 32);
+    // Specialized path: 32 bytes input, keccak-256.
+    // block_size = (1600 - 256*2) / 8 = 136 bytes.
+    // 32 < 136, so no multi-block processing needed.
+    // 32 / 8 = 4 full words, 0 remaining bytes.
+    uint64_t state[25] = {0};
+    state[0] = load_le(data);
+    state[1] = load_le(data + 8);
+    state[2] = load_le(data + 16);
+    state[3] = load_le(data + 24);
+    // Padding: 0x01 byte after data, 0x80 at end of block.
+    state[4] = 0x0000000000000001ULL;   // to_le64(0x01) at position 32
+    state[16] ^= 0x8000000000000000ULL; // block_size/8 - 1 = 16
+    keccakf1600_best(state);
+    hash.word64s[0] = to_le64(state[0]);
+    hash.word64s[1] = to_le64(state[1]);
+    hash.word64s[2] = to_le64(state[2]);
+    hash.word64s[3] = to_le64(state[3]);
     return hash;
 }
