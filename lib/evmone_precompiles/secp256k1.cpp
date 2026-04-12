@@ -92,12 +92,13 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     auto [sk1a, sk1b] = ecc::decompose<Curve>(u1);
     auto [sk2a, sk2b] = ecc::decompose<Curve>(u2);
 
-    // 2. Build R-Shamir table (only 3 entries, 1 inversion via add_affine)
+    // 2. Build R-Shamir table: 2 affine entries + 1 projective (saves 1 field inversion)
     const AffinePoint phi_R{FE{Curve::BETA} * R.x, R.y};
     AffinePoint P3 = sk2a.sign ? -R : R;
     AffinePoint P4 = sk2b.sign ? -phi_R : phi_R;
-    const auto P3_plus_P4 = ecc::add_affine(P3, P4);  // 1 field inversion
-    const AffinePoint* r_table[3] = {&P3, &P4, &P3_plus_P4};
+    // P3+P4 kept in projective form (no inversion needed)
+    const auto P3_plus_P4_proj = ecc::add(ecc::ProjPoint<Curve>(P3), P4);
+    const AffinePoint* r_table_affine[2] = {&P3, &P4};
 
     // 3. Signs for G/phi(G) table lookups — negation applied per-lookup
     const bool g_neg = sk1a.sign;
@@ -159,8 +160,10 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
         if (i <= bw)
         {
             const auto r_idx = r_idx_arr[i - 1];
-            if (r_idx != 0)
-                result = ecc::add(result, *r_table[r_idx - 1]);
+            if (r_idx == 3)
+                result = ecc::add(result, P3_plus_P4_proj);  // Jacobian-Jacobian
+            else if (r_idx != 0)
+                result = ecc::add(result, *r_table_affine[r_idx - 1]);  // mixed
         }
 
         // G-component: window-8 lookup (every 8th bit)

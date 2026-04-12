@@ -61,7 +61,12 @@ intx::uint256 compute_blob_gas_price(
             // Ensure the multiplication won't overflow 256 bits.
             if (const auto p = intx::umul(numerator_accum, numerator256);
                 p <= std::numeric_limits<intx::uint256>::max())
-                numerator_accum = intx::uint256(p) / (denominator * i);
+            {
+                // Optimize: denominator * i fits in uint64_t for typical EIP-4844 params
+                // (denominator ~3.3M, i < ~100), avoiding expensive uint256 division.
+                const auto divisor_64 = static_cast<uint64_t>(i) * denominator;
+                numerator_accum = intx::uint256(p) / divisor_64;
+            }
             else
                 return std::numeric_limits<intx::uint256>::max();
             i += 1;
