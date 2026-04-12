@@ -182,7 +182,29 @@ inline void sub(StackTop stack) noexcept
 inline void div(StackTop stack) noexcept
 {
     auto& v = stack[1];
-    v = v != 0 ? stack[0] / v : 0;
+    if (v == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    // Fast path: if divisor fits in a single 64-bit word (top 3 words are zero),
+    // we can avoid the expensive multi-word Knuth division.
+    if ((v[3] | v[2] | v[1]) == 0)
+    {
+        const auto d = v[0];
+        // Power-of-2 fast path: shift instead of divide.
+        if ((d & (d - 1)) == 0)
+        {
+            const auto shift = static_cast<unsigned>(__builtin_ctzll(d));
+            v = stack[0] >> shift;
+            return;
+        }
+        v = stack[0] / v;
+    }
+    else
+    {
+        v = stack[0] / v;
+    }
 }
 
 inline void sdiv(StackTop stack) noexcept
@@ -194,7 +216,26 @@ inline void sdiv(StackTop stack) noexcept
 inline void mod(StackTop stack) noexcept
 {
     auto& v = stack[1];
-    v = v != 0 ? stack[0] % v : 0;
+    if (v == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    // Fast path: power-of-2 modulus uses bitwise AND.
+    if ((v[3] | v[2] | v[1]) == 0)
+    {
+        const auto d = v[0];
+        if ((d & (d - 1)) == 0)
+        {
+            v = stack[0];
+            v[0] &= (d - 1);
+            v[1] = 0;
+            v[2] = 0;
+            v[3] = 0;
+            return;
+        }
+    }
+    v = stack[0] % v;
 }
 
 inline void smod(StackTop stack) noexcept
