@@ -124,38 +124,67 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
         return {};
 
     // Compute NAF for k2a and k2b and build joint index array.
-    // NAF is computed LSB-first by the rule: if scalar is odd, digit = 2 - (scalar % 4),
-    // then scalar -= digit, scalar /= 2.
-    uint8_t r_naf_idx[130];  // joint NAF index, up to 129 digits (128 bits + 1 for NAF extension)
+    // NAF digit rule: if scalar is odd, digit = 2 - (scalar % 4), then scalar -= digit.
+    // Then scalar >>= 1. Uses 32-bit word-level operations for efficiency on RV32.
+    uint8_t r_naf_idx[130];
     unsigned naf_len = 0;
     {
-        // Work on copies (NAF modifies the scalars)
-        uint256 a = k2a;
-        uint256 b = k2b;
-        while (a != 0 || b != 0)
+        // Work with 32-bit words directly for 128-bit scalars.
+        uint32_t aw[4], bw[4];
+        {
+            const auto* ka = reinterpret_cast<const uint32_t*>(&k2a);
+            const auto* kb = reinterpret_cast<const uint32_t*>(&k2b);
+            for (int j = 0; j < 4; ++j) { aw[j] = ka[j]; bw[j] = kb[j]; }
+        }
+
+        auto is_zero4 = [](const uint32_t* w) {
+            return (w[0] | w[1] | w[2] | w[3]) == 0;
+        };
+        auto shr1 = [](uint32_t* w) {
+            w[0] = (w[0] >> 1) | (w[1] << 31);
+            w[1] = (w[1] >> 1) | (w[2] << 31);
+            w[2] = (w[2] >> 1) | (w[3] << 31);
+            w[3] = w[3] >> 1;
+        };
+        // Add/sub a small value d to a 128-bit number (d is 1 or 2).
+        auto add_small = [](uint32_t* w, uint32_t d) {
+            uint64_t carry = d;
+            for (int j = 0; j < 4 && carry; ++j) {
+                carry += w[j];
+                w[j] = static_cast<uint32_t>(carry);
+                carry >>= 32;
+            }
+        };
+        auto sub_small = [](uint32_t* w, uint32_t d) {
+            uint64_t borrow = 0;
+            uint64_t sub = d;
+            for (int j = 0; j < 4; ++j) {
+                uint64_t diff = static_cast<uint64_t>(w[j]) - sub - borrow;
+                w[j] = static_cast<uint32_t>(diff);
+                borrow = (diff >> 32) & 1;
+                sub = 0;
+            }
+        };
+
+        while (!is_zero4(aw) || !is_zero4(bw))
         {
             int8_t da = 0, db = 0;
-            if (a[0] & 1)  // a is odd
+            if (aw[0] & 1)
             {
-                da = static_cast<int8_t>(2 - static_cast<int>(a[0] & 3));
-                if (da >= 0)
-                    a = a - static_cast<unsigned>(da);
-                else
-                    a = a + static_cast<unsigned>(-da);
+                da = static_cast<int8_t>(2 - static_cast<int>(aw[0] & 3));
+                if (da > 0) sub_small(aw, static_cast<uint32_t>(da));
+                else add_small(aw, static_cast<uint32_t>(-da));
             }
-            if (b[0] & 1)  // b is odd
+            if (bw[0] & 1)
             {
-                db = static_cast<int8_t>(2 - static_cast<int>(b[0] & 3));
-                if (db >= 0)
-                    b = b - static_cast<unsigned>(db);
-                else
-                    b = b + static_cast<unsigned>(-db);
+                db = static_cast<int8_t>(2 - static_cast<int>(bw[0] & 3));
+                if (db > 0) sub_small(bw, static_cast<uint32_t>(db));
+                else add_small(bw, static_cast<uint32_t>(-db));
             }
-            // Encode joint index: (da+1)*3 + (db+1), range [0,8], 4 = (0,0) = skip
             r_naf_idx[naf_len] = static_cast<uint8_t>((da + 1) * 3 + (db + 1));
             ++naf_len;
-            a >>= 1;
-            b >>= 1;
+            shr1(aw);
+            shr1(bw);
         }
     }
 
