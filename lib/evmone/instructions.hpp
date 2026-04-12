@@ -91,15 +91,17 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     // This implementation recomputes memory.size(). This value is already known to the caller
     // and can be passed as a parameter, but this make no difference to the performance.
 
-    const auto new_words = num_words(new_size);
-    const auto current_words = static_cast<int64_t>(memory.size() / word_size);
-    const auto new_cost = 3 * new_words + new_words * new_words / 512;
-    const auto current_cost = 3 * current_words + current_words * current_words / 512;
-    const auto cost = new_cost - current_cost;
+    // Use unsigned arithmetic to avoid signed division overhead on rv32im.
+    // Memory word counts are always non-negative and bounded by ~8MB/32 < 2^18.
+    const auto new_words = static_cast<uint32_t>((new_size + (word_size - 1)) / word_size);
+    const auto current_words = static_cast<uint32_t>(memory.size() >> 5);  // / 32
+    const auto new_cost = 3 * new_words + (new_words * new_words >> 9);    // / 512
+    const auto current_cost = 3 * current_words + (current_words * current_words >> 9);
+    const auto cost = static_cast<int64_t>(new_cost - current_cost);
 
     gas_left -= cost;
     if (gas_left >= 0) [[likely]]
-        memory.grow(static_cast<size_t>(new_words * word_size));
+        memory.grow(static_cast<size_t>(new_words) * word_size);
     return gas_left;
 }
 
