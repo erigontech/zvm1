@@ -269,15 +269,31 @@ public:
 
                 alignas(32) UintT A;       // x -> t_lo -> t_hi -> result
                 alignas(32) UintT B;       // scratch: t_lo saved -> m -> mn_hi
-                alignas(32) UintT Y = y;   // aligned copy of y (may be misaligned)
 
-                // 0. Copy x -> A (x may be misaligned, use word copy)
-                A = x;
+                // Resolve y pointer: use &y directly if 32-byte aligned, else copy.
+                // FieldElement::value_ is alignas(32) so this is the common path.
+                alignas(32) UintT Y_buf;
+                const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
+                if (!y_al) Y_buf = y;
+                const uintptr_t y_ptr = y_al
+                    ? reinterpret_cast<uintptr_t>(&y)
+                    : reinterpret_cast<uintptr_t>(&Y_buf);
+
+                // 0. Copy x -> A: use MEMCOPY if x is aligned, else word copy.
+                const bool x_al = (reinterpret_cast<uintptr_t>(&x) % 32 == 0);
+                if (x_al) {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                } else {
+                    A = x;
+                }
 
                 // 1. T_lo = MUL_LOW(x, y)  →  A = t_lo
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&Y);
+                    register uintptr_t a1 asm("x11") = y_ptr;
                     register uint32_t a2 asm("x12") = 0x08;
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
@@ -291,10 +307,17 @@ public:
                 }
 
                 // 3. Reload x -> A, then MUL_HIGH(x, y) -> A = t_hi
-                A = x;
+                if (x_al) {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                } else {
+                    A = x;
+                }
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&Y);
+                    register uintptr_t a1 asm("x11") = y_ptr;
                     register uint32_t a2 asm("x12") = 0x10; // MUL_HIGH
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }

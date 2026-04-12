@@ -78,28 +78,28 @@ public:
 
     friend constexpr bool operator==(const FieldElement& a, zero_t) noexcept { return !a.value_; }
 
-    friend constexpr auto operator*(const FieldElement& a, const FieldElement& b) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator*(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.mul(a.value_, b.value_));
     }
 
-    friend constexpr auto operator+(const FieldElement& a, const FieldElement& b) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator+(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.add(a.value_, b.value_));
     }
 
-    FieldElement& operator+=(const FieldElement& b) noexcept
+    FieldElement& __attribute__((always_inline)) operator+=(const FieldElement& b) noexcept
     {
         value_ = Fp.add(value_, b.value_);
         return *this;
     }
 
-    friend constexpr auto operator-(const FieldElement& a, const FieldElement& b) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator-(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.sub(a.value_, b.value_));
     }
 
-    friend constexpr auto operator-(const FieldElement& a) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator-(const FieldElement& a) noexcept
     {
         return wrap(Fp.sub(0, a.value_));
     }
@@ -242,6 +242,7 @@ using InvFn = IntT (*)(const ModArith<IntT>&, const IntT& x) noexcept;
 
 /// Converts a projected point to an affine point.
 template <typename Curve>
+__attribute__((flatten))
 inline AffinePoint<Curve> to_affine(const ProjPoint<Curve>& p) noexcept
 {
     // This works correctly for the point at infinity (z == 0) because then z_inv == 0.
@@ -297,6 +298,7 @@ AffinePoint<Curve> add_affine(const AffinePoint<Curve>& p, const AffinePoint<Cur
 /// Computes P ⊕ Q for two points in Jacobian coordinates on the elliptic curve.
 /// This procedure handles all inputs (e.g. doubling or points at infinity).
 template <typename Curve>
+__attribute__((flatten))
 ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexcept
 {
     if (p == 0)
@@ -355,6 +357,7 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
 /// Computes P ⊕ Q for a point P in Jacobian coordinates and a point Q in affine coordinates.
 /// This procedure handles all inputs (e.g. doubling or points at infinity).
 template <typename Curve>
+__attribute__((flatten))
 ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noexcept
 {
     if (q == 0)
@@ -403,6 +406,7 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
 }
 
 template <typename Curve>
+__attribute__((flatten))
 ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 {
     const auto& [x1, y1, z1] = p;
