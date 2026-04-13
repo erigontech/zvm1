@@ -117,6 +117,9 @@ public:
     /// Named 1/x inversion method. Needed in the pairing templates.
     constexpr auto __attribute__((always_inline)) inv() const noexcept { return wrap(Fp.inv(value_)); }
 
+    /// Repeated squaring: returns x^(2^n). Uses ModArith::square_n for CSR loop optimization.
+    constexpr auto __attribute__((always_inline)) square_n(unsigned n) const noexcept { return wrap(Fp.square_n(value_, n)); }
+
     /// Named one element. Needed in the pairing templates.
     static constexpr auto one() noexcept { return FieldElement{1}; }
 };
