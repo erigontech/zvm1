@@ -293,107 +293,190 @@ public:
 
                 // 0. Copy x -> A: use MEMCOPY if x is aligned, else word copy.
                 const bool x_al = (reinterpret_cast<uintptr_t>(&x) % 32 == 0);
-                if (x_al) {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
-                    register uint32_t a2 asm("x12") = 0x80;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                } else {
+                if (!x_al)
                     A = x;
-                }
 
-                // 1. T_lo = MUL_LOW(x, y)  →  A = t_lo
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = y_ptr;
-                    register uint32_t a2 asm("x12") = 0x08;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 2. Save t_lo: MEMCOPY A -> B
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&A);
-                    register uint32_t a2 asm("x12") = 0x80; // MEMCOPY A -> B
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 3. Reload x -> A, then MUL_HIGH(x, y) -> A = t_hi
                 if (x_al) {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
-                    register uint32_t a2 asm("x12") = 0x80;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    // Aligned fast path: single asm block for all CSR operations.
+                    // Avoids redundant pointer reloads between separate asm volatile blocks.
+                    const uintptr_t pA = reinterpret_cast<uintptr_t>(&A);
+                    const uintptr_t pB = reinterpret_cast<uintptr_t>(&B);
+                    const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+                    const uintptr_t pY = y_ptr;
+                    const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
+                    const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+
+                    uint32_t tmp;
+                    asm volatile(
+                        // Step 0: MEMCOPY x -> A
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pX]\n\t"
+                        "li x12, 0x80\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 1: MUL_LOW(A, y) -> A = t_lo
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pY]\n\t"
+                        "li x12, 0x08\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 2: MEMCOPY A -> B (save t_lo)
+                        "mv x10, %[pB]\n\t"
+                        "mv x11, %[pA]\n\t"
+                        "li x12, 0x80\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 3a: MEMCOPY x -> A (reload x)
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pX]\n\t"
+                        "li x12, 0x80\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 3b: MUL_HIGH(A, y) -> A = t_hi
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pY]\n\t"
+                        "li x12, 0x10\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 4: Zero check on B (short-circuit: first nonzero word -> carry=1)
+                        "lw %[tmp], 0(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 4(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 8(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 12(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 16(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 20(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 24(%[pB])\n\t"
+                        "bnez %[tmp], 1f\n\t"
+                        "lw %[tmp], 28(%[pB])\n\t"
+                        "1:\n\t"
+                        "snez %[tmp], %[tmp]\n\t"  // tmp = (t_lo != 0) ? 1 : 0
+
+                        // Step 5: MUL_LOW(B, mod_inv) -> B = m
+                        "mv x10, %[pB]\n\t"
+                        "mv x11, %[pModInv]\n\t"
+                        "li x12, 0x08\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 6: MUL_HIGH(B, mod) -> B = mN_hi
+                        "mv x10, %[pB]\n\t"
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x10\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 7: ADD(A, B + carry) -> A += B, carry out in x12
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pB]\n\t"
+                        "slli x12, %[tmp], 6\n\t"
+                        "ori x12, x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "mv %[tmp], x12\n\t"  // tmp = carry out from ADD
+
+                        // Step 8: SUB(A, mod) -> A -= mod, borrow in x12
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x02\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 9: Conditional ADD back if carry==0 && borrow!=0
+                        "bnez %[tmp], 2f\n\t"   // if carry != 0, skip (result valid)
+                        "beqz x12, 2f\n\t"      // if borrow == 0, skip (no underflow)
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "2:\n\t"
+
+                        : [tmp] "=&r"(tmp)
+                        : [pA] "r"(pA), [pB] "r"(pB), [pX] "r"(pX),
+                          [pY] "r"(pY), [pModInv] "r"(pModInv), [pMod] "r"(pMod)
+                        : "x10", "x11", "x12", "memory"
+                    );
                 } else {
+                    // Unaligned x path: A already contains x from word copy above.
+                    // Steps 1-9 with word-copy reloads where needed.
+
+                    // 1. MUL_LOW(A, y) -> A = t_lo
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = y_ptr;
+                        register uint32_t a2 asm("x12") = 0x08;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+
+                    // 2. MEMCOPY A -> B
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&A);
+                        register uint32_t a2 asm("x12") = 0x80;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+
+                    // 3. Reload x -> A (word copy), then MUL_HIGH
                     A = x;
-                }
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = y_ptr;
-                    register uint32_t a2 asm("x12") = 0x10; // MUL_HIGH
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-                // Now A = t_hi, B = t_lo
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = y_ptr;
+                        register uint32_t a2 asm("x12") = 0x10;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
 
-                // 4. Carry from low half: carry = (t_lo != 0).
-                // Short-circuit: check first word, branch out early.
-                // Probability of t_lo==0 is 1/2^256, so first check almost always succeeds.
-                uint32_t low_carry;
-                {
-                    const auto* bw = reinterpret_cast<const uint32_t*>(&B);
-                    uint32_t w = bw[0];
-                    if (w == 0) w |= bw[1];
-                    if (w == 0) w |= bw[2];
-                    if (w == 0) w |= bw[3];
-                    if (w == 0) w |= bw[4];
-                    if (w == 0) w |= bw[5];
-                    if (w == 0) w |= bw[6];
-                    if (w == 0) w |= bw[7];
-                    low_carry = (w != 0) ? 1u : 0u;
-                }
+                    // 4. Zero check
+                    uint32_t low_carry;
+                    {
+                        const auto* bw = reinterpret_cast<const uint32_t*>(&B);
+                        uint32_t w = bw[0];
+                        if (w == 0) w |= bw[1];
+                        if (w == 0) w |= bw[2];
+                        if (w == 0) w |= bw[3];
+                        if (w == 0) w |= bw[4];
+                        if (w == 0) w |= bw[5];
+                        if (w == 0) w |= bw[6];
+                        if (w == 0) w |= bw[7];
+                        low_carry = (w != 0) ? 1u : 0u;
+                    }
 
-                // 5. m = MUL_LOW(t_lo, N')  →  B = m
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_inv_full_);
-                    register uint32_t a2 asm("x12") = 0x08; // MUL_LOW
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 6. mN_hi = MUL_HIGH(m, N)  →  B = mN_hi
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x10;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 7. result = ADD(t_hi + mN_hi + carry)  →  A += B
-                uint32_t carry;
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
-                    register uint32_t a2 asm("x12") = 0x01 | (low_carry << 6);
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    carry = a2;
-                }
-
-                // 7. Conditional subtract: SUB(A, mod), undo if underflow.
-                //    Branchless-ish: always SUB, then ADD back only when both carry==0 AND borrow==1.
-                uint32_t borrow;
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x02; // SUB
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    borrow = a2;
-                }
-                if (!carry & borrow)  // bitwise AND avoids branch-on-branch
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x01; // ADD (undo sub)
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    // 5-9: same as before
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_inv_full_);
+                        register uint32_t a2 asm("x12") = 0x08;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                        register uint32_t a2 asm("x12") = 0x10;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
+                    uint32_t carry;
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
+                        register uint32_t a2 asm("x12") = 0x01 | (low_carry << 6);
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                        carry = a2;
+                    }
+                    uint32_t borrow;
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                        register uint32_t a2 asm("x12") = 0x02;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                        borrow = a2;
+                    }
+                    if (!carry & borrow)
+                    {
+                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                        register uint32_t a2 asm("x12") = 0x01;
+                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    }
                 }
 
                 return A;
