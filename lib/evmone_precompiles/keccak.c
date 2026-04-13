@@ -371,11 +371,81 @@ static inline ALWAYS_INLINE void keccak(
     const size_t block_size = (1600 - bits * 2) / 8;
 
     size_t i;
-    uint64_t* state_iter;
     uint64_t last_word = 0;
     uint8_t* last_word_iter = (uint8_t*)&last_word;
 
+#if defined(AIRBENDER)
+    // Work directly on the static CSR-aligned buf[] to avoid the
+    // state→buf→state copies that syscall_keccak_permute would do
+    // on every permutation call (saves 50 word copies per call).
+    for (i = 0; i < 25; i++) buf[i] = 0;
+    for (i = 25; i < 31; i++) buf[i] = 0;
+
+    while (size >= block_size)
+    {
+        for (i = 0; i < (block_size / word_size); ++i)
+        {
+            buf[i] ^= load_le(data);
+            data += word_size;
+        }
+
+        {
+            register uint32_t ctrl __asm__("x10") = 0;
+            register void*    sptr __asm__("x11") = (void*)buf;
+            __asm__ __volatile__(
+                ".rept 649\n"
+                "  csrrw x0, 0x7CB, x0\n"
+                ".endr\n"
+                : "+r"(ctrl)
+                : "r"(sptr)
+                : "memory"
+            );
+        }
+
+        size -= block_size;
+    }
+
+    {
+        uint64_t* buf_iter = buf;
+        while (size >= word_size)
+        {
+            *buf_iter ^= load_le(data);
+            ++buf_iter;
+            data += word_size;
+            size -= word_size;
+        }
+
+        while (size > 0)
+        {
+            *last_word_iter = *data;
+            ++last_word_iter;
+            ++data;
+            --size;
+        }
+        *last_word_iter = 0x01;
+        *buf_iter ^= to_le64(last_word);
+    }
+
+    buf[(block_size / word_size) - 1] ^= 0x8000000000000000;
+
+    {
+        register uint32_t ctrl __asm__("x10") = 0;
+        register void*    sptr __asm__("x11") = (void*)buf;
+        __asm__ __volatile__(
+            ".rept 649\n"
+            "  csrrw x0, 0x7CB, x0\n"
+            ".endr\n"
+            : "+r"(ctrl)
+            : "r"(sptr)
+            : "memory"
+        );
+    }
+
+    for (i = 0; i < (hash_size / word_size); ++i)
+        out[i] = to_le64(buf[i]);
+#else
     uint64_t state[25] = {0};
+    uint64_t* state_iter;
 
     while (size >= block_size)
     {
@@ -416,6 +486,7 @@ static inline ALWAYS_INLINE void keccak(
 
     for (i = 0; i < (hash_size / word_size); ++i)
         out[i] = to_le64(state[i]);
+#endif
 }
 
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
