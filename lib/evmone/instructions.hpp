@@ -169,17 +169,49 @@ inline constexpr auto invalid = stop_impl<EVMC_INVALID_INSTRUCTION>;
 
 inline void add(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // CSR ADD: *x10 += *x11, result at *x10.
+    // stack[0] = top, stack[1] = below. Result goes into stack[1] (new top after dispatch -1).
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x01;  // ADD
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack.top() += stack.pop();
+#endif
 }
 
 inline void mul(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // CSR MUL_LOW: *x10 = low256(*x10 * *x11), result at *x10.
+    // EVM MUL is mod 2^256 = low word. x10 != x11 (adjacent stack slots).
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x08;  // MUL_LOW
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack.top() *= stack.pop();
+#endif
 }
 
 inline void sub(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // EVM SUB: stack[1] = stack[0] - stack[1]. Result must be in stack[1].
+    // CSR SUB: *x10 -= *x11. So: stack[0] -= stack[1], then MEMCOPY stack[1] = stack[0].
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uint32_t r12 asm("x12") = 0x02;  // SUB
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    // Copy result from stack[0] to stack[1].
+    r10 = reinterpret_cast<uintptr_t>(&stack[1]);
+    r11 = reinterpret_cast<uintptr_t>(&stack[0]);
+    r12 = 0x80;  // MEMCOPY
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack[1] = stack[0] - stack[1];
+#endif
 }
 
 inline void div(StackTop stack) noexcept
