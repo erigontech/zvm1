@@ -349,7 +349,71 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     if ((gas_left -= additional_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv)
+    // CSR-accelerated binary exponentiation.
+    // We keep result and tmp as fixed aligned buffers and use CSR MUL_LOW + MEMCOPY
+    // to avoid the per-multiply copy overhead of intx::operator*.
+    // Each square: 1 MEMCOPY + 1 MUL_LOW (vs 4 memcpy + 1 MUL_LOW in generic path).
+    // Each multiply-by-base: 1 MUL_LOW (vs 3 memcpy + 1 MUL_LOW in generic path).
+
+    // Handle base == 2 fast path (shift, no CSR benefit).
+    if (base == 2)
+    {
+        exponent = uint256{1} << exponent;
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    // Copy exponent before overwriting with result.
+    alignas(32) uint256 exp_copy = exponent;
+    const auto bw = intx::bit_width(exp_copy);
+
+    if (bw == 0)
+    {
+        // exponent == 0 => result = 1.
+        exponent = 1;
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    // result lives at &exponent (stack top), starts as 1.
+    // base_buf holds the base for multiply steps.
+    alignas(32) uint256 base_buf = base;
+    alignas(32) uint256 tmp;
+
+    // Initialize result = 1 at &exponent.
+    exponent = 1;
+
+    register uintptr_t r10 asm("x10");
+    register uintptr_t r11 asm("x11");
+    register uint32_t r12 asm("x12");
+
+    for (size_t i = bw; i > 0; --i)
+    {
+        // Square: result = result * result.
+        // Step 1: MEMCOPY tmp = result.
+        r10 = reinterpret_cast<uintptr_t>(&tmp);
+        r11 = reinterpret_cast<uintptr_t>(&exponent);
+        r12 = 0x80;  // MEMCOPY
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+
+        // Step 2: MUL_LOW result = result * tmp.
+        r10 = reinterpret_cast<uintptr_t>(&exponent);
+        r11 = reinterpret_cast<uintptr_t>(&tmp);
+        r12 = 0x08;  // MUL_LOW
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+
+        // Conditional multiply by base.
+        if (intx::bit_test(exp_copy, i - 1))
+        {
+            // MUL_LOW result = result * base_buf.
+            r10 = reinterpret_cast<uintptr_t>(&exponent);
+            r11 = reinterpret_cast<uintptr_t>(&base_buf);
+            r12 = 0x08;  // MUL_LOW
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+        }
+    }
+#else
     exponent = intx::exp(base, exponent);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -388,14 +452,38 @@ inline void signextend(StackTop stack) noexcept
 
 inline void lt(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // LT: is old_top < new_top?
+    // CSR SUB(&old_top, &new_top) → borrow = (old_top < new_top).
+    // old_top is the popped slot (scratch OK). Result → new_top (stack[0] after pop).
+    auto& x = stack.pop();  // non-const: we allow CSR to modify the popped slot.
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x02;  // SUB
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    stack[0] = uint64_t{r12 != 0};  // borrow != 0 means x < stack[0]
+#else
     const auto& x = stack.pop();
     stack[0] = uint64_t{x < stack[0]};
+#endif
 }
 
 inline void gt(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // GT: is new_top < old_top?  (arguments swapped in EVM spec)
+    // CSR SUB(&new_top, &old_top) → borrow = (new_top < old_top).
+    // The popped slot (old_top) is preserved as x11. new_top (stack[0]) is clobbered then overwritten.
+    auto& x = stack.pop();
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+    register uint32_t r12 asm("x12") = 0x02;  // SUB
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    stack[0] = uint64_t{r12 != 0};  // borrow != 0 means stack[0] < x
+#else
     const auto& x = stack.pop();
     stack[0] = uint64_t{stack[0] < x};  // Arguments are swapped and < is used.
+#endif
 }
 
 inline void slt(StackTop stack) noexcept
