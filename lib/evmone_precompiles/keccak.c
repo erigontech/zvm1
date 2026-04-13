@@ -15,13 +15,15 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     asm volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
 #elif defined(AIRBENDER)
+// File-level static buffer for keccak CSR delegation (256-byte aligned).
+// Shared between syscall_keccak_permute and direct-access optimized paths.
+static uint64_t __attribute__((aligned(256))) buf[32];
+
 /// Keccak-f[1600] via airbender CSR 0x7CB delegation.
 /// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
 /// scans for exactly 649 contiguous csrrw instructions.
 static void syscall_keccak_permute(uint64_t state[25])
 {
-    /* Use static buffer to avoid stack alignment issues on rv32im. */
-    static uint64_t __attribute__((aligned(256))) buf[32];
     int i;
     for (i = 0; i < 25; i++)
         buf[i] = state[i];
@@ -423,6 +425,46 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
     // Most EVM inputs are < 136 bytes (single block). Specialize.
     if (size < 136)
     {
+#if defined(AIRBENDER)
+        // Write directly to the static CSR-aligned buf — avoid state→buf→state copies.
+        {
+            int i;
+            for (i = 0; i < 31; i++) buf[i] = 0;
+
+            uint64_t* buf_iter = buf;
+            const uint8_t* d = data;
+            size_t remaining = size;
+            while (remaining >= 8)
+            {
+                *buf_iter++ ^= load_le(d);
+                d += 8;
+                remaining -= 8;
+            }
+            uint64_t last_word = 0;
+            uint8_t* lw = (uint8_t*)&last_word;
+            for (i = 0; i < (int)remaining; ++i)
+                lw[i] = d[i];
+            lw[remaining] = 0x01;
+            *buf_iter ^= to_le64(last_word);
+            buf[16] ^= 0x8000000000000000ULL;
+
+            register uint32_t ctrl __asm__("x10") = 0;
+            register void*    sptr __asm__("x11") = (void*)buf;
+            __asm__ __volatile__(
+                ".rept 649\n"
+                "  csrrw x0, 0x7CB, x0\n"
+                ".endr\n"
+                : "+r"(ctrl)
+                : "r"(sptr)
+                : "memory"
+            );
+            hash.word64s[0] = to_le64(buf[0]);
+            hash.word64s[1] = to_le64(buf[1]);
+            hash.word64s[2] = to_le64(buf[2]);
+            hash.word64s[3] = to_le64(buf[3]);
+            return hash;
+        }
+#else
         size_t i;
         uint64_t state[25] = {0};
         uint64_t* state_iter = state;
@@ -453,6 +495,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
         hash.word64s[2] = to_le64(state[2]);
         hash.word64s[3] = to_le64(state[3]);
         return hash;
+#endif
     }
     keccak(hash.word64s, 256, data, size);
     return hash;
@@ -461,6 +504,37 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
 {
     union ethash_hash256 hash;
+#if defined(AIRBENDER)
+    // Write directly to the CSR-aligned static buffer — skip the state→buf→state copies.
+    {
+        // Use file-level static buf[] directly — no copy overhead.
+        int i;
+        buf[0] = load_le(data);
+        buf[1] = load_le(data + 8);
+        buf[2] = load_le(data + 16);
+        buf[3] = load_le(data + 24);
+        buf[4] = 0x0000000000000001ULL;
+        for (i = 5; i < 16; i++) buf[i] = 0;
+        buf[16] = 0x8000000000000000ULL;
+        for (i = 17; i < 31; i++) buf[i] = 0;
+
+        register uint32_t ctrl __asm__("x10") = 0;
+        register void*    sptr __asm__("x11") = (void*)buf;
+        __asm__ __volatile__(
+            ".rept 649\n"
+            "  csrrw x0, 0x7CB, x0\n"
+            ".endr\n"
+            : "+r"(ctrl)
+            : "r"(sptr)
+            : "memory"
+        );
+        hash.word64s[0] = to_le64(buf[0]);
+        hash.word64s[1] = to_le64(buf[1]);
+        hash.word64s[2] = to_le64(buf[2]);
+        hash.word64s[3] = to_le64(buf[3]);
+        return hash;
+    }
+#else
     // Specialized path: 32 bytes input, keccak-256.
     // block_size = (1600 - 256*2) / 8 = 136 bytes.
     // 32 < 136, so no multi-block processing needed.
@@ -479,4 +553,5 @@ union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
     hash.word64s[2] = to_le64(state[2]);
     hash.word64s[3] = to_le64(state[3]);
     return hash;
+#endif
 }

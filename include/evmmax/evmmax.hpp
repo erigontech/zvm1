@@ -188,7 +188,19 @@ public:
                 }
 
                 // 3. carry = (x != 0) since t_lo = x and t_lo + mN_lo = 0 or 2^256
-                const uint32_t low_carry = (x != UintT{0}) ? 1u : 0u;
+                uint32_t low_carry;
+                {
+                    const auto* xw = reinterpret_cast<const uint32_t*>(&x);
+                    uint32_t w = xw[0];
+                    if (w == 0) w |= xw[1];
+                    if (w == 0) w |= xw[2];
+                    if (w == 0) w |= xw[3];
+                    if (w == 0) w |= xw[4];
+                    if (w == 0) w |= xw[5];
+                    if (w == 0) w |= xw[6];
+                    if (w == 0) w |= xw[7];
+                    low_carry = (w != 0) ? 1u : 0u;
+                }
 
                 // 4. result = 0 + mN_hi + carry -> A += D
                 uint32_t carry;
@@ -323,8 +335,22 @@ public:
                 }
                 // Now A = t_hi, B = t_lo
 
-                // 4. Carry from low half (before overwriting B)
-                const uint32_t low_carry = (B != UintT{0}) ? 1u : 0u;
+                // 4. Carry from low half: carry = (t_lo != 0).
+                // Short-circuit: check first word, branch out early.
+                // Probability of t_lo==0 is 1/2^256, so first check almost always succeeds.
+                uint32_t low_carry;
+                {
+                    const auto* bw = reinterpret_cast<const uint32_t*>(&B);
+                    uint32_t w = bw[0];
+                    if (w == 0) w |= bw[1];
+                    if (w == 0) w |= bw[2];
+                    if (w == 0) w |= bw[3];
+                    if (w == 0) w |= bw[4];
+                    if (w == 0) w |= bw[5];
+                    if (w == 0) w |= bw[6];
+                    if (w == 0) w |= bw[7];
+                    low_carry = (w != 0) ? 1u : 0u;
+                }
 
                 // 5. m = MUL_LOW(t_lo, N')  →  B = m
                 {
@@ -352,32 +378,22 @@ public:
                     carry = a2;
                 }
 
-                // 7. Conditional subtract: try SUB(A, mod), keep if no borrow
-                //    Use aligned mod_ directly as x11.
-                if (carry)
+                // 7. Conditional subtract: SUB(A, mod), undo if underflow.
+                //    Branchless-ish: always SUB, then ADD back only when both carry==0 AND borrow==1.
+                uint32_t borrow;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
                     register uint32_t a2 asm("x12") = 0x02; // SUB
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    borrow = a2;
                 }
-                else
+                if (!carry & borrow)  // bitwise AND avoids branch-on-branch
                 {
-                    uint32_t borrow;
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                        register uint32_t a2 asm("x12") = 0x02;
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                        borrow = a2;
-                    }
-                    if (borrow)
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                        register uint32_t a2 asm("x12") = 0x01;
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    }
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                    register uint32_t a2 asm("x12") = 0x01; // ADD (undo sub)
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 }
 
                 return A;
@@ -439,13 +455,25 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // add = x + y, then try subtract mod. 2-3 CSR calls.
-                // Copy y to aligned buffer (y may be misaligned stack temp).
-                alignas(32) UintT res = x;
-                alignas(32) UintT yy = y;
+                alignas(32) UintT res;
+                // Copy x → res: MEMCOPY if aligned, else word copy.
+                if (reinterpret_cast<uintptr_t>(&x) % 32 == 0) {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                } else { res = x; }
+                // Resolve y pointer: use directly if aligned.
+                alignas(32) UintT yy_buf;
+                const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
+                if (!y_al) yy_buf = y;
+                const uintptr_t y_ptr = y_al
+                    ? reinterpret_cast<uintptr_t>(&y)
+                    : reinterpret_cast<uintptr_t>(&yy_buf);
                 uint32_t add_carry;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&yy);
+                    register uintptr_t a1 asm("x11") = y_ptr;
                     register uint32_t a2 asm("x12") = 0x01; // ADD
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     add_carry = a2;
@@ -506,13 +534,23 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // sub = x - y; if borrow, add mod back. 1-2 CSR calls.
-                // Copy y to aligned buffer (y may be misaligned stack temp).
-                alignas(32) UintT res = x;
-                alignas(32) UintT yy = y;
+                alignas(32) UintT res;
+                if (reinterpret_cast<uintptr_t>(&x) % 32 == 0) {
+                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
+                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+                    register uint32_t a2 asm("x12") = 0x80;
+                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                } else { res = x; }
+                alignas(32) UintT yy_buf;
+                const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
+                if (!y_al) yy_buf = y;
+                const uintptr_t y_ptr = y_al
+                    ? reinterpret_cast<uintptr_t>(&y)
+                    : reinterpret_cast<uintptr_t>(&yy_buf);
                 uint32_t borrow;
                 {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&yy);
+                    register uintptr_t a1 asm("x11") = y_ptr;
                     register uint32_t a2 asm("x12") = 0x02; // SUB
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     borrow = a2;
@@ -537,7 +575,7 @@ public:
 
     /// Compute the modular inversion of the x in Montgomery form. The result is in Montgomery form.
     /// If x is not invertible, the result is 0.
-    constexpr UintT inv(const UintT& x) const noexcept
+    constexpr __attribute__((flatten)) UintT inv(const UintT& x) const noexcept
     {
 #if defined(AIRBENDER) && defined(__riscv)
         if constexpr (UintT::num_bits == 256)

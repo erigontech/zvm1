@@ -149,22 +149,24 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
             w[3] = w[3] >> 1;
         };
         // Add/sub a small value d to a 128-bit number (d is 1 or 2).
+        // Native 32-bit arithmetic — avoids 64-bit emulation on rv32im.
         auto add_small = [](uint32_t* w, uint32_t d) {
-            uint64_t carry = d;
-            for (int j = 0; j < 4 && carry; ++j) {
-                carry += w[j];
-                w[j] = static_cast<uint32_t>(carry);
-                carry >>= 32;
+            uint32_t sum = w[0] + d;
+            uint32_t c = (sum < w[0]) ? 1u : 0u;
+            w[0] = sum;
+            for (int j = 1; j < 4 && c; ++j) {
+                sum = w[j] + c;
+                c = (sum < w[j]) ? 1u : 0u;
+                w[j] = sum;
             }
         };
         auto sub_small = [](uint32_t* w, uint32_t d) {
-            uint64_t borrow = 0;
-            uint64_t sub = d;
-            for (int j = 0; j < 4; ++j) {
-                uint64_t diff = static_cast<uint64_t>(w[j]) - sub - borrow;
-                w[j] = static_cast<uint32_t>(diff);
-                borrow = (diff >> 32) & 1;
-                sub = 0;
+            uint32_t c = (w[0] < d) ? 1u : 0u;
+            w[0] -= d;
+            for (int j = 1; j < 4 && c; ++j) {
+                uint32_t prev = w[j];
+                w[j] -= c;
+                c = (prev < c) ? 1u : 0u;
             }
         };
 
@@ -274,6 +276,7 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
 }  // namespace
 
 // FIXME: Change to "uncompress_point".
+__attribute__((flatten))
 std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept
 {
     // Calculate y = √(x³ + 7).

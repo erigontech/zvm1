@@ -104,18 +104,18 @@ public:
         return wrap(Fp.sub(0, a.value_));
     }
 
-    friend constexpr auto operator/(one_t, const FieldElement& a) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator/(one_t, const FieldElement& a) noexcept
     {
         return wrap(Fp.inv(a.value_));
     }
 
-    friend constexpr auto operator/(const FieldElement& a, const FieldElement& b) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator/(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.mul(a.value_, Fp.inv(b.value_)));
     }
 
     /// Named 1/x inversion method. Needed in the pairing templates.
-    constexpr auto inv() const noexcept { return wrap(Fp.inv(value_)); }
+    constexpr auto __attribute__((always_inline)) inv() const noexcept { return wrap(Fp.inv(value_)); }
 
     /// Named one element. Needed in the pairing templates.
     static constexpr auto one() noexcept { return FieldElement{1}; }
