@@ -314,28 +314,22 @@ public:
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 1: MUL_LOW(A, y) -> A = t_lo
-                        "mv x10, %[pA]\n\t"
-                        "mv x11, %[pY]\n\t"
-                        "li x12, 0x08\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-
-                        // Step 2: MEMCOPY A -> B (save t_lo)
+                        // Step 0b: MEMCOPY x -> B (save x for MUL_LOW later)
                         "mv x10, %[pB]\n\t"
-                        "mv x11, %[pA]\n\t"
-                        "li x12, 0x80\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-
-                        // Step 3a: MEMCOPY x -> A (reload x)
-                        "mv x10, %[pA]\n\t"
                         "mv x11, %[pX]\n\t"
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 3b: MUL_HIGH(A, y) -> A = t_hi
+                        // Step 1: MUL_HIGH(A, y) -> A = t_hi
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pY]\n\t"
                         "li x12, 0x10\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Step 2: MUL_LOW(B, y) -> B = t_lo
+                        "mv x10, %[pB]\n\t"
+                        "mv x11, %[pY]\n\t"
+                        "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
                         // Step 4: Zero check on B (short-circuit: first nonzero word -> carry=1)
