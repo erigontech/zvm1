@@ -308,31 +308,32 @@ public:
 
                     uint32_t tmp;
                     asm volatile(
-                        // Step 0: MEMCOPY x -> A
+                        // Step 0: MEMCOPY x -> A  (x10=pA, x11=pX)
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pX]\n\t"
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 0b: MEMCOPY x -> B (save x for MUL_LOW later)
+                        // Step 0b: MEMCOPY x -> B  (x10=pB, x11=pX already)
                         "mv x10, %[pB]\n\t"
-                        "mv x11, %[pX]\n\t"
+                        // x11 already pX from step 0
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 1: MUL_HIGH(A, y) -> A = t_hi
+                        // Step 1: MUL_HIGH(A, y) -> A = t_hi  (x10=pA, x11=pY)
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pY]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 2: MUL_LOW(B, y) -> B = t_lo
+                        // Step 2: MUL_LOW(B, y) -> B = t_lo  (x10=pB, x11=pY already)
                         "mv x10, %[pB]\n\t"
-                        "mv x11, %[pY]\n\t"
+                        // x11 already pY from step 1
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
                         // Step 4: Zero check on B (short-circuit: first nonzero word -> carry=1)
+                        // x10 still pB after step 2 CSR (CSR does not modify x10/x11)
                         "lw %[tmp], 0(%[pB])\n\t"
                         "bnez %[tmp], 1f\n\t"
                         "lw %[tmp], 4(%[pB])\n\t"
@@ -351,14 +352,14 @@ public:
                         "1:\n\t"
                         "snez %[tmp], %[tmp]\n\t"  // tmp = (t_lo != 0) ? 1 : 0
 
-                        // Step 5: MUL_LOW(B, mod_inv) -> B = m
-                        "mv x10, %[pB]\n\t"
+                        // Step 5: MUL_LOW(B, mod_inv) -> B = m  (x10=pB already, x11=pModInv)
+                        // x10 still pB (zero check did not modify x10)
                         "mv x11, %[pModInv]\n\t"
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 6: MUL_HIGH(B, mod) -> B = mN_hi
-                        "mv x10, %[pB]\n\t"
+                        // Step 6: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB already, x11=pMod)
+                        // x10 still pB from step 5
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
@@ -371,17 +372,16 @@ public:
                         "csrrw x0, 0x7CA, x0\n\t"
                         "mv %[tmp], x12\n\t"  // tmp = carry out from ADD
 
-                        // Step 8: SUB(A, mod) -> A -= mod, borrow in x12
-                        "mv x10, %[pA]\n\t"
+                        // Step 8: SUB(A, mod) -> A -= mod, borrow in x12  (x10=pA already)
+                        // x10 still pA from step 7
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x02\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
                         // Step 9: Conditional ADD back if carry==0 && borrow!=0
+                        // x10=pA, x11=pMod both still valid from step 8
                         "bnez %[tmp], 2f\n\t"   // if carry != 0, skip (result valid)
                         "beqz x12, 2f\n\t"      // if borrow == 0, skip (no underflow)
-                        "mv x10, %[pA]\n\t"
-                        "mv x11, %[pMod]\n\t"
                         "li x12, 0x01\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
                         "2:\n\t"
@@ -553,31 +553,32 @@ public:
                     // Steps 3-8: standard Montgomery reduction
                     uint32_t tmp;
                     asm volatile(
-                        // Step 0: MEMCOPY A -> C
+                        // Step 0: MEMCOPY A -> C  (x10=pC, x11=pA)
                         "mv x10, %[pC]\n\t"
                         "mv x11, %[pA]\n\t"
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 0b: MEMCOPY A -> B
+                        // Step 0b: MEMCOPY A -> B  (x10=pB, x11=pA already)
                         "mv x10, %[pB]\n\t"
-                        "mv x11, %[pA]\n\t"
+                        // x11 already pA from step 0
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 1: MUL_HIGH(A, C) -> A = t_hi  (x10=A, x11=C: A!=C)
+                        // Step 1: MUL_HIGH(A, C) -> A = t_hi  (x10=pA, x11=pC)
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pC]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 2: MUL_LOW(B, C) -> B = t_lo  (x10=B, x11=C: B!=C)
+                        // Step 2: MUL_LOW(B, C) -> B = t_lo  (x10=pB, x11=pC already)
                         "mv x10, %[pB]\n\t"
-                        "mv x11, %[pC]\n\t"
+                        // x11 already pC from step 1
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
                         // Step 3: Zero check on B (t_lo)
+                        // x10 still pB after step 2 CSR (CSR does not modify x10/x11)
                         "lw %[tmp], 0(%[pB])\n\t"
                         "bnez %[tmp], 1f\n\t"
                         "lw %[tmp], 4(%[pB])\n\t"
@@ -596,19 +597,19 @@ public:
                         "1:\n\t"
                         "snez %[tmp], %[tmp]\n\t"
 
-                        // Step 4: MUL_LOW(B, mod_inv) -> B = m  (x10=B, x11=modInv: OK)
-                        "mv x10, %[pB]\n\t"
+                        // Step 4: MUL_LOW(B, mod_inv) -> B = m  (x10=pB already, x11=pModInv)
+                        // x10 still pB (zero check did not modify x10)
                         "mv x11, %[pModInv]\n\t"
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 5: MUL_HIGH(B, mod) -> B = mN_hi  (x10=B, x11=mod: OK)
-                        "mv x10, %[pB]\n\t"
+                        // Step 5: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB already, x11=pMod)
+                        // x10 still pB from step 4
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 6: ADD(A, B + carry) -> A += B  (x10=A, x11=B: A!=B)
+                        // Step 6: ADD(A, B + carry) -> A += B  (x10=pA, x11=pB)
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pB]\n\t"
                         "slli x12, %[tmp], 6\n\t"
@@ -616,17 +617,16 @@ public:
                         "csrrw x0, 0x7CA, x0\n\t"
                         "mv %[tmp], x12\n\t"
 
-                        // Step 7: SUB(A, mod) -> A -= mod  (x10=A, x11=mod: OK)
-                        "mv x10, %[pA]\n\t"
+                        // Step 7: SUB(A, mod) -> A -= mod  (x10=pA already, x11=pMod)
+                        // x10 still pA from step 6
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x02\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
                         // Step 8: Conditional ADD back
+                        // x10=pA, x11=pMod both still valid from step 7
                         "bnez %[tmp], 2f\n\t"
                         "beqz x12, 2f\n\t"
-                        "mv x10, %[pA]\n\t"
-                        "mv x11, %[pMod]\n\t"
                         "li x12, 0x01\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
                         "2:\n\t"
