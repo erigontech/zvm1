@@ -377,7 +377,9 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     // result lives at &exponent (stack top), starts as 1.
     // base_buf holds the base for multiply steps.
     alignas(32) uint256 base_buf = base;
-    alignas(32) uint256 tmp;
+    // Use uninitialized buffer for tmp: MEMCOPY overwrites before any read.
+    alignas(32) char tmp_raw_exp_[sizeof(uint256)];
+    auto& tmp = *reinterpret_cast<uint256*>(tmp_raw_exp_);
 
     // Initialize result = 1 at &exponent.
     exponent = 1;
@@ -1104,31 +1106,34 @@ inline void swap(StackTop stack) noexcept
 #if defined(AIRBENDER) && defined(__riscv)
     // Use BigInt CSR MEMCOPY for 256-bit swap via temp buffer.
     // 3 CSR calls vs ~32 rv32im instructions for manual word-by-word swap.
-    alignas(32) uint256 tmp;  // Temp buffer on stack (RAM, 32-byte aligned).
-    auto* t_ptr = &stack.top();
-    auto* a_ptr = &stack[N];
+    // Use uninitialized buffer: MEMCOPY overwrites immediately, skip zero-init.
+    alignas(32) char tmp_raw_[sizeof(uint256)];
+    const uintptr_t pTmp = reinterpret_cast<uintptr_t>(tmp_raw_);
+    const uintptr_t pTop = reinterpret_cast<uintptr_t>(&stack.top());
+    const uintptr_t pA = reinterpret_cast<uintptr_t>(&stack[N]);
 
-    register uintptr_t r10 asm("x10");
-    register uintptr_t r11 asm("x11");
-    register uint32_t r12 asm("x12");
-
-    // Step 1: tmp = top
-    r10 = reinterpret_cast<uintptr_t>(&tmp);
-    r11 = reinterpret_cast<uintptr_t>(t_ptr);
-    r12 = 0x80;  // MEMCOPY
-    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-
-    // Step 2: top = a
-    r10 = reinterpret_cast<uintptr_t>(t_ptr);
-    r11 = reinterpret_cast<uintptr_t>(a_ptr);
-    r12 = 0x80;
-    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-
-    // Step 3: a = tmp
-    r10 = reinterpret_cast<uintptr_t>(a_ptr);
-    r11 = reinterpret_cast<uintptr_t>(&tmp);
-    r12 = 0x80;
-    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    // Fused 3-way MEMCOPY swap in a single asm block.
+    // x12 must be re-set before each CSR call (CSR may modify x12).
+    asm volatile(
+        // Step 1: tmp = top
+        "mv x10, %[pTmp]\n\t"
+        "mv x11, %[pTop]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // Step 2: top = a
+        "mv x10, %[pTop]\n\t"
+        "mv x11, %[pA]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // Step 3: a = tmp
+        "mv x10, %[pA]\n\t"
+        "mv x11, %[pTmp]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [pTmp] "r"(pTmp), [pTop] "r"(pTop), [pA] "r"(pA)
+        : "x10", "x11", "x12", "memory"
+    );
 #else
     // The simple std::swap(stack.top(), stack[N]) is not used to workaround
     // clang missed optimization: https://github.com/llvm/llvm-project/issues/59116
