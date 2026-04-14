@@ -787,6 +787,75 @@ public:
         return (d.carry) ? s : d.value;
     }
 
+    /// Optimized BN254 Fp Fermat inversion: x^(p-2) mod p.
+    /// p-2 = 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45
+    /// Uses sliding window w=5: 252S + 54M = 306 Montgomery muls (vs generic 362).
+    /// Marked noinline to prevent flatten from inlining all 54 mul calls (262KB code bloat).
+    __attribute__((noinline)) UintT inv_bn254_fp(const UintT& x) const noexcept
+    {
+        // Precomputation: x^2 and odd powers x^3, x^5, ..., x^31
+        UintT x2 = mul(x, x);
+        UintT x3 = mul(x, x2);
+        UintT x5 = mul(x3, x2);
+        UintT x7 = mul(x5, x2);
+        UintT x9 = mul(x7, x2);
+        UintT x11 = mul(x9, x2);
+        UintT x13 = mul(x11, x2);
+        UintT x15 = mul(x13, x2);
+        UintT x17 = mul(x15, x2);
+        UintT x19 = mul(x17, x2);
+        UintT x21 = mul(x19, x2);
+        UintT x23 = mul(x21, x2);
+        UintT x25 = mul(x23, x2);
+        UintT x27 = mul(x25, x2);
+        UintT x29 = mul(x27, x2);
+        UintT x31 = mul(x29, x2);
+        // 16M precomputation
+
+        // Sliding window chain: 252S + 38M
+        UintT r = x3;                                       // initial
+        r = square_n(r, 10); r = mul(r, x25);   // 10S+1M
+        r = square_n(r, 8); r = mul(r, x19);    // 8S+1M
+        r = square_n(r, 5); r = mul(r, x19);    // 5S+1M
+        r = square_n(r, 4); r = mul(r, x9);     // 4S+1M
+        r = square_n(r, 4); r = mul(r, x7);     // 4S+1M
+        r = square_n(r, 9); r = mul(r, x19);    // 9S+1M
+        r = square_n(r, 7); r = mul(r, x13);    // 7S+1M
+        r = square_n(r, 10); r = mul(r, x5);    // 10S+1M
+        r = square_n(r, 7); r = mul(r, x27);    // 7S+1M
+        r = square_n(r, 1); r = mul(r, x);      // 1S+1M
+        r = square_n(r, 7); r = mul(r, x5);     // 7S+1M
+        r = square_n(r, 10); r = mul(r, x17);   // 10S+1M
+        r = square_n(r, 6); r = mul(r, x27);    // 6S+1M
+        r = square_n(r, 5); r = mul(r, x13);    // 5S+1M
+        r = square_n(r, 8); r = mul(r, x3);     // 8S+1M
+        r = square_n(r, 11); r = mul(r, x21);   // 11S+1M
+        r = square_n(r, 1); r = mul(r, x);      // 1S+1M
+        r = square_n(r, 9); r = mul(r, x23);    // 9S+1M
+        r = square_n(r, 6); r = mul(r, x25);    // 6S+1M
+        r = square_n(r, 5); r = mul(r, x15);    // 5S+1M
+        r = square_n(r, 10); r = mul(r, x11);   // 10S+1M
+        r = square_n(r, 6); r = mul(r, x21);    // 6S+1M
+        r = square_n(r, 7); r = mul(r, x17);    // 7S+1M
+        r = square_n(r, 5); r = mul(r, x13);    // 5S+1M
+        r = square_n(r, 7); r = mul(r, x7);     // 7S+1M
+        r = square_n(r, 6); r = mul(r, x7);     // 6S+1M
+        r = square_n(r, 7); r = mul(r, x21);    // 7S+1M
+        r = square_n(r, 7); r = mul(r, x13);    // 7S+1M
+        r = square_n(r, 6); r = mul(r, x15);    // 6S+1M
+        r = square_n(r, 5); r = mul(r, x);      // 5S+1M
+        r = square_n(r, 10); r = mul(r, x17);   // 10S+1M
+        r = square_n(r, 1); r = mul(r, x);      // 1S+1M
+        r = square_n(r, 9); r = mul(r, x11);    // 9S+1M
+        r = square_n(r, 6); r = mul(r, x27);    // 6S+1M
+        r = square_n(r, 9); r = mul(r, x31);    // 9S+1M
+        r = square_n(r, 7); r = mul(r, x31);    // 7S+1M
+        r = square_n(r, 5); r = mul(r, x21);    // 5S+1M
+        r = square_n(r, 6); r = mul(r, x5);     // 6S+1M
+        // Total: 252S + 54M = 306 Montgomery muls
+        return r;
+    }
+
     /// Compute the modular inversion of the x in Montgomery form. The result is in Montgomery form.
     /// If x is not invertible, the result is 0.
     constexpr __attribute__((flatten)) UintT inv(const UintT& x) const noexcept
@@ -963,9 +1032,15 @@ public:
                     // Total phase 2: 131S + 24M
                     return r;
                 }
-                else
+                // BN254 base field prime (Fp)
+                constexpr UintT BN254_P =
+                    intx::from_string<UintT>("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47");
+
+                if (mod_ == BN254_P)
+                    return inv_bn254_fp(x);
+
+                // Generic Fermat: square-and-multiply over bits of (mod - 2).
                 {
-                    // Generic Fermat: square-and-multiply over bits of (mod - 2).
                     const UintT exp = mod_ - 2;
                     const auto bw = intx::bit_width(exp);
                     UintT result = x;
