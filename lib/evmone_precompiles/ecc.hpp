@@ -622,13 +622,77 @@ std::array<SignedScalar<typename Curve::uint_type>, 2> decompose(
     // f(v₂) = 0
     static_assert((Curve::X2 + umul(Curve::Y2, Curve::LAMBDA)) % Curve::ORDER == 0);
 
+    // DET is the (v₁, v₂) matrix determinant.
+    static constexpr auto WIDE_DET =
+        umul(Curve::X1, Curve::Y2) + umul(Curve::X2, Curve::MINUS_Y1);
+    static_assert(WIDE_DET <= std::numeric_limits<UIntT>::max());
+    static constexpr auto DET = static_cast<UIntT>(WIDE_DET);
+    static constexpr auto HALF_DET = DET / 2;
+
+#if defined(AIRBENDER) && defined(__riscv)
+    // Barrett reduction constants for replacing expensive udivrem(uint512, uint256).
+    // M = floor(2^512 / DET) = 2^256 + M_LO, where M_LO = floor((2^256-DET)*2^256 / DET).
+    // Only usable when M_LO fits in 256 bits (i.e. DET has full 256-bit width).
+    static constexpr auto BARRETT_GAP = ~DET + UIntT{1};  // 2^256 - DET
+    static constexpr auto BARRETT_M_LO_WIDE =
+        (intx::uint<512>{BARRETT_GAP} << 256) / intx::uint<512>{DET};
+    static constexpr bool BARRETT_FITS =
+        BARRETT_M_LO_WIDE <= std::numeric_limits<UIntT>::max();
+    // Only define M_LO when it fits; otherwise Barrett path is disabled.
+    static constexpr auto BARRETT_M_LO = BARRETT_FITS
+        ? static_cast<UIntT>(BARRETT_M_LO_WIDE) : UIntT{};
+#endif
+
     static constexpr auto round_div = [](const auto& a) noexcept {
-        // DET is the (v₁, v₂) matrix determinant.
-        static constexpr auto WIDE_DET =
-            umul(Curve::X1, Curve::Y2) + umul(Curve::X2, Curve::MINUS_Y1);
-        static_assert(WIDE_DET <= std::numeric_limits<UIntT>::max());
-        static constexpr auto DET = static_cast<UIntT>(WIDE_DET);
-        static constexpr auto HALF_DET = DET / 2;
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (BARRETT_FITS)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // Barrett reduction: replace expensive udivrem(uint512, uint256) with
+                // one CSR MUL_HIGH (for approximate quotient) + one umul (for correction).
+                //
+                // q_hat = a_hi + MUL_HIGH(a_hi, M_LO) is an approximate quotient
+                // satisfying q_hat <= q_true <= q_hat + 1.
+
+                // Extract upper and lower 256-bit halves of the 512-bit dividend.
+                const auto a_hi = static_cast<UIntT>(a >> 256);
+                const auto a_lo = static_cast<UIntT>(a);
+
+                // Step 1: q_hat = a_hi + MUL_HIGH(a_hi, M_LO)
+                alignas(32) UIntT buf_hi = a_hi;
+                alignas(32) UIntT m_lo_buf = BARRETT_M_LO;
+                {
+                    register uintptr_t r10 asm("x10") =
+                        reinterpret_cast<uintptr_t>(&buf_hi);
+                    register uintptr_t r11 asm("x11") =
+                        reinterpret_cast<uintptr_t>(&m_lo_buf);
+                    register uint32_t r12 asm("x12") = 0x10;  // MUL_HIGH
+                    asm volatile("csrrw x0, 0x7CA, x0"
+                        : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+                }
+                auto q_hat = a_hi + buf_hi;
+
+                // Step 2: Compute diff = a - q_hat * DET (at most 2*DET - 1).
+                // umul uses CSR MUL_LOW+MUL_HIGH on AIRBENDER.
+                const auto product = umul(q_hat, DET);
+                // 512-bit subtract (scalar on rv32im).
+                const auto diff = a - product;
+                auto diff_lo = static_cast<UIntT>(diff);
+
+                // Step 3: Correction. If diff >= DET, q_hat was 1 too low.
+                const bool needs_correction =
+                    static_cast<UIntT>(diff >> 256) != 0 || diff_lo >= DET;
+                if (needs_correction)
+                {
+                    diff_lo -= DET;
+                    q_hat += UIntT{1};
+                }
+
+                return q_hat + UIntT{diff_lo > HALF_DET};
+            }
+        }
+#endif
 
         const auto [wide_q, r] = udivrem(a, DET);
         // Division reduces the quotient enough to fit into a single uint.
