@@ -273,10 +273,10 @@ __attribute__((flatten))
 inline AffinePoint<Curve> to_affine(const ProjPoint<Curve>& p) noexcept
 {
     // This works correctly for the point at infinity (z == 0) because then z_inv == 0.
-    const auto z_inv = 1 / p.z;
+    auto z_inv = 1 / p.z;
     const auto zz_inv = z_inv * z_inv;
-    const auto zzz_inv = zz_inv * z_inv;
-    return {p.x * zz_inv, p.y * zzz_inv};
+    z_inv *= zz_inv;            // z_inv now = zzz_inv = zz_inv * z_inv (in-place, saves 1 MEMCOPY)
+    return {p.x * zz_inv, p.y * z_inv};
 }
 
 /// Elliptic curve point addition in affine coordinates.
@@ -346,14 +346,16 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
 
     auto z1z1 = z1 * z1;
     auto z2z2 = z2 * z2;
-    const auto u1 = x1 * z2z2;
-    const auto u2 = x2 * z1z1;
+    auto u1 = x1 * z2z2;
+    auto u2 = x2 * z1z1;
     z1z1 *= z1;                 // z1z1 now = z1^3 (saves 1 MEMCOPY)
     z2z2 *= z2;                 // z2z2 now = z2^3 (saves 1 MEMCOPY)
     z2z2 *= y1;                 // z2z2 now = s1 = y1*z2^3 (saves 1 MEMCOPY)
     z1z1 *= y2;                 // z1z1 now = s2 = y2*z1^3 (saves 1 MEMCOPY)
-    auto h = u2 - u1;
-    auto r = z1z1 - z2z2;      // s2 - s1
+    u2 -= u1;                  // u2 now = h = u2 - u1 (in-place, saves 1 MEMCOPY)
+    auto& h = u2;
+    z1z1 -= z2z2;              // z1z1 now = r = s2 - s1 (in-place, saves 1 MEMCOPY)
+    auto& r = z1z1;
 
     // Handle point doubling in case p == q, i.e. when u1 == u2 and s1 == s2.
     // TODO: Untested case of two points having the same y coordinate but different x.
@@ -363,16 +365,17 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
         return dbl(p);
 
     auto hh = h * h;
-    const auto v = u1 * hh;    // compute v before hhh (hh still alive)
+    u1 *= hh;                  // u1 now = v = u1 * hh (in-place, saves 1 MEMCOPY)
+    auto& v = u1;
     hh *= h;                    // hh now = hhh = h^3 (saves 1 MEMCOPY)
     auto x3 = r * r;          // t2
     auto t3 = v;
     t3 += v;                   // t3 = 2*v    (in-place, saves 1 MEMCOPY)
     x3 -= hh;                 // t4 = t2 - hhh (in-place, saves 1 MEMCOPY)
     x3 -= t3;                 // x3 = t4 - t3  (in-place, saves 1 MEMCOPY)
-    const auto t5 = v - x3;
+    v -= x3;                   // v now = v - x3 (in-place, eliminates temporary t5)
     hh *= z2z2;                // hh now = s1*hhh = t6 (saves 1 MEMCOPY; z2z2 holds s1)
-    r *= t5;                   // r now = r*t5 = t7 (saves 1 MEMCOPY)
+    r *= v;                    // r now = r*(v-x3) = t7 (saves 1 MEMCOPY)
     r -= hh;                   // r now = y3 = t7 - t6  (in-place, saves 1 MEMCOPY)
     h *= z2;                   // h now = z2*h = t8 (saves 1 MEMCOPY)
     h *= z1;                   // h now = z3 = z1*t8 (saves 1 MEMCOPY)
@@ -402,14 +405,16 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     const auto& [x2, y2] = q;
 
     auto z1z1 = z1 * z1;
-    const auto u2 = x2 * z1z1;
+    auto u2 = x2 * z1z1;
     z1z1 *= z1;                 // z1z1 now = z1^3 (saves 1 MEMCOPY vs z1z1z1 = z1 * z1z1)
     z1z1 *= y2;                 // z1z1 now = s2 = y2 * z1^3 (saves 1 MEMCOPY vs s2 = y2 * z1z1z1)
-    auto h = u2 - x1;
+    u2 -= x1;                   // u2 now = h = u2 - x1 (in-place, saves 1 MEMCOPY)
+    auto& h = u2;
     auto t1 = h;
     t1 += h;                    // t1 = 2*h  (in-place, saves 1 MEMCOPY)
     auto i = t1 * t1;
-    const auto t2 = z1z1 - y1; // was: s2 - y1
+    z1z1 -= y1;                 // z1z1 now = t2 = s2 - y1 (in-place, saves 1 MEMCOPY)
+    auto& t2 = z1z1;
 
     // Handle point doubling in case p == q.
     // p == q (in jacobian coordinates) if and only if x1 == x2 * z1z1 and y1 = y2 * z1z1z1
@@ -418,16 +423,16 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
 
     auto r = t2;
     r += t2;                    // r = 2*t2  (in-place, saves 1 MEMCOPY)
-    const auto v = x1 * i;     // v = x1 * i (i still holds original)
+    auto v = x1 * i;           // v = x1 * i (i still holds original)
     i *= h;                     // i now = j = h * i (saves 1 MEMCOPY vs j = h * i)
     auto x3 = r * r;           // t3 = r^2
     auto t4 = v;
     t4 += v;                    // t4 = 2*v  (in-place, saves 1 MEMCOPY)
     x3 -= i;                   // t5 = t3 - j  (in-place, saves 1 MEMCOPY)
     x3 -= t4;                  // x3 = t5 - t4 (in-place, saves 1 MEMCOPY)
-    const auto t6 = v - x3;
+    v -= x3;                    // v now = v - x3 (in-place, eliminates temporary t6)
     i *= y1;                    // i now = y1 * j = t7 (saves 1 MEMCOPY vs t7 = y1 * j)
-    r *= t6;                    // r now = y3 = r * t6 (saves 1 MEMCOPY vs y3 = r * t6)
+    r *= v;                     // r now = y3 = r * (v-x3) (saves 1 MEMCOPY)
     i += i;                     // t8 = 2*t7 (in-place, saves 1 MEMCOPY)
     r -= i;                     // y3 = t9 - t8 (in-place, saves 1 MEMCOPY)
     h *= z1;                    // h now = z3 = z1 * h (saves 1 MEMCOPY vs z3 = z1 * h)
@@ -456,16 +461,17 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         yy *= x1;              // yy now = s = X*Y^2 (saves 1 MEMCOPY vs s = x1 * yy)
         yy += yy;              // s = 2*X*Y^2        (in-place, saves 1 MEMCOPY)
         yy += yy;              // S = 4*X*Y^2        (in-place, saves 1 MEMCOPY)
-        auto m = xx + xx;      // 2*X^2  (out-of-place, avoids 1 copy vs `m = xx; m += xx;`)
+        auto m = xx;            // copy X^2
+        m += xx;                // 2*X^2             (in-place, saves 1 MEMCOPY vs m = xx + xx)
         m += xx;                // M = 3*X^2         (in-place)
         auto x3 = m * m;       // M^2
         x3 -= yy;              // M^2 - S   (eliminates s2 copy: was `s2=yy; s2+=yy; x3-=s2`)
         x3 -= yy;              // X' = M^2 - 2*S    (in-place)
-        const auto t = yy - x3; // S - X'
+        yy -= x3;              // yy now = S - X'   (in-place, eliminates temporary t)
         yyyy += yyyy;           // 2*Y^4             (in-place, saves 1 MEMCOPY)
         yyyy += yyyy;           // 4*Y^4             (in-place, saves 1 MEMCOPY)
         yyyy += yyyy;           // 8*Y^4             (in-place, saves 1 MEMCOPY)
-        m *= t;                 // m now = Y' = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
+        m *= yy;                // m now = Y' = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
         m -= yyyy;             // Y' = M*(S - X') - 8*Y^4  (in-place, saves 1 MEMCOPY)
         auto z3 = y1 * z1;    // Y*Z
         z3 += z3;              // Z' = 2*Y*Z        (in-place, saves 1 MEMCOPY)

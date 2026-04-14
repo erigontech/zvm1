@@ -283,8 +283,10 @@ __attribute__((flatten))
 std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept
 {
     // Calculate y = √(x³ + 7).
-    const auto xxx = x * x * x;
-    const auto opt_y = field_sqrt(xxx + B);
+    auto xxx = x * x;          // x^2
+    xxx *= x;                   // x^3 (in-place, saves 1 MEMCOPY vs x * x * x)
+    xxx += B;                   // x^3 + B (in-place, saves 1 MEMCOPY)
+    const auto opt_y = field_sqrt(xxx);
     if (!opt_y.has_value())
         return std::nullopt;
 
