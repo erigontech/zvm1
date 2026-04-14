@@ -83,6 +83,16 @@ public:
         return wrap(Fp.mul(a.value_, b.value_));
     }
 
+    FieldElement& __attribute__((always_inline)) operator*=(const FieldElement& b) noexcept
+    {
+#if defined(AIRBENDER) && defined(__riscv)
+        Fp.mul_assign(value_, b.value_);
+#else
+        value_ = Fp.mul(value_, b.value_);
+#endif
+        return *this;
+    }
+
     friend constexpr auto __attribute__((always_inline)) operator+(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.add(a.value_, b.value_));

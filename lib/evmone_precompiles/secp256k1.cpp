@@ -795,13 +795,13 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     z = x * x;
 
     // Step 2: z = x^0x3
-    z = x * z;
+    z *= x;
 
     // Step 4: t0 = x^0xc  (2 squarings of z)
     t0 = z.square_n(2);
 
     // Step 5: t0 = x^0xf
-    t0 = z * t0;
+    t0 *= z;
 
     // Step 6: t1 = x^0x1e
     t1 = t0 * t0;
@@ -813,61 +813,61 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     t1 = t2.square_n(2);
 
     // Step 10: t1 = x^0x7f
-    t1 = z * t1;
+    t1 *= z;
 
     // Step 14: t3 = x^0x7f0  (4 squarings of t1)
     t3 = t1.square_n(4);
 
     // Step 15: t0 = x^0x7ff
-    t0 = t0 * t3;
+    t0 *= t3;
 
     // Step 26: t3 = x^0x3ff800  (11 squarings of t0)
     t3 = t0.square_n(11);
 
     // Step 27: t0 = x^0x3fffff
-    t0 = t0 * t3;
+    t0 *= t3;
 
     // Step 32: t3 = x^0x7ffffe0  (5 squarings of t0)
     t3 = t0.square_n(5);
 
     // Step 33: t2 = x^0x7ffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
     // Step 60: t3 = x^0x3ffffff8000000  (27 squarings of t2)
     t3 = t2.square_n(27);
 
     // Step 61: t2 = x^0x3fffffffffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
     // Step 115: t3 = (54 squarings of t2)
     t3 = t2.square_n(54);
 
     // Step 116: t2 = x^0xfffffffffffffffffffffffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
     // Step 224: t3 = (108 squarings of t2)
     t3 = t2.square_n(108);
 
     // Step 225: t2 = x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
     // Step 232: t2 = (7 squarings)
     t2 = t2.square_n(7);
 
     // Step 233: t1 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    t1 = t1 * t2;
+    t1 *= t2;
 
     // Step 256: t1 = (23 squarings)
     t1 = t1.square_n(23);
 
     // Step 257: t0 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
-    t0 = t0 * t1;
+    t0 *= t1;
 
     // Step 263: t0 = (6 squarings)
     t0 = t0.square_n(6);
 
     // Step 264: z = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
-    z = z * t0;
+    z *= t0;
 
     // Step 266: z = (2 squarings)
     z = z.square_n(2);
