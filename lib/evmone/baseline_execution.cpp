@@ -88,8 +88,22 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
 
     if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
     {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+        // On rv32im, int64_t arithmetic generates 5-6 instructions for subtraction + sign check.
+        // EVM gas fits in 32 bits (block gas limit ~30M << 2^31). By narrowing to int32_t
+        // for the hot subtraction, the compiler generates just addi + bltz (2 instructions).
+        // Convert back to int64_t via sign extension.
+        {
+            auto g32 = static_cast<int32_t>(gas_left);
+            g32 -= static_cast<int32_t>(gas_cost);
+            gas_left = static_cast<int64_t>(g32);
+            if (INTX_UNLIKELY(g32 < 0))
+                return EVMC_OUT_OF_GAS;
+        }
+#else
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
+#endif
     }
 
     return EVMC_SUCCESS;
