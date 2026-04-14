@@ -416,29 +416,29 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 
     if constexpr (Curve::A == 0)
     {
-        // Use the "dbl-2009-l" formula for a=0 curve in Jacobian coordinates.
-        // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#doubling-dbl-2009-l
+        // Optimized doubling for a=0 curve in Jacobian coordinates.
+        // Computes S = 4*X*Y^2 directly (1M + 2A) instead of via the dbl-2009-l
+        // squaring trick (1M + 2S + 1A), saving 2 modular subtractions per doubling.
+        // Formula: S = 4*X*Y^2, M = 3*X^2, X' = M^2 - 2S, Y' = M(S-X') - 8Y^4, Z' = 2YZ.
+        // Cost: 7M + 9A + 3S = 7M + 12(A+S) vs original 7M + 9A + 5S = 7M + 14(A+S).
 
         const auto xx = x1 * x1;
         const auto yy = y1 * y1;
         const auto yyyy = yy * yy;
-        const auto t0 = x1 + yy;
-        const auto t1 = t0 * t0;
-        const auto t2 = t1 - xx;
-        const auto t3 = t2 - yyyy;
-        const auto d = t3 + t3;
-        const auto e = xx + xx + xx;
-        const auto f = e * e;
-        const auto t4 = d + d;
-        const auto x3 = f - t4;
-        const auto t6 = d - x3;
+        const auto xyy = x1 * yy;
+        const auto xyy2 = xyy + xyy;
+        const auto s = xyy2 + xyy2;       // S = 4*X*Y^2
+        const auto m = xx + xx + xx;       // M = 3*X^2
+        const auto mm = m * m;             // M^2
+        const auto s2 = s + s;             // 2*S
+        const auto x3 = mm - s2;           // X' = M^2 - 2*S
+        const auto t = s - x3;             // S - X'
         const auto yyyy2 = yyyy + yyyy;
         const auto yyyy4 = yyyy2 + yyyy2;
         const auto yyyy8 = yyyy4 + yyyy4;
-        const auto t9 = e * t6;
-        const auto y3 = t9 - yyyy8;
-        const auto t10 = y1 * z1;
-        const auto z3 = t10 + t10;
+        const auto y3 = m * t - yyyy8;     // Y' = M*(S - X') - 8*Y^4
+        const auto yz = y1 * z1;
+        const auto z3 = yz + yz;           // Z' = 2*Y*Z
         return {x3, y3, z3};
     }
     else if constexpr (Curve::A == Curve::FIELD_PRIME - 3)
