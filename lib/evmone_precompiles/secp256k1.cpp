@@ -283,7 +283,7 @@ __attribute__((flatten))
 std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept
 {
     // Calculate y = √(x³ + 7).
-    auto xxx = x * x;          // x^2
+    auto xxx = x; xxx *= x;    // x^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
     xxx *= x;                   // x^3 (in-place, saves 1 MEMCOPY vs x * x * x)
     xxx += B;                   // x^3 + B (in-place, saves 1 MEMCOPY)
     const auto opt_y = field_sqrt(xxx);
@@ -806,7 +806,7 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
 
 
     // Step 1: z = x^0x2
-    z = x * x;
+    z = x; z *= x;                 // copy+mul_assign saves 1 MEMCOPY vs operator*
 
     // Step 2: z = x^0x3
     z *= x;
@@ -818,10 +818,10 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     t0 *= z;
 
     // Step 6: t1 = x^0x1e
-    t1 = t0 * t0;
+    t1 = t0; t1 *= t0;            // copy+mul_assign saves 1 MEMCOPY vs operator*
 
     // Step 7: t2 = x^0x1f
-    t2 = x * t1;
+    t2 = t1; t2 *= x;             // copy+mul_assign saves 1 MEMCOPY vs operator*
 
     // Step 9: t1 = x^0x7c  (2 squarings of t2)
     t1 = t2.square_n(2);
@@ -886,8 +886,11 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     // Step 266: z = (2 squarings)
     z = z.square_n(2);
 
-    if (z * z != x)
-        return std::nullopt;  // Computed value is not the square root.
+    {
+        auto zz = z; zz *= z;     // z^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
+        if (zz != x)
+            return std::nullopt;  // Computed value is not the square root.
+    }
 
     return z;
 }

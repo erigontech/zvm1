@@ -1014,27 +1014,28 @@ public:
     /// Marked noinline to prevent flatten from inlining all 54 mul calls (262KB code bloat).
     __attribute__((noinline)) UintT inv_bn254_fp(const UintT& x) const noexcept
     {
-        // Precomputation: x^2 and odd powers x^3, x^5, ..., x^31
-        UintT x2 = mul(x, x);
-        UintT x3 = mul(x, x2);
-        UintT x5 = mul(x3, x2);
-        UintT x7 = mul(x5, x2);
-        UintT x9 = mul(x7, x2);
-        UintT x11 = mul(x9, x2);
-        UintT x13 = mul(x11, x2);
-        UintT x15 = mul(x13, x2);
-        UintT x17 = mul(x15, x2);
-        UintT x19 = mul(x17, x2);
-        UintT x21 = mul(x19, x2);
-        UintT x23 = mul(x21, x2);
-        UintT x25 = mul(x23, x2);
-        UintT x27 = mul(x25, x2);
-        UintT x29 = mul(x27, x2);
-        UintT x31 = mul(x29, x2);
+        // Precomputation: x^2 and odd powers x^3..x^31
+        // copy+mul_assign saves 1 MEMCOPY vs mul per line; DECL_UNINIT_BUF avoids zero-init
+        DECL_UNINIT_BUF(UintT, x2); x2 = x; mul_assign(x2, x);
+        DECL_UNINIT_BUF(UintT, x3); x3 = x; mul_assign(x3, x2);
+        DECL_UNINIT_BUF(UintT, x5); x5 = x3; mul_assign(x5, x2);
+        DECL_UNINIT_BUF(UintT, x7); x7 = x5; mul_assign(x7, x2);
+        DECL_UNINIT_BUF(UintT, x9); x9 = x7; mul_assign(x9, x2);
+        DECL_UNINIT_BUF(UintT, x11); x11 = x9; mul_assign(x11, x2);
+        DECL_UNINIT_BUF(UintT, x13); x13 = x11; mul_assign(x13, x2);
+        DECL_UNINIT_BUF(UintT, x15); x15 = x13; mul_assign(x15, x2);
+        DECL_UNINIT_BUF(UintT, x17); x17 = x15; mul_assign(x17, x2);
+        DECL_UNINIT_BUF(UintT, x19); x19 = x17; mul_assign(x19, x2);
+        DECL_UNINIT_BUF(UintT, x21); x21 = x19; mul_assign(x21, x2);
+        DECL_UNINIT_BUF(UintT, x23); x23 = x21; mul_assign(x23, x2);
+        DECL_UNINIT_BUF(UintT, x25); x25 = x23; mul_assign(x25, x2);
+        DECL_UNINIT_BUF(UintT, x27); x27 = x25; mul_assign(x27, x2);
+        DECL_UNINIT_BUF(UintT, x29); x29 = x27; mul_assign(x29, x2);
+        DECL_UNINIT_BUF(UintT, x31); x31 = x29; mul_assign(x31, x2);
         // 16M precomputation
 
         // Sliding window chain: 252S + 38M
-        UintT r = x3;                                       // initial
+        DECL_UNINIT_BUF(UintT, r); r = x3;                  // initial
         r = square_n(r, 10); mul_assign(r, x25);   // 10S+1M
         r = square_n(r, 8); mul_assign(r, x19);    // 8S+1M
         r = square_n(r, 5); mul_assign(r, x19);    // 5S+1M
@@ -1115,7 +1116,7 @@ public:
                     DECL_UNINIT_BUF(UintT, f);
 
                     // Step 1: z = x^0x2
-                    z = mul(x, x);
+                    z = x; mul_assign(z, x);   // copy+mul_assign saves 1 MEMCOPY vs mul
                     // Step 2: z = x^0x3
                     mul_assign(z, x);
                     // Step 4: t0 = x^0xc (2 squarings of z)
@@ -1125,9 +1126,9 @@ public:
                     // Save x^15 for computing x^45 later
                     f = t0;
                     // Step 6: t1 = x^0x1e
-                    t1 = mul(t0, t0);
+                    t1 = t0; mul_assign(t1, t0);  // copy+mul_assign saves 1 MEMCOPY
                     // Step 7: t2 = x^0x1f
-                    t2 = mul(x, t1);
+                    t2 = t1; mul_assign(t2, x);   // copy+mul_assign saves 1 MEMCOPY
                     // Step 9: t1 = x^0x7c (2 squarings of t2)
                     t1 = square_n(t2, 2);
                     // Step 10: t1 = x^0x7f
@@ -1169,10 +1170,11 @@ public:
                     // Step 267: t0 = x^{2^256 - 2^32 - 2^10} (10 squarings)
                     t0 = square_n(t0, 10);
                     // x^45 = (x^15)^3 from saved f
-                    t3 = mul(f, f);   // x^30
+                    t3 = f; mul_assign(t3, f);    // x^30 (copy+mul_assign saves 1 MEMCOPY)
                     mul_assign(t3, f);  // x^45
                     // x^{p-2} = x^{2^256-2^32-979}
-                    return mul(t0, t3);
+                    mul_assign(t0, t3);           // in-place saves 1 MEMCOPY vs return mul
+                    return t0;
                 }
 
                 // secp256k1 scalar field order N
@@ -1187,48 +1189,49 @@ public:
                     // then sliding window w=5 for remaining 131 bits.
                     // Total: 251S + 46M = 297 Montgomery muls (vs generic 450).
 
-                    // Precomputation: x^2 and odd powers x^3, x^5, ..., x^31
-                    UintT x2 = mul(x, x);
-                    UintT x3 = mul(x, x2);
-                    UintT x5 = mul(x3, x2);
-                    UintT x7 = mul(x5, x2);
-                    UintT x9 = mul(x7, x2);
-                    UintT x11 = mul(x9, x2);
-                    UintT x13 = mul(x11, x2);
-                    UintT x15 = mul(x13, x2);
-                    UintT x17 = mul(x15, x2);
-                    UintT x19 = mul(x17, x2);
-                    UintT x21 = mul(x19, x2);
-                    UintT x23 = mul(x21, x2);
-                    UintT x25 = mul(x23, x2);
-                    UintT x27 = mul(x25, x2);
-                    UintT x29 = mul(x27, x2);
-                    UintT x31 = mul(x29, x2);
+                    // Precomputation: x^2 and odd powers x^3..x^31
+                    // copy+mul_assign saves 1 MEMCOPY vs mul per line; DECL_UNINIT_BUF avoids zero-init
+                    DECL_UNINIT_BUF(UintT, x2); x2 = x; mul_assign(x2, x);
+                    DECL_UNINIT_BUF(UintT, x3); x3 = x; mul_assign(x3, x2);
+                    DECL_UNINIT_BUF(UintT, x5); x5 = x3; mul_assign(x5, x2);
+                    DECL_UNINIT_BUF(UintT, x7); x7 = x5; mul_assign(x7, x2);
+                    DECL_UNINIT_BUF(UintT, x9); x9 = x7; mul_assign(x9, x2);
+                    DECL_UNINIT_BUF(UintT, x11); x11 = x9; mul_assign(x11, x2);
+                    DECL_UNINIT_BUF(UintT, x13); x13 = x11; mul_assign(x13, x2);
+                    DECL_UNINIT_BUF(UintT, x15); x15 = x13; mul_assign(x15, x2);
+                    DECL_UNINIT_BUF(UintT, x17); x17 = x15; mul_assign(x17, x2);
+                    DECL_UNINIT_BUF(UintT, x19); x19 = x17; mul_assign(x19, x2);
+                    DECL_UNINIT_BUF(UintT, x21); x21 = x19; mul_assign(x21, x2);
+                    DECL_UNINIT_BUF(UintT, x23); x23 = x21; mul_assign(x23, x2);
+                    DECL_UNINIT_BUF(UintT, x25); x25 = x23; mul_assign(x25, x2);
+                    DECL_UNINIT_BUF(UintT, x27); x27 = x25; mul_assign(x27, x2);
+                    DECL_UNINIT_BUF(UintT, x29); x29 = x27; mul_assign(x29, x2);
+                    DECL_UNINIT_BUF(UintT, x31); x31 = x29; mul_assign(x31, x2);
 
                     // Phase 1: Build x^(2^125-1) via doubling chain from x^31.
                     // x^(2^5-1) = x^31 (from precomp)
-                    UintT r = x31;
+                    DECL_UNINIT_BUF(UintT, r); r = x31;
                     DECL_UNINIT_BUF(UintT, t);  // avoid dead zero-init
                     // x^(2^10-1) = sq5(x^31) * x^31
                     t = square_n(r, 5);
                     mul_assign(t, x31);
-                    UintT x10_1 = t;
+                    DECL_UNINIT_BUF(UintT, x10_1); x10_1 = t;
                     // x^(2^20-1) = sq10(x^(2^10-1)) * x^(2^10-1)
                     t = square_n(x10_1, 10);
                     mul_assign(t, x10_1);
-                    UintT x20_1 = t;
+                    DECL_UNINIT_BUF(UintT, x20_1); x20_1 = t;
                     // x^(2^25-1) = sq5(x^(2^20-1)) * x^31
                     t = square_n(x20_1, 5);
                     mul_assign(t, x31);
-                    UintT x25_1 = t;
+                    DECL_UNINIT_BUF(UintT, x25_1); x25_1 = t;
                     // x^(2^50-1) = sq25(x^(2^25-1)) * x^(2^25-1)
                     t = square_n(x25_1, 25);
                     mul_assign(t, x25_1);
-                    UintT x50_1 = t;
+                    DECL_UNINIT_BUF(UintT, x50_1); x50_1 = t;
                     // x^(2^100-1) = sq50(x^(2^50-1)) * x^(2^50-1)
                     t = square_n(x50_1, 50);
                     mul_assign(t, x50_1);
-                    UintT x100_1 = t;
+                    DECL_UNINIT_BUF(UintT, x100_1); x100_1 = t;
                     // x^(2^125-1) = sq25(x^(2^100-1)) * x^(2^25-1)
                     t = square_n(x100_1, 25);
                     mul_assign(t, x25_1);
