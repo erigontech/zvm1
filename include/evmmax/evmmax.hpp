@@ -174,30 +174,38 @@ public:
             {
                 // Optimized from_mont: mul(x, 1) means T = x*1, so t_lo = x, t_hi = 0.
                 // Skip the two MUL CSR calls for x*y entirely.
-                // m = t_lo * N' mod 2^256 = x * N' mod 2^256
-                // result = (0 + mN_hi + carry) where carry = (x != 0)
+                // m = x * N' mod 2^256, mN_hi = upper(m * N),
+                // result = 0 + mN_hi + carry where carry = (x != 0).
                 // Then conditional subtract mod.
+                //
+                // Merged asm blocks: MUL_LOW+MUL_HIGH share x10, ADD+SUB share x10.
+                // Zero check uses short-circuit branching for early exit.
 
                 alignas(32) UintT A{};     // t_hi = 0 -> result
-                alignas(32) UintT D = x;   // m = x * N' (copy x, may be misaligned)
+                DECL_UNINIT_BUF(UintT, D); // scratch: x copy -> m -> mN_hi
+                D = x;  // word copy (cheaper than MEMCOPY CSR)
 
-                // 1. m = MUL_LOW(x, N') -> D = m (use aligned mod_inv_full_ directly)
+                // 1-2. MUL_LOW(D, mod_inv) then MUL_HIGH(D, mod) - merged (x10=pD shared)
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_inv_full_);
-                    register uint32_t a2 asm("x12") = 0x08; // MUL_LOW
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    const uintptr_t pD = reinterpret_cast<uintptr_t>(&D);
+                    const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
+                    const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+                    asm volatile(
+                        "mv x10, %[pD]\n\t"
+                        "mv x11, %[pModInv]\n\t"
+                        "li x12, 0x08\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        // x10 still pD
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x10\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        :
+                        : [pD] "r"(pD), [pModInv] "r"(pModInv), [pMod] "r"(pMod)
+                        : "x10", "x11", "x12", "memory"
+                    );
                 }
 
-                // 2. mN_hi = MUL_HIGH(m, N) -> D = mN_hi (use aligned mod_ directly)
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&D);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x10; // MUL_HIGH
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-
-                // 3. carry = (x != 0) since t_lo = x and t_lo + mN_lo = 0 or 2^256
+                // 3. carry = (x != 0) - short-circuit branching
                 uint32_t low_carry;
                 {
                     const auto* xw = reinterpret_cast<const uint32_t*>(&x);
@@ -212,41 +220,39 @@ public:
                     low_carry = (w != 0) ? 1u : 0u;
                 }
 
-                // 4. result = 0 + mN_hi + carry -> A += D
-                uint32_t carry;
+                // 4-6. ADD(A, D+carry) + SUB(A, mod) + conditional ADD - merged
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&D);
-                    register uint32_t a2 asm("x12") = 0x01 | (low_carry << 6);
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    carry = a2;
-                }
+                    const uintptr_t pA = reinterpret_cast<uintptr_t>(&A);
+                    const uintptr_t pD = reinterpret_cast<uintptr_t>(&D);
+                    const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+                    uint32_t tmp;
+                    asm volatile(
+                        // ADD(A, D + carry)
+                        "mv x10, %[pA]\n\t"
+                        "mv x11, %[pD]\n\t"
+                        "slli x12, %[carry], 6\n\t"
+                        "ori x12, x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "mv %[tmp], x12\n\t"  // tmp = carry out
 
-                // 5. Conditional subtract mod (use aligned mod_ directly)
-                if (carry)
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x02;
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-                else
-                {
-                    uint32_t borrow;
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                        register uint32_t a2 asm("x12") = 0x02;
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                        borrow = a2;
-                    }
-                    if (borrow)
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                        register uint32_t a2 asm("x12") = 0x01;
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    }
+                        // SUB(A, mod) - x10=pA stays
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x02\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        // Conditional ADD back if carry==0 && borrow!=0
+                        // x10=pA, x11=pMod still valid
+                        "bnez %[tmp], 2f\n\t"
+                        "beqz x12, 2f\n\t"
+                        "li x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "2:\n\t"
+
+                        : [tmp] "=&r"(tmp)
+                        : [pA] "r"(pA), [pD] "r"(pD), [pMod] "r"(pMod),
+                          [carry] "r"(low_carry)
+                        : "x10", "x11", "x12", "memory"
+                    );
                 }
 
                 return A;
