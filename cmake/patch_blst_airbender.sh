@@ -444,6 +444,114 @@ FROM_MONT_IMPL(384)
 src = src.replace(old_from, new_from, 1)
 print("Patched FROM_MONT_IMPL(384)")
 
+# Patch mul_mont_384x: redirect mul_mont_n(... NLIMBS(384)) -> mul_mont_384
+# The generic mul_mont_n is O(n^2) scalar CIOS; mul_mont_384 uses BigInt CSR.
+old_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
+                          const vec384 p, limb_t n0)
+{
+    vec384 aa, bb, cc;
+
+    add_mod_n(aa, a[0], a[1], p, NLIMBS(384));
+    add_mod_n(bb, b[0], b[1], p, NLIMBS(384));
+    mul_mont_n(bb, bb, aa, p, n0, NLIMBS(384));
+    mul_mont_n(aa, a[0], b[0], p, n0, NLIMBS(384));
+    mul_mont_n(cc, a[1], b[1], p, n0, NLIMBS(384));
+    sub_mod_n(ret[0], aa, cc, p, NLIMBS(384));
+    sub_mod_n(ret[1], bb, aa, p, NLIMBS(384));
+    sub_mod_n(ret[1], ret[1], cc, p, NLIMBS(384));
+}"""
+new_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
+                          const vec384 p, limb_t n0)
+{
+    vec384 aa, bb, cc;
+
+    add_mod_n(aa, a[0], a[1], p, NLIMBS(384));
+    add_mod_n(bb, b[0], b[1], p, NLIMBS(384));
+#ifdef AIRBENDER_BIGINT_CSR
+    mul_mont_384(bb, bb, aa, p, n0);
+    mul_mont_384(aa, a[0], b[0], p, n0);
+    mul_mont_384(cc, a[1], b[1], p, n0);
+#else
+    mul_mont_n(bb, bb, aa, p, n0, NLIMBS(384));
+    mul_mont_n(aa, a[0], b[0], p, n0, NLIMBS(384));
+    mul_mont_n(cc, a[1], b[1], p, n0, NLIMBS(384));
+#endif
+    sub_mod_n(ret[0], aa, cc, p, NLIMBS(384));
+    sub_mod_n(ret[1], bb, aa, p, NLIMBS(384));
+    sub_mod_n(ret[1], ret[1], cc, p, NLIMBS(384));
+}"""
+src = src.replace(old_mul384x, new_mul384x, 1)
+print("Patched mul_mont_384x -> mul_mont_384")
+
+# Patch sqr_n_mul_mont_383: redirect mul_mont_nonred_n/mul_mont_n -> mul_mont_384
+old_sqr_n_mul = """void sqr_n_mul_mont_383(vec384 ret, const vec384 a, size_t count,
+                        const vec384 p, limb_t n0, const vec384 b)
+{
+    __builtin_assume(count != 0);
+    while(count--) {
+        mul_mont_nonred_n(ret, a, a, p, n0, NLIMBS(384));
+        a = ret;
+    }
+    mul_mont_n(ret, ret, b, p, n0, NLIMBS(384));
+}"""
+new_sqr_n_mul = """void sqr_n_mul_mont_383(vec384 ret, const vec384 a, size_t count,
+                        const vec384 p, limb_t n0, const vec384 b)
+{
+#ifdef AIRBENDER_BIGINT_CSR
+    __builtin_assume(count != 0);
+    while(count--) {
+        mul_mont_384(ret, a, a, p, n0);
+        a = ret;
+    }
+    mul_mont_384(ret, ret, b, p, n0);
+#else
+    __builtin_assume(count != 0);
+    while(count--) {
+        mul_mont_nonred_n(ret, a, a, p, n0, NLIMBS(384));
+        a = ret;
+    }
+    mul_mont_n(ret, ret, b, p, n0, NLIMBS(384));
+#endif
+}"""
+src = src.replace(old_sqr_n_mul, new_sqr_n_mul, 1)
+print("Patched sqr_n_mul_mont_383 -> mul_mont_384")
+
+# Patch sqr_mont_382x: redirect mul_mont_nonred_n -> mul_mont_384
+old_sqr_382x = """    /* "mul_mont_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));" */
+    mul_mont_nonred_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));
+
+    /* "add_mod_n(ret[1], ret[1], ret[1], p, NLIMBS(384));" */
+    for (carry=0, i=0; i<NLIMBS(384); i++) {
+        limb_t a_i = ret[1][i];
+        ret[1][i] = a_i<<1 | carry;
+        carry = a_i>>(LIMB_T_BITS-1);
+    }
+
+    /* "mul_mont_n(ret[0], t0, t1, p, n0, NLIMBS(384));" */
+    mul_mont_nonred_n(ret[0], t0, t1, p, n0, NLIMBS(384));"""
+new_sqr_382x = """    /* "mul_mont_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));" */
+#ifdef AIRBENDER_BIGINT_CSR
+    mul_mont_384(ret[1], a[0], a[1], p, n0);
+#else
+    mul_mont_nonred_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));
+#endif
+
+    /* "add_mod_n(ret[1], ret[1], ret[1], p, NLIMBS(384));" */
+    for (carry=0, i=0; i<NLIMBS(384); i++) {
+        limb_t a_i = ret[1][i];
+        ret[1][i] = a_i<<1 | carry;
+        carry = a_i>>(LIMB_T_BITS-1);
+    }
+
+    /* "mul_mont_n(ret[0], t0, t1, p, n0, NLIMBS(384));" */
+#ifdef AIRBENDER_BIGINT_CSR
+    mul_mont_384(ret[0], t0, t1, p, n0);
+#else
+    mul_mont_nonred_n(ret[0], t0, t1, p, n0, NLIMBS(384));
+#endif"""
+src = src.replace(old_sqr_382x, new_sqr_382x, 1)
+print("Patched sqr_mont_382x -> mul_mont_384")
+
 with open(path, 'w') as f:
     f.write(src)
 
