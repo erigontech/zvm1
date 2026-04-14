@@ -90,7 +90,21 @@ public:
 
     FieldElement& __attribute__((always_inline)) operator+=(const FieldElement& b) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        Fp.add_assign(value_, b.value_);
+#else
         value_ = Fp.add(value_, b.value_);
+#endif
+        return *this;
+    }
+
+    FieldElement& __attribute__((always_inline)) operator-=(const FieldElement& b) noexcept
+    {
+#if defined(AIRBENDER) && defined(__riscv)
+        Fp.sub_assign(value_, b.value_);
+#else
+        value_ = Fp.sub(value_, b.value_);
+#endif
         return *this;
     }
 
@@ -341,14 +355,15 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
     const auto hh = h * h;
     const auto hhh = h * hh;
     const auto v = u1 * hh;
-    const auto t2 = r * r;
-    const auto t3 = v + v;
-    const auto t4 = t2 - hhh;
-    const auto x3 = t4 - t3;
+    auto x3 = r * r;          // t2
+    auto t3 = v;
+    t3 += v;                   // t3 = 2*v    (in-place, saves 1 MEMCOPY)
+    x3 -= hhh;                // t4 = t2 - hhh (in-place, saves 1 MEMCOPY)
+    x3 -= t3;                 // x3 = t4 - t3  (in-place, saves 1 MEMCOPY)
     const auto t5 = v - x3;
     const auto t6 = s1 * hhh;
-    const auto t7 = r * t5;
-    const auto y3 = t7 - t6;
+    auto y3 = r * t5;         // t7
+    y3 -= t6;                 // y3 = t7 - t6  (in-place, saves 1 MEMCOPY)
     const auto t8 = z2 * h;
     const auto z3 = z1 * t8;
 
@@ -381,7 +396,8 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     const auto z1z1z1 = z1 * z1z1;
     const auto s2 = y2 * z1z1z1;
     const auto h = u2 - x1;
-    const auto t1 = h + h;
+    auto t1 = h;
+    t1 += h;                    // t1 = 2*h  (in-place, saves 1 MEMCOPY)
     const auto i = t1 * t1;
     const auto j = h * i;
     const auto t2 = s2 - y1;
@@ -391,19 +407,21 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     if (h == 0 && t2 == 0) [[unlikely]]
         return dbl(p);
 
-    const auto r = t2 + t2;
+    auto r = t2;
+    r += t2;                    // r = 2*t2  (in-place, saves 1 MEMCOPY)
     const auto v = x1 * i;
-    const auto t3 = r * r;
-    const auto t4 = v + v;
-    const auto t5 = t3 - j;
-    const auto x3 = t5 - t4;
+    auto x3 = r * r;           // t3 = r^2
+    auto t4 = v;
+    t4 += v;                    // t4 = 2*v  (in-place, saves 1 MEMCOPY)
+    x3 -= j;                   // t5 = t3 - j  (in-place, saves 1 MEMCOPY)
+    x3 -= t4;                  // x3 = t5 - t4 (in-place, saves 1 MEMCOPY)
     const auto t6 = v - x3;
-    const auto t7 = y1 * j;
-    const auto t8 = t7 + t7;
-    const auto t9 = r * t6;
-    const auto y3 = t9 - t8;
-    const auto t10 = z1 * h;
-    const auto z3 = t10 + t10;
+    auto t7 = y1 * j;
+    auto y3 = r * t6;          // t9
+    t7 += t7;                   // t8 = 2*t7 (in-place, saves 1 MEMCOPY)
+    y3 -= t7;                  // y3 = t9 - t8 (in-place, saves 1 MEMCOPY)
+    auto z3 = z1 * h;          // t10
+    z3 += z3;                  // z3 = 2*t10 (in-place, saves 1 MEMCOPY)
 
     return {x3, y3, z3};
 }
@@ -424,21 +442,25 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 
         const auto xx = x1 * x1;
         const auto yy = y1 * y1;
-        const auto yyyy = yy * yy;
-        const auto xyy = x1 * yy;
-        const auto xyy2 = xyy + xyy;
-        const auto s = xyy2 + xyy2;       // S = 4*X*Y^2
-        const auto m = xx + xx + xx;       // M = 3*X^2
-        const auto mm = m * m;             // M^2
-        const auto s2 = s + s;             // 2*S
-        const auto x3 = mm - s2;           // X' = M^2 - 2*S
-        const auto t = s - x3;             // S - X'
-        const auto yyyy2 = yyyy + yyyy;
-        const auto yyyy4 = yyyy2 + yyyy2;
-        const auto yyyy8 = yyyy4 + yyyy4;
-        const auto y3 = m * t - yyyy8;     // Y' = M*(S - X') - 8*Y^4
-        const auto yz = y1 * z1;
-        const auto z3 = yz + yz;           // Z' = 2*Y*Z
+        auto yyyy = yy * yy;
+        auto s = x1 * yy;      // xyy
+        s += s;                 // xyy2 = 2*X*Y^2  (in-place, saves 1 MEMCOPY)
+        s += s;                 // S = 4*X*Y^2      (in-place, saves 1 MEMCOPY)
+        auto m = xx;
+        m += xx;                // 2*X^2             (in-place, saves 1 MEMCOPY)
+        m += xx;                // M = 3*X^2         (in-place, saves 1 MEMCOPY)
+        auto x3 = m * m;       // M^2
+        auto s2 = s;
+        s2 += s;                // 2*S               (in-place, saves 1 MEMCOPY)
+        x3 -= s2;              // X' = M^2 - 2*S    (in-place, saves 1 MEMCOPY)
+        const auto t = s - x3; // S - X'
+        yyyy += yyyy;           // 2*Y^4             (in-place, saves 1 MEMCOPY)
+        yyyy += yyyy;           // 4*Y^4             (in-place, saves 1 MEMCOPY)
+        yyyy += yyyy;           // 8*Y^4             (in-place, saves 1 MEMCOPY)
+        auto y3 = m * t;
+        y3 -= yyyy;            // Y' = M*(S - X') - 8*Y^4  (in-place, saves 1 MEMCOPY)
+        auto z3 = y1 * z1;    // Y*Z
+        z3 += z3;              // Z' = 2*Y*Z        (in-place, saves 1 MEMCOPY)
         return {x3, y3, z3};
     }
     else if constexpr (Curve::A == Curve::FIELD_PRIME - 3)
@@ -448,27 +470,30 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 
         const auto zz = z1 * z1;
         const auto yy = y1 * y1;
-        const auto xyy = x1 * yy;
+        auto xyy = x1 * yy;
         const auto t0 = x1 - zz;
         const auto t1 = x1 + zz;
         const auto t2 = t0 * t1;
-        const auto alpha = t2 + t2 + t2;
-        const auto t3 = alpha * alpha;
-        const auto xyy2 = xyy + xyy;
-        const auto xyy4 = xyy2 + xyy2;
-        const auto xyy8 = xyy4 + xyy4;
-        const auto x3 = t3 - xyy8;
+        auto alpha = t2;
+        alpha += t2;               // 2*t2     (in-place)
+        alpha += t2;               // alpha = 3*t2 (in-place)
+        auto x3 = alpha * alpha;   // t3
+        xyy += xyy;               // xyy2     (in-place)
+        xyy += xyy;               // xyy4     (in-place)
+        auto xyy4_save = xyy;     // save for t9
+        xyy += xyy;               // xyy8     (in-place)
+        x3 -= xyy;               // x3 = t3 - xyy8 (in-place)
         const auto t5 = y1 + z1;
-        const auto t6 = t5 * t5;
-        const auto t7 = t6 - yy;
-        const auto z3 = t7 - zz;
-        const auto t9 = xyy4 - x3;
-        const auto yyyy = yy * yy;
-        const auto yyyy2 = yyyy + yyyy;
-        const auto yyyy4 = yyyy2 + yyyy2;
-        const auto yyyy8 = yyyy4 + yyyy4;
-        const auto t12 = alpha * t9;
-        const auto y3 = t12 - yyyy8;
+        auto z3 = t5 * t5;       // t6
+        z3 -= yy;                // t7       (in-place)
+        z3 -= zz;                // z3       (in-place)
+        xyy4_save -= x3;         // t9 = xyy4 - x3 (in-place)
+        auto yyyy = yy * yy;
+        yyyy += yyyy;             // yyyy2    (in-place)
+        yyyy += yyyy;             // yyyy4    (in-place)
+        yyyy += yyyy;             // yyyy8    (in-place)
+        auto y3 = alpha * xyy4_save; // t12
+        y3 -= yyyy;              // y3       (in-place)
         return {x3, y3, z3};
     }
     else

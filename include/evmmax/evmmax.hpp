@@ -797,6 +797,88 @@ public:
         return (d.carry) ? s : d.value;
     }
 
+#if defined(AIRBENDER) && defined(__riscv)
+    /// In-place modular addition: x += y (mod p).
+    /// Requires x to be 32-byte aligned (FieldElement::value_ always is).
+    /// Saves one MEMCOPY CSR call vs the out-of-place add().
+    void __attribute__((always_inline)) add_assign(UintT& x, const UintT& y) const noexcept
+        requires(UintT::num_bits == 256)
+    {
+        // Resolve y pointer: must differ from &x (CSR requires x10 != x11).
+        // Also must be 32-byte aligned. Copy to buffer if same address or unaligned.
+        DECL_UNINIT_BUF(UintT, yy_buf);
+        const bool y_needs_copy = (&x == &y) ||
+            (reinterpret_cast<uintptr_t>(&y) % 32 != 0);
+        if (y_needs_copy) yy_buf = y;
+        const uintptr_t y_ptr = y_needs_copy
+            ? reinterpret_cast<uintptr_t>(&yy_buf)
+            : reinterpret_cast<uintptr_t>(&y);
+        uint32_t add_carry;
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+            register uintptr_t a1 asm("x11") = y_ptr;
+            register uint32_t a2 asm("x12") = 0x01; // ADD
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+            add_carry = a2;
+        }
+        if (add_carry)
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+            register uint32_t a2 asm("x12") = 0x02; // SUB
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+        else
+        {
+            uint32_t borrow;
+            {
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                register uint32_t a2 asm("x12") = 0x02; // SUB
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                borrow = a2;
+            }
+            if (borrow)
+            {
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                register uint32_t a2 asm("x12") = 0x01; // ADD
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+            }
+        }
+    }
+
+    /// In-place modular subtraction: x -= y (mod p).
+    /// Requires x to be 32-byte aligned.
+    void __attribute__((always_inline)) sub_assign(UintT& x, const UintT& y) const noexcept
+        requires(UintT::num_bits == 256)
+    {
+        // Resolve y pointer: must differ from &x (CSR requires x10 != x11).
+        DECL_UNINIT_BUF(UintT, yy_buf);
+        const bool y_needs_copy = (&x == &y) ||
+            (reinterpret_cast<uintptr_t>(&y) % 32 != 0);
+        if (y_needs_copy) yy_buf = y;
+        const uintptr_t y_ptr = y_needs_copy
+            ? reinterpret_cast<uintptr_t>(&yy_buf)
+            : reinterpret_cast<uintptr_t>(&y);
+        uint32_t borrow;
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+            register uintptr_t a1 asm("x11") = y_ptr;
+            register uint32_t a2 asm("x12") = 0x02; // SUB
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+            borrow = a2;
+        }
+        if (borrow)
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+            register uint32_t a2 asm("x12") = 0x01; // ADD
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+    }
+#endif
+
     /// Optimized BN254 Fp Fermat inversion: x^(p-2) mod p.
     /// p-2 = 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45
     /// Uses sliding window w=5: 252S + 54M = 306 Montgomery muls (vs generic 362).
