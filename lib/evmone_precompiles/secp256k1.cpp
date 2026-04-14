@@ -102,6 +102,9 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
     // P_a+P_b and P_a-P_b in Jacobian (no inversions needed).
     const auto P_sum = ecc::add(ecc::ProjPoint<Curve>(P_a), P_b);     // P_a + P_b
     const auto P_diff = ecc::add(ecc::ProjPoint<Curve>(P_a), neg_P_b);   // P_a - P_b
+    // Precompute negations to avoid constructing temporaries in the hot loop.
+    const auto neg_P_sum = -P_sum;
+    const auto neg_P_diff = -P_diff;
 
     // 3. Signs for G/phi(G) table lookups -- negation applied per-lookup
     const bool g_neg = sk1a.sign;
@@ -206,16 +209,18 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
 
     ecc::ProjPoint<Curve> result;
 
-    // Determine the effective bit width including NAF extension
+    // Determine the effective bit width including NAF extension.
+    // Start from effective_bw (not aligned_bw) to skip wasted identity doublings.
+    // The G-window lookups still fire at the right positions: (i-1) % 8 == 0.
     const auto effective_bw = std::max(static_cast<unsigned>(bw), naf_len);
-    const auto aligned_bw = ((effective_bw + G_WINDOW - 1) / G_WINDOW) * G_WINDOW;
 
-    for (auto i = aligned_bw; i != 0; --i)
+    for (auto i = effective_bw; i != 0; --i)
     {
         result = ecc::dbl(result);
 
-        // R-component: NAF-based Shamir with signed digits
-        if (i <= effective_bw && (i - 1) < naf_len)
+        // R-component: NAF-based Shamir with signed digits.
+        // Note: (i-1) < naf_len implies i <= naf_len <= effective_bw.
+        if ((i - 1) < naf_len)
         {
             const auto idx = r_naf_idx[i - 1];
             // idx encodes (da+1)*3 + (db+1); 4 = (0,0) = no-op
@@ -229,19 +234,18 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
             case 5: result = ecc::add(result, P_b); break;       // (0,1): +P_b
             case 3: result = ecc::add(result, neg_P_b); break;   // (0,-1): -P_b
             case 8: result = ecc::add(result, P_sum); break;     // (1,1): +P_sum (Jac+Jac)
-            case 0: result = ecc::add(result, -P_sum); break;    // (-1,-1): -P_sum
+            case 0: result = ecc::add(result, neg_P_sum); break;   // (-1,-1): -P_sum
             case 6: result = ecc::add(result, P_diff); break;    // (1,-1): +P_diff (Jac+Jac)
-            case 2: result = ecc::add(result, -P_diff); break;   // (-1,1): -P_diff
+            case 2: result = ecc::add(result, neg_P_diff); break; // (-1,1): -P_diff
             }
         }
 
-        // G-component: window-8 lookup (every 8th bit)
-        if (((i - 1) % G_WINDOW) == 0)
+        // G-component: window-8 lookup (every 8th bit, for 128-bit scalars = 16 windows).
+        if (((i - 1) & (G_WINDOW - 1)) == 0 && i <= 128)
         {
-            const auto win_idx = (i - 1) / G_WINDOW;
+            const auto win_idx = (i - 1) >> 3;  // (i - 1) / 8
 
             // u1a window -> G_TABLE
-            if (win_idx < 16)
             {
                 const auto u1a_win = static_cast<unsigned>(g_wins[win_idx]);
                 if (u1a_win != 0)
@@ -255,7 +259,6 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
             }
 
             // u1b window -> PHI_G_TABLE
-            if (win_idx < 16)
             {
                 const auto u1b_win = static_cast<unsigned>(g_wins[win_idx + 16]);
                 if (u1b_win != 0)
