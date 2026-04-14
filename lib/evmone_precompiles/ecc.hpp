@@ -456,13 +456,11 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         yy *= x1;              // yy now = s = X*Y^2 (saves 1 MEMCOPY vs s = x1 * yy)
         yy += yy;              // s = 2*X*Y^2        (in-place, saves 1 MEMCOPY)
         yy += yy;              // S = 4*X*Y^2        (in-place, saves 1 MEMCOPY)
-        auto m = xx;
-        m += xx;                // 2*X^2             (in-place, saves 1 MEMCOPY)
-        m += xx;                // M = 3*X^2         (in-place, saves 1 MEMCOPY)
+        auto m = xx + xx;      // 2*X^2  (out-of-place, avoids 1 copy vs `m = xx; m += xx;`)
+        m += xx;                // M = 3*X^2         (in-place)
         auto x3 = m * m;       // M^2
-        auto s2 = yy;
-        s2 += yy;              // 2*S               (in-place, saves 1 MEMCOPY)
-        x3 -= s2;              // X' = M^2 - 2*S    (in-place, saves 1 MEMCOPY)
+        x3 -= yy;              // M^2 - S   (eliminates s2 copy: was `s2=yy; s2+=yy; x3-=s2`)
+        x3 -= yy;              // X' = M^2 - 2*S    (in-place)
         const auto t = yy - x3; // S - X'
         yyyy += yyyy;           // 2*Y^4             (in-place, saves 1 MEMCOPY)
         yyyy += yyyy;           // 4*Y^4             (in-place, saves 1 MEMCOPY)
