@@ -296,6 +296,28 @@ public:
         const auto bit = (byte >> bit_index) & 1;
         return bit != 0;
     }
+
+    /// Returns a 4-bit window value at the given bit position.
+    /// The position is the bit index of the lowest bit in the window (0-based from LSB).
+    /// E.g., window4(0) returns bits [3:0], window4(4) returns bits [7:4].
+    /// For the topmost window, missing high bits are implicitly zero.
+    unsigned window4(size_t low_bit) const noexcept
+    {
+        unsigned w = 0;
+        for (unsigned b = 0; b < 4; ++b)
+        {
+            const auto bit_pos = low_bit + b;
+            if (bit_pos < bit_width_)
+            {
+                const auto exp_size = (bit_width_ + 7) / 8;
+                const auto byte_index = bit_pos / 8;
+                const auto byte = data_[exp_size - 1 - byte_index];
+                const auto bit_index = bit_pos % 8;
+                w |= ((byte >> bit_index) & 1) << b;
+            }
+        }
+        return w;
+    }
 };
 
 /// Performs the Almost Montgomery Multiplication (AMM).
@@ -366,28 +388,104 @@ void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Expo
 
     // Compute base_mont = (base * R) % mod, where R = 2^(n*64).
     // The numerator u = base << (n*64): base in the upper words, lower n words are zero.
-    const auto tmp_storage = std::make_unique_for_overwrite<uint64_t[]>(n + base.size() + n + n);
+    const auto ebw = exp.bit_width();
+
+    if (ebw <= 32)
+    {
+        // Small exponent: binary square-and-multiply (precompute overhead not worth it).
+        const auto tmp_storage =
+            std::make_unique_for_overwrite<uint64_t[]>(n + base.size() + n + n);
+        const auto u = std::span{tmp_storage.get(), n + base.size()};
+        const auto base_mont = std::span{tmp_storage.get() + n + base.size(), n};
+        const auto t = std::span{tmp_storage.get() + n + base.size() + n, n};
+
+        std::ranges::fill(u.first(n), uint64_t{0});
+        std::ranges::copy(base, u.subspan(n).begin());
+        rem(base_mont, u, mod);
+
+        const auto r = u.subspan(0, n);
+
+        std::ranges::copy(base_mont, r.begin());
+        for (auto i = ebw - 1; i != 0; --i)
+        {
+            mul_amm(r, r, mod, mod_inv, t);
+            if (exp[i - 1])
+                mul_amm(r, base_mont, mod, mod_inv, t);
+        }
+
+        // Convert from Montgomery form.
+        std::ranges::fill(base_mont, uint64_t{0});
+        base_mont[0] = 1;
+        mul_amm(r, base_mont, mod, mod_inv, t);
+
+        if (!less(r, mod))
+            sub(r, mod);
+        assert(less(r, mod));
+
+        const auto [_, out] = std::ranges::copy(r, result.begin());
+        std::fill(out, result.end(), uint64_t{0});
+        return;
+    }
+
+    // Window-4 exponentiation for larger exponents.
+    // Precompute table[i] = base^(i+1) in Montgomery form, i = 0..14.
+    const auto tmp_storage =
+        std::make_unique_for_overwrite<uint64_t[]>(n + base.size() + n + n + 15 * n);
     const auto u = std::span{tmp_storage.get(), n + base.size()};
     const auto base_mont = std::span{tmp_storage.get() + n + base.size(), n};
     const auto t = std::span{tmp_storage.get() + n + base.size() + n, n};
+    const auto table_storage = std::span{tmp_storage.get() + n + base.size() + n + n, 15 * n};
 
-    std::ranges::fill(u.first(n), uint64_t{0});  // Lower n words of u must be zero.
+    std::ranges::fill(u.first(n), uint64_t{0});
     std::ranges::copy(base, u.subspan(n).begin());
     rem(base_mont, u, mod);
 
-    // Reuse the lower n words of u as the result buffer r.
-    const auto r = u.subspan(0, n);
-
-    std::ranges::copy(base_mont, r.begin());
-    for (auto i = exp.bit_width() - 1; i != 0; --i)
+    // Build precomputation table.
+    auto table_entry = [&](size_t i) { return table_storage.subspan(i * n, n); };
+    std::ranges::copy(base_mont, table_entry(0).begin());
+    for (int i = 1; i < 15; ++i)
     {
-        mul_amm(r, r, mod, mod_inv, t);
-        if (exp[i - 1])
-            mul_amm(r, base_mont, mod, mod_inv, t);
+        std::ranges::copy(table_entry(i - 1), table_entry(i).begin());
+        mul_amm(table_entry(i), base_mont, mod, mod_inv, t);
     }
 
-    // Convert the result from Montgomery form by multiplying with 1.
-    // Reuse base_mont as ONE (it is no longer needed after the loop).
+    // Process exponent 4 bits at a time, MSB to LSB.
+    const auto r = u.subspan(0, n);
+
+    // Compute 1 in Montgomery form: R % mod. We need (1 * R) % mod.
+    // u = 1 << (n*64): upper word is 1, lower n words are zero.
+    std::ranges::fill(u, uint64_t{0});
+    // u has n + base.size() words. Set word at index n to 1 (that's 1 << n*64).
+    if (n < u.size())
+        u[n] = 1;
+    // r = u.subspan(0, n), so we need a separate buffer for the "one_mont" computation.
+    // Actually, let's just use the first window to initialize r.
+    const auto padded_bw = (ebw + 3) & ~size_t{3};
+
+    // Initialize result to 1 in Montgomery form.
+    // To get R % mod, compute (1 << n*64) % mod. Reuse u for this.
+    {
+        const auto one_storage = std::make_unique_for_overwrite<uint64_t[]>(n + 1);
+        const auto one_u = std::span{one_storage.get(), n + 1};
+        std::ranges::fill(one_u, uint64_t{0});
+        one_u[n] = 1;  // one_u = 2^(n*64)
+        rem(r, one_u, mod);  // r = R % mod = 1 in Montgomery form
+    }
+
+    for (auto pos = padded_bw; pos != 0; pos -= 4)
+    {
+        // 4 squarings.
+        mul_amm(r, r, mod, mod_inv, t);
+        mul_amm(r, r, mod, mod_inv, t);
+        mul_amm(r, r, mod, mod_inv, t);
+        mul_amm(r, r, mod, mod_inv, t);
+
+        const auto w = exp.window4(pos - 4);
+        if (w != 0)
+            mul_amm(r, table_entry(w - 1), mod, mod_inv, t);
+    }
+
+    // Convert from Montgomery form.
     std::ranges::fill(base_mont, uint64_t{0});
     base_mont[0] = 1;
     mul_amm(r, base_mont, mod, mod_inv, t);
@@ -612,15 +710,50 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
         {
             const auto base = load_u256(base_bytes);
             const evmmax::ModArith<uint256> arith(mod);
-            auto r = arith.to_mont(base);
-            const auto base_mont = r;
-            for (auto i = exp.bit_width() - 1; i != 0; --i)
+            const auto base_mont = arith.to_mont(base);
+
+            uint256 result;
+            const auto ebw = exp.bit_width();
+
+            if (ebw <= 32)
             {
-                r = arith.mul(r, r);
-                if (exp[i - 1])
-                    r = arith.mul(r, base_mont);
+                // Small exponent: binary square-and-multiply (precompute overhead not worth it).
+                auto r = base_mont;
+                for (auto i = ebw - 1; i != 0; --i)
+                {
+                    r = arith.mul(r, r);
+                    if (exp[i - 1])
+                        r = arith.mul(r, base_mont);
+                }
+                result = arith.from_mont(r);
             }
-            const auto result = arith.from_mont(r);
+            else
+            {
+                // Window-4 exponentiation: precompute table[i] = base^(i+1) in Montgomery form.
+                uint256 table[15];
+                table[0] = base_mont;
+                for (int i = 1; i < 15; ++i)
+                    table[i] = arith.mul(table[i - 1], base_mont);
+
+                // Round bit_width up to a multiple of 4 for uniform window processing.
+                const auto padded_bw = (ebw + 3) & ~size_t{3};
+
+                // Process exponent 4 bits at a time, MSB to LSB.
+                auto r = arith.to_mont(uint256{1});
+                for (auto pos = padded_bw; pos != 0; pos -= 4)
+                {
+                    // 4 squarings.
+                    r = arith.mul(r, r);
+                    r = arith.mul(r, r);
+                    r = arith.mul(r, r);
+                    r = arith.mul(r, r);
+
+                    const auto w = exp.window4(pos - 4);
+                    if (w != 0)
+                        r = arith.mul(r, table[w - 1]);
+                }
+                result = arith.from_mont(r);
+            }
             uint8_t tmp[32];
             intx::be::store(tmp, result);
             const auto offset = 32 - mod_bytes.size();
