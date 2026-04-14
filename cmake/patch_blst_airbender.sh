@@ -465,23 +465,79 @@ new_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x 
 {
     vec384 aa, bb, cc;
 
-    add_mod_n(aa, a[0], a[1], p, NLIMBS(384));
-    add_mod_n(bb, b[0], b[1], p, NLIMBS(384));
 #ifdef AIRBENDER_BIGINT_CSR
+    add_mod_384(aa, a[0], a[1], p);
+    add_mod_384(bb, b[0], b[1], p);
     mul_mont_384(bb, bb, aa, p, n0);
     mul_mont_384(aa, a[0], b[0], p, n0);
     mul_mont_384(cc, a[1], b[1], p, n0);
+    sub_mod_384(ret[0], aa, cc, p);
+    sub_mod_384(ret[1], bb, aa, p);
+    sub_mod_384(ret[1], ret[1], cc, p);
 #else
+    add_mod_n(aa, a[0], a[1], p, NLIMBS(384));
+    add_mod_n(bb, b[0], b[1], p, NLIMBS(384));
     mul_mont_n(bb, bb, aa, p, n0, NLIMBS(384));
     mul_mont_n(aa, a[0], b[0], p, n0, NLIMBS(384));
     mul_mont_n(cc, a[1], b[1], p, n0, NLIMBS(384));
-#endif
     sub_mod_n(ret[0], aa, cc, p, NLIMBS(384));
     sub_mod_n(ret[1], bb, aa, p, NLIMBS(384));
     sub_mod_n(ret[1], ret[1], cc, p, NLIMBS(384));
+#endif
 }"""
 src = src.replace(old_mul384x, new_mul384x, 1)
-print("Patched mul_mont_384x -> mul_mont_384")
+print("Patched mul_mont_384x -> mul_mont_384 + add/sub_mod_384")
+
+# Patch sgn0_pty_mont_384: redirect from_mont_n -> from_mont_384
+old_sgn0_384 = """inline limb_t sgn0_pty_mont_384(const vec384 a, const vec384 p, limb_t n0)
+{
+    vec384 tmp;
+
+    from_mont_n(tmp, a, p, n0, NLIMBS(384));
+
+    return sgn0_pty_mod_n(tmp, p, NLIMBS(384));
+}"""
+new_sgn0_384 = """inline limb_t sgn0_pty_mont_384(const vec384 a, const vec384 p, limb_t n0)
+{
+    vec384 tmp;
+
+#ifdef AIRBENDER_BIGINT_CSR
+    from_mont_384(tmp, a, p, n0);
+#else
+    from_mont_n(tmp, a, p, n0, NLIMBS(384));
+#endif
+
+    return sgn0_pty_mod_n(tmp, p, NLIMBS(384));
+}"""
+src = src.replace(old_sgn0_384, new_sgn0_384, 1)
+print("Patched sgn0_pty_mont_384 -> from_mont_384")
+
+# Patch sgn0_pty_mont_384x: redirect from_mont_n -> from_mont_384
+old_sgn0_384x = """inline limb_t sgn0_pty_mont_384x(const vec384x a, const vec384 p, limb_t n0)
+{
+    vec384x tmp;
+
+    from_mont_n(tmp[0], a[0], p, n0, NLIMBS(384));
+    from_mont_n(tmp[1], a[1], p, n0, NLIMBS(384));
+
+    return sgn0_pty_mod_384x(tmp, p);
+}"""
+new_sgn0_384x = """inline limb_t sgn0_pty_mont_384x(const vec384x a, const vec384 p, limb_t n0)
+{
+    vec384x tmp;
+
+#ifdef AIRBENDER_BIGINT_CSR
+    from_mont_384(tmp[0], a[0], p, n0);
+    from_mont_384(tmp[1], a[1], p, n0);
+#else
+    from_mont_n(tmp[0], a[0], p, n0, NLIMBS(384));
+    from_mont_n(tmp[1], a[1], p, n0, NLIMBS(384));
+#endif
+
+    return sgn0_pty_mod_384x(tmp, p);
+}"""
+src = src.replace(old_sgn0_384x, new_sgn0_384x, 1)
+print("Patched sgn0_pty_mont_384x -> from_mont_384")
 
 # Patch sqr_n_mul_mont_383: redirect mul_mont_nonred_n/mul_mont_n -> mul_mont_384
 old_sqr_n_mul = """void sqr_n_mul_mont_383(vec384 ret, const vec384 a, size_t count,
