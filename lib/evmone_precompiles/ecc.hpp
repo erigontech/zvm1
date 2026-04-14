@@ -53,6 +53,46 @@ public:
 
     FieldElement() = default;
 
+#if defined(AIRBENDER) && defined(__riscv)
+    /// CSR MEMCOPY-accelerated copy constructor.
+    /// Both source and destination value_ are alignas(32), so CSR MEMCOPY (4 insns)
+    /// replaces the default word-by-word copy (16 insns on rv32), saving 12 insns per copy.
+    /// The member-init zero of value_ is dead-store eliminated by the compiler since
+    /// the asm volatile MEMCOPY immediately overwrites the entire buffer.
+    __attribute__((always_inline)) constexpr FieldElement(const FieldElement& other) noexcept
+        : value_{}
+    {
+        if (!std::is_constant_evaluated())
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&value_);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&other.value_);
+            register uint32_t a2 asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+        else
+        {
+            value_ = other.value_;
+        }
+    }
+
+    /// CSR MEMCOPY-accelerated copy assignment.
+    __attribute__((always_inline)) constexpr FieldElement& operator=(const FieldElement& other) noexcept
+    {
+        if (!std::is_constant_evaluated())
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&value_);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&other.value_);
+            register uint32_t a2 asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+        else
+        {
+            value_ = other.value_;
+        }
+        return *this;
+    }
+#endif
+
     constexpr explicit FieldElement(uint_type v) : value_{Fp.to_mont(v)} {}
 
     constexpr uint_type value() const noexcept { return Fp.from_mont(value_); }
