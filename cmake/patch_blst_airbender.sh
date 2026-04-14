@@ -282,10 +282,137 @@ MUL_MONT_IMPL(384)
 src = src.replace('MUL_MONT_IMPL(384)', airbender_384, 1)
 print("Patched mul_mont_384/sqr_mont_384")
 
-# Patch ADD_MOD_IMPL(384), SUB_MOD_IMPL(384) using software 384-bit with CSR ADD/SUB for low 256
-# These are simpler -- just use the generic implementations for now to keep risk low.
-# The mul_mont is the hot path (~80%+ of BLS12-381 cycles).
-# We can accelerate add/sub later if needed.
+# Patch ADD_MOD_IMPL(384) to use CSR ADD/SUB for the low 256-bit chunk.
+old_add_384 = 'ADD_MOD_IMPL(384)'
+new_add_384 = r"""#ifdef AIRBENDER_BIGINT_CSR
+/* add_mod_384: ret = (a + b) mod p, using CSR ADD for low 256 bits.
+ * Split 384-bit values into lo(256) + hi(128). CSR handles lo, manual carry for hi.
+ * 1. tmp_lo = CSR ADD(a_lo, b_lo), carry_lo
+ * 2. tmp_hi = a_hi + b_hi + carry_lo (manual 4-word chain), carry384
+ * 3. sub_lo = CSR SUB(tmp_lo, p_lo), borrow_lo
+ * 4. sub_hi = tmp_hi - p_hi - borrow_lo (manual), borrow384
+ * 5. If carry384 - borrow384 == 0 (subtraction succeeded): ret = sub, else ret = tmp
+ */
+inline void add_mod_384(vec384 ret, const vec384 a,
+                        const vec384 b, const vec384 p)
+{
+    (void)p;
+    limb_t tmp_lo[8] _BLS_ALIGN32;
+    limb_t sub_lo[8] _BLS_ALIGN32;
+    limb_t tmp_hi[4], sub_hi[4];
+    limb_t carry_lo, borrow_lo, carry384, borrow384;
+    llimb_t limbx;
+
+    /* Step 1: tmp_lo = a_lo + b_lo via CSR ADD */
+    tmp_lo[0]=a[0]; tmp_lo[1]=a[1]; tmp_lo[2]=a[2]; tmp_lo[3]=a[3];
+    tmp_lo[4]=a[4]; tmp_lo[5]=a[5]; tmp_lo[6]=a[6]; tmp_lo[7]=a[7];
+    sub_lo[0]=b[0]; sub_lo[1]=b[1]; sub_lo[2]=b[2]; sub_lo[3]=b[3];
+    sub_lo[4]=b[4]; sub_lo[5]=b[5]; sub_lo[6]=b[6]; sub_lo[7]=b[7];
+    carry_lo = _bls_csr(tmp_lo, sub_lo, 0x01);  /* tmp_lo = a_lo + b_lo */
+
+    /* Step 2: tmp_hi = a_hi + b_hi + carry_lo */
+    limbx = (llimb_t)a[8]  + b[8]  + carry_lo;
+    tmp_hi[0] = (limb_t)limbx; carry384 = (limb_t)(limbx >> LIMB_T_BITS);
+    limbx = (llimb_t)a[9]  + b[9]  + carry384;
+    tmp_hi[1] = (limb_t)limbx; carry384 = (limb_t)(limbx >> LIMB_T_BITS);
+    limbx = (llimb_t)a[10] + b[10] + carry384;
+    tmp_hi[2] = (limb_t)limbx; carry384 = (limb_t)(limbx >> LIMB_T_BITS);
+    limbx = (llimb_t)a[11] + b[11] + carry384;
+    tmp_hi[3] = (limb_t)limbx; carry384 = (limb_t)(limbx >> LIMB_T_BITS);
+
+    /* Step 3: sub_lo = tmp_lo - p_lo via CSR SUB */
+    _bls_copy256(sub_lo, tmp_lo);
+    borrow_lo = _bls_csr(sub_lo, _bls_p_lo, 0x02);  /* sub_lo = tmp_lo - p_lo */
+
+    /* Step 4: sub_hi = tmp_hi - p_hi - borrow_lo */
+    limbx = (llimb_t)tmp_hi[0] - _bls_P[8]  - borrow_lo;
+    sub_hi[0] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    limbx = (llimb_t)tmp_hi[1] - _bls_P[9]  - borrow384;
+    sub_hi[1] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    limbx = (llimb_t)tmp_hi[2] - _bls_P[10] - borrow384;
+    sub_hi[2] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    limbx = (llimb_t)tmp_hi[3] - _bls_P[11] - borrow384;
+    sub_hi[3] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+
+    /* Step 5: Select. If carry384 >= borrow384, subtraction succeeded: use sub.
+     * Otherwise (carry384==0, borrow384==1): use tmp (a+b < p). */
+    if (carry384 - borrow384) {
+        /* Subtraction underflowed: use tmp (a+b) */
+        ret[0]=tmp_lo[0]; ret[1]=tmp_lo[1]; ret[2]=tmp_lo[2]; ret[3]=tmp_lo[3];
+        ret[4]=tmp_lo[4]; ret[5]=tmp_lo[5]; ret[6]=tmp_lo[6]; ret[7]=tmp_lo[7];
+        ret[8]=tmp_hi[0]; ret[9]=tmp_hi[1]; ret[10]=tmp_hi[2]; ret[11]=tmp_hi[3];
+    } else {
+        /* Subtraction succeeded: use sub (a+b-p) */
+        ret[0]=sub_lo[0]; ret[1]=sub_lo[1]; ret[2]=sub_lo[2]; ret[3]=sub_lo[3];
+        ret[4]=sub_lo[4]; ret[5]=sub_lo[5]; ret[6]=sub_lo[6]; ret[7]=sub_lo[7];
+        ret[8]=sub_hi[0]; ret[9]=sub_hi[1]; ret[10]=sub_hi[2]; ret[11]=sub_hi[3];
+    }
+}
+#else
+ADD_MOD_IMPL(384)
+#endif"""
+src = src.replace(old_add_384, new_add_384, 1)
+print("Patched add_mod_384 with CSR ADD/SUB")
+
+# Patch SUB_MOD_IMPL(384) to use CSR SUB/ADD for the low 256-bit chunk.
+old_sub_384 = 'SUB_MOD_IMPL(384)'
+new_sub_384 = r"""#ifdef AIRBENDER_BIGINT_CSR
+/* sub_mod_384: ret = (a - b) mod p, using CSR SUB for low 256 bits.
+ * 1. ret_lo = CSR SUB(a_lo, b_lo), borrow_lo
+ * 2. ret_hi = a_hi - b_hi - borrow_lo (manual), borrow384
+ * 3. If borrow384: ret_lo = CSR ADD(ret_lo, p_lo), carry_lo
+ *                  ret_hi += p_hi + carry_lo (manual)
+ */
+inline void sub_mod_384(vec384 ret, const vec384 a,
+                        const vec384 b, const vec384 p)
+{
+    (void)p;
+    limb_t ret_lo[8] _BLS_ALIGN32;
+    limb_t b_lo[8] _BLS_ALIGN32;
+    limb_t ret_hi[4];
+    limb_t borrow_lo, borrow384, carry_lo, carry;
+    llimb_t limbx;
+
+    /* Step 1: ret_lo = a_lo - b_lo via CSR SUB */
+    ret_lo[0]=a[0]; ret_lo[1]=a[1]; ret_lo[2]=a[2]; ret_lo[3]=a[3];
+    ret_lo[4]=a[4]; ret_lo[5]=a[5]; ret_lo[6]=a[6]; ret_lo[7]=a[7];
+    b_lo[0]=b[0]; b_lo[1]=b[1]; b_lo[2]=b[2]; b_lo[3]=b[3];
+    b_lo[4]=b[4]; b_lo[5]=b[5]; b_lo[6]=b[6]; b_lo[7]=b[7];
+    borrow_lo = _bls_csr(ret_lo, b_lo, 0x02);  /* ret_lo = a_lo - b_lo */
+
+    /* Step 2: ret_hi = a_hi - b_hi - borrow_lo */
+    limbx = (llimb_t)a[8]  - b[8]  - borrow_lo;
+    ret_hi[0] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    limbx = (llimb_t)a[9]  - b[9]  - borrow384;
+    ret_hi[1] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    limbx = (llimb_t)a[10] - b[10] - borrow384;
+    ret_hi[2] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    limbx = (llimb_t)a[11] - b[11] - borrow384;
+    ret_hi[3] = (limb_t)limbx; borrow384 = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+
+    /* Step 3: If borrow, add p back */
+    if (borrow384) {
+        carry_lo = _bls_csr(ret_lo, _bls_p_lo, 0x01);  /* ret_lo += p_lo */
+
+        limbx = (llimb_t)ret_hi[0] + _bls_P[8]  + carry_lo;
+        ret_hi[0] = (limb_t)limbx; carry = (limb_t)(limbx >> LIMB_T_BITS);
+        limbx = (llimb_t)ret_hi[1] + _bls_P[9]  + carry;
+        ret_hi[1] = (limb_t)limbx; carry = (limb_t)(limbx >> LIMB_T_BITS);
+        limbx = (llimb_t)ret_hi[2] + _bls_P[10] + carry;
+        ret_hi[2] = (limb_t)limbx; carry = (limb_t)(limbx >> LIMB_T_BITS);
+        limbx = (llimb_t)ret_hi[3] + _bls_P[11] + carry;
+        ret_hi[3] = (limb_t)limbx;
+    }
+
+    ret[0]=ret_lo[0]; ret[1]=ret_lo[1]; ret[2]=ret_lo[2]; ret[3]=ret_lo[3];
+    ret[4]=ret_lo[4]; ret[5]=ret_lo[5]; ret[6]=ret_lo[6]; ret[7]=ret_lo[7];
+    ret[8]=ret_hi[0]; ret[9]=ret_hi[1]; ret[10]=ret_hi[2]; ret[11]=ret_hi[3];
+}
+#else
+SUB_MOD_IMPL(384)
+#endif"""
+src = src.replace(old_sub_384, new_sub_384, 1)
+print("Patched sub_mod_384 with CSR SUB/ADD")
 
 # Patch REDC_MONT_IMPL(384, 768)
 old_redc = 'REDC_MONT_IMPL(384, 768)'
