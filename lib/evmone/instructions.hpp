@@ -651,10 +651,17 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         const auto end = std::min(begin + 32, state.msg->input_size);
         const auto len = end - begin;
 
-        uint8_t data[32] = {};
-        std::memcpy(data, state.msg->input_data + begin, len);
-
-        index = intx::be::load<uint256>(data);
+        if (len == 32) [[likely]]
+        {
+            // Fast path: full 32-byte load, skip temporary buffer.
+            index = intx::be::unsafe::load<uint256>(state.msg->input_data + begin);
+        }
+        else
+        {
+            uint8_t data[32] = {};
+            std::memcpy(data, state.msg->input_data + begin, len);
+            index = intx::be::load<uint256>(data);
+        }
     }
 }
 
