@@ -878,6 +878,91 @@ public:
                     // x^{p-2} = x^{2^256-2^32-979}
                     return mul(t0, t3);
                 }
+
+                // secp256k1 scalar field order N
+                constexpr UintT SECP256K1_N =
+                    intx::from_string<UintT>("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+
+                if (mod_ == SECP256K1_N)
+                {
+                    // Optimized addition chain for N-2 exponent.
+                    // N-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD036413F
+                    // Uses hybrid approach: doubling chain for top 125 all-1 bits,
+                    // then sliding window w=5 for remaining 131 bits.
+                    // Total: 251S + 46M = 297 Montgomery muls (vs generic 450).
+
+                    // Precomputation: x^2 and odd powers x^3, x^5, ..., x^31
+                    UintT x2 = mul(x, x);
+                    UintT x3 = mul(x, x2);
+                    UintT x5 = mul(x3, x2);
+                    UintT x7 = mul(x5, x2);
+                    UintT x9 = mul(x7, x2);
+                    UintT x11 = mul(x9, x2);
+                    UintT x13 = mul(x11, x2);
+                    UintT x15 = mul(x13, x2);
+                    UintT x17 = mul(x15, x2);
+                    UintT x19 = mul(x17, x2);
+                    UintT x21 = mul(x19, x2);
+                    UintT x23 = mul(x21, x2);
+                    UintT x25 = mul(x23, x2);
+                    UintT x27 = mul(x25, x2);
+                    UintT x29 = mul(x27, x2);
+                    UintT x31 = mul(x29, x2);
+
+                    // Phase 1: Build x^(2^125-1) via doubling chain from x^31.
+                    // x^(2^5-1) = x^31 (from precomp)
+                    UintT r = x31;
+                    UintT t;
+                    // x^(2^10-1) = sq5(x^31) * x^31
+                    t = square_n(r, 5);
+                    UintT x10_1 = mul(t, x31);
+                    // x^(2^20-1) = sq10(x^(2^10-1)) * x^(2^10-1)
+                    t = square_n(x10_1, 10);
+                    UintT x20_1 = mul(t, x10_1);
+                    // x^(2^25-1) = sq5(x^(2^20-1)) * x^31
+                    t = square_n(x20_1, 5);
+                    UintT x25_1 = mul(t, x31);
+                    // x^(2^50-1) = sq25(x^(2^25-1)) * x^(2^25-1)
+                    t = square_n(x25_1, 25);
+                    UintT x50_1 = mul(t, x25_1);
+                    // x^(2^100-1) = sq50(x^(2^50-1)) * x^(2^50-1)
+                    t = square_n(x50_1, 50);
+                    UintT x100_1 = mul(t, x50_1);
+                    // x^(2^125-1) = sq25(x^(2^100-1)) * x^(2^25-1)
+                    t = square_n(x100_1, 25);
+                    r = mul(t, x25_1);
+                    // r = x^(2^125-1), cost: 120S + 6M
+
+                    // Phase 2: Remaining 131 bits of N-2 via sliding window.
+                    // N-2 remaining after top 125 ones:
+                    // 11_0_10111010101011101101110011100110...10011111
+                    r = square_n(r, 4); r = mul(r, x13);   // 4S+1M
+                    r = square_n(r, 6); r = mul(r, x29);   // 6S+1M
+                    r = square_n(r, 6); r = mul(r, x21);   // 6S+1M
+                    r = square_n(r, 5); r = mul(r, x27);   // 5S+1M
+                    r = square_n(r, 4); r = mul(r, x7);    // 4S+1M
+                    r = square_n(r, 5); r = mul(r, x7);    // 5S+1M
+                    r = square_n(r, 6); r = mul(r, x13);   // 6S+1M
+                    r = square_n(r, 6); r = mul(r, x23);   // 6S+1M
+                    r = square_n(r, 3); r = mul(r, x5);    // 3S+1M
+                    r = square_n(r, 7); r = mul(r, x17);   // 7S+1M
+                    r = square_n(r, 2); r = mul(r, x);     // 2S+1M
+                    r = square_n(r, 12); r = mul(r, x29);  // 12S+1M
+                    r = square_n(r, 5); r = mul(r, x27);   // 5S+1M
+                    r = square_n(r, 5); r = mul(r, x31);   // 5S+1M
+                    r = square_n(r, 3); r = mul(r, x5);    // 3S+1M
+                    r = square_n(r, 6); r = mul(r, x9);    // 6S+1M
+                    r = square_n(r, 5); r = mul(r, x15);   // 5S+1M
+                    r = square_n(r, 6); r = mul(r, x17);   // 6S+1M
+                    r = square_n(r, 5); r = mul(r, x19);   // 5S+1M
+                    r = square_n(r, 2); r = mul(r, x);     // 2S+1M
+                    r = square_n(r, 11); r = mul(r, x27);  // 11S+1M
+                    r = square_n(r, 3); r = mul(r, x);     // 3S+1M
+                    r = square_n(r, 10); r = mul(r, x19);  // 10S+1M
+                    r = square_n(r, 4); r = mul(r, x15);   // 4S+1M
+                    // Total phase 2: 131S + 24M
+                    return r;
+                }
                 else
                 {
                     // Generic Fermat: square-and-multiply over bits of (mod - 2).
