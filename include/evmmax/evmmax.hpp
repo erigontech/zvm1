@@ -1098,7 +1098,13 @@ public:
                     // Reuses the field_sqrt chain (253S+13M) up to x223, then 34S+3M for tail.
                     // Total: 266S + 14M = 280 Montgomery muls.
 
-                    UintT z, t0, t1, t2, t3, f;
+                    // Use uninit buffers to avoid dead zero-init of 6 uint256 vars (48 sw zero).
+                    DECL_UNINIT_BUF(UintT, z);
+                    DECL_UNINIT_BUF(UintT, t0);
+                    DECL_UNINIT_BUF(UintT, t1);
+                    DECL_UNINIT_BUF(UintT, t2);
+                    DECL_UNINIT_BUF(UintT, t3);
+                    DECL_UNINIT_BUF(UintT, f);
 
                     // Step 1: z = x^0x2
                     z = mul(x, x);
@@ -1194,7 +1200,7 @@ public:
                     // Phase 1: Build x^(2^125-1) via doubling chain from x^31.
                     // x^(2^5-1) = x^31 (from precomp)
                     UintT r = x31;
-                    UintT t;
+                    DECL_UNINIT_BUF(UintT, t);  // avoid dead zero-init
                     // x^(2^10-1) = sq5(x^31) * x^31
                     t = square_n(r, 5);
                     mul_assign(t, x31);

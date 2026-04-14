@@ -784,11 +784,20 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     // return     ((x223 << 23 + x22) << 6 + _11) << 2
 
     // Allocate Temporaries.
+#if defined(AIRBENDER) && defined(__riscv)
+    // Uninit buffers avoid dead zero-init of 5 FieldElement vars (40 sw zero).
+    DECL_UNINIT_BUF(Curve::Fp, z);
+    DECL_UNINIT_BUF(Curve::Fp, t0);
+    DECL_UNINIT_BUF(Curve::Fp, t1);
+    DECL_UNINIT_BUF(Curve::Fp, t2);
+    DECL_UNINIT_BUF(Curve::Fp, t3);
+#else
     Curve::Fp z;
     Curve::Fp t0;
     Curve::Fp t1;
     Curve::Fp t2;
     Curve::Fp t3;
+#endif
 
 
     // Step 1: z = x^0x2
