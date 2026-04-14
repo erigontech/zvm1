@@ -57,6 +57,16 @@ constexpr uint64_t compute_mont_mod_inv(const UintT& mod) noexcept
 }
 
 #if defined(AIRBENDER) && defined(__riscv)
+
+/// Declares an aligned, uninitialized buffer and a UintT reference to it.
+/// Avoids the zero-initialization overhead of `UintT var;` (whose default
+/// constructor zeroes all words due to `uint64_t words_[N]{}` in intx).
+/// The CSR MEMCOPY that follows always overwrites the buffer before reading,
+/// so the initial contents are irrelevant.
+#define DECL_UNINIT_BUF(UintT, name) \
+    alignas(32) char name##_raw_[sizeof(UintT)]; \
+    auto& name = *reinterpret_cast<UintT*>(name##_raw_)
+
 /// Compute the full 256-bit Montgomery inverse: N' such that mod⋅N' ≡ -1 (mod 2²⁵⁶).
 /// Uses Newton-Raphson starting from the 64-bit inverse, doubling bits each step.
 template <typename UintT>
@@ -279,12 +289,12 @@ public:
                 // FieldElement value_ is aligned, so y can be used directly as x11.
                 // Only 2 stack buffers needed: A (x10 mutable), B (scratch).
 
-                alignas(32) UintT A;       // x -> t_lo -> t_hi -> result
-                alignas(32) UintT B;       // scratch: t_lo saved -> m -> mn_hi
+                DECL_UNINIT_BUF(UintT, A);       // x -> t_lo -> t_hi -> result
+                DECL_UNINIT_BUF(UintT, B);       // scratch: t_lo saved -> m -> mn_hi
 
                 // Resolve y pointer: use &y directly if 32-byte aligned, else copy.
                 // FieldElement::value_ is alignas(32) so this is the common path.
-                alignas(32) UintT Y_buf;
+                DECL_UNINIT_BUF(UintT, Y_buf);
                 const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
                 if (!y_al) Y_buf = y;
                 const uintptr_t y_ptr = y_al
@@ -523,9 +533,9 @@ public:
         {
             if (!std::is_constant_evaluated() && n > 0)
             {
-                alignas(32) UintT A;       // result accumulator
-                alignas(32) UintT B;       // scratch: t_lo -> m -> mN_hi
-                alignas(32) UintT C;       // holds copy of input (y operand for squaring)
+                DECL_UNINIT_BUF(UintT, A);       // result accumulator
+                DECL_UNINIT_BUF(UintT, B);       // scratch: t_lo -> m -> mN_hi
+                DECL_UNINIT_BUF(UintT, C);       // holds copy of input (y operand for squaring)
 
                 // Initial copy of x into A
                 if (reinterpret_cast<uintptr_t>(&x) % 32 == 0) {
@@ -669,7 +679,7 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // add = x + y, then try subtract mod. 2-3 CSR calls.
-                alignas(32) UintT res;
+                DECL_UNINIT_BUF(UintT, res);
                 // Copy x → res: MEMCOPY if aligned, else word copy.
                 if (reinterpret_cast<uintptr_t>(&x) % 32 == 0) {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
@@ -678,7 +688,7 @@ public:
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 } else { res = x; }
                 // Resolve y pointer: use directly if aligned.
-                alignas(32) UintT yy_buf;
+                DECL_UNINIT_BUF(UintT, yy_buf);
                 const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
                 if (!y_al) yy_buf = y;
                 const uintptr_t y_ptr = y_al
@@ -748,14 +758,14 @@ public:
             if (!std::is_constant_evaluated())
             {
                 // sub = x - y; if borrow, add mod back. 1-2 CSR calls.
-                alignas(32) UintT res;
+                DECL_UNINIT_BUF(UintT, res);
                 if (reinterpret_cast<uintptr_t>(&x) % 32 == 0) {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
                     register uint32_t a2 asm("x12") = 0x80;
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                 } else { res = x; }
-                alignas(32) UintT yy_buf;
+                DECL_UNINIT_BUF(UintT, yy_buf);
                 const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
                 if (!y_al) yy_buf = y;
                 const uintptr_t y_ptr = y_al
