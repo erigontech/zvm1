@@ -561,14 +561,14 @@ public:
         {
             if (!std::is_constant_evaluated())
             {
-                // CSR requires x10 != x11. If x and y alias, fall back to mul().
+                // CSR requires x10 != x11 AND both 32-byte aligned.
+                // If x and y alias, fall back to mul(). If either operand is
+                // unaligned (const UintT& from inv chains may have only
+                // natural alignment), fall back to out-of-place mul().
                 if (&x == &y) { x = mul(x, y); return; }
-
-                // x is alignas(32) (FieldElement::value_ or DECL_UNINIT_BUF), but
-                // y may be a const UintT& parameter passed from inv chains where
-                // the caller's UintT has only natural alignment. Fall back to
-                // out-of-place mul() when y is unaligned.
-                if ((reinterpret_cast<uintptr_t>(&y) & 31) != 0) {
+                const auto px_bits = reinterpret_cast<uintptr_t>(&x) & 31;
+                const auto py_bits = reinterpret_cast<uintptr_t>(&y) & 31;
+                if ((px_bits | py_bits) != 0) {
                     x = mul(x, y);
                     return;
                 }
@@ -815,12 +815,22 @@ public:
         DECL_UNINIT_BUF(UintT, B);       // scratch: t_lo -> m -> mN_hi
         DECL_UNINIT_BUF(UintT, C);       // holds copy of input (y operand for squaring)
 
-        // Initial MEMCOPY x → A.
+        // Initial copy x → A. CSR MEMCOPY requires 32-byte alignment on x; fall
+        // back to word copy when x is unaligned (can happen for const UintT&
+        // parameters from inv chains whose caller has natural alignment).
+        if ((reinterpret_cast<uintptr_t>(&x) & 31) == 0)
         {
             register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
             register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
             register uint32_t a2 asm("x12") = 0x80;
             asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+        else
+        {
+            auto* d = reinterpret_cast<uint32_t*>(&A);
+            const auto* s = reinterpret_cast<const uint32_t*>(&x);
+            d[0]=s[0]; d[1]=s[1]; d[2]=s[2]; d[3]=s[3];
+            d[4]=s[4]; d[5]=s[5]; d[6]=s[6]; d[7]=s[7];
         }
 
         const uintptr_t pA = reinterpret_cast<uintptr_t>(&A);
