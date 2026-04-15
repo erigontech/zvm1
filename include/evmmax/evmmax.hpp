@@ -808,39 +808,34 @@ public:
                 const uintptr_t y_ptr = y_al
                     ? reinterpret_cast<uintptr_t>(&y)
                     : reinterpret_cast<uintptr_t>(&yy_buf);
-                uint32_t add_carry;
+                // Single asm block: ADD, unconditional SUB mod, conditional ADD back.
+                // Saves 2-4 mv instructions vs separate asm blocks (x10/x11 reuse).
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = y_ptr;
-                    register uint32_t a2 asm("x12") = 0x01; // ADD
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    add_carry = a2;
-                }
-                // Try subtract mod (use aligned mod_ directly)
-                if (add_carry)
-                {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x02; // SUB
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                }
-                else
-                {
-                    uint32_t borrow;
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                        register uint32_t a2 asm("x12") = 0x02; // SUB
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                        borrow = a2;
-                    }
-                    if (borrow)
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                        register uint32_t a2 asm("x12") = 0x01; // ADD
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    }
+                    const uintptr_t pR = reinterpret_cast<uintptr_t>(&res);
+                    const uintptr_t pY = y_ptr;
+                    const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+                    uint32_t tmp;
+                    asm volatile(
+                        "mv x10, %[pR]\n\t"
+                        "mv x11, %[pY]\n\t"
+                        "li x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "mv %[tmp], x12\n\t"
+
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x02\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        "bnez %[tmp], 1f\n\t"
+                        "beqz x12, 1f\n\t"
+                        "li x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "1:\n\t"
+
+                        : [tmp] "=&r"(tmp)
+                        : [pR] "r"(pR), [pY] "r"(pY), [pMod] "r"(pMod)
+                        : "x10", "x11", "x12", "memory"
+                    );
                 }
                 return res;
             }
@@ -885,21 +880,28 @@ public:
                 const uintptr_t y_ptr = y_al
                     ? reinterpret_cast<uintptr_t>(&y)
                     : reinterpret_cast<uintptr_t>(&yy_buf);
-                uint32_t borrow;
+                // Single asm block: SUB, then conditional ADD mod back.
+                // Saves 1-2 mv instructions vs separate asm blocks (x10 reuse).
                 {
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = y_ptr;
-                    register uint32_t a2 asm("x12") = 0x02; // SUB
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                    borrow = a2;
-                }
-                if (borrow)
-                {
-                    // Use aligned mod_ directly as x11 (no copy needed)
-                    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&res);
-                    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                    register uint32_t a2 asm("x12") = 0x01; // ADD
-                    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                    const uintptr_t pR = reinterpret_cast<uintptr_t>(&res);
+                    const uintptr_t pY = y_ptr;
+                    const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+                    asm volatile(
+                        "mv x10, %[pR]\n\t"
+                        "mv x11, %[pY]\n\t"
+                        "li x12, 0x02\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+
+                        "beqz x12, 1f\n\t"
+                        "mv x11, %[pMod]\n\t"
+                        "li x12, 0x01\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
+                        "1:\n\t"
+
+                        :
+                        : [pR] "r"(pR), [pY] "r"(pY), [pMod] "r"(pMod)
+                        : "x10", "x11", "x12", "memory"
+                    );
                 }
                 return res;
             }
@@ -927,38 +929,38 @@ public:
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
             : reinterpret_cast<uintptr_t>(&y);
-        uint32_t add_carry;
+        // Single asm block: ADD, then unconditional SUB mod, then conditional ADD back.
+        // Saves 2-4 mv instructions vs separate asm blocks (x10/x11 reuse across CSR ops).
         {
-            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-            register uintptr_t a1 asm("x11") = y_ptr;
-            register uint32_t a2 asm("x12") = 0x01; // ADD
-            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-            add_carry = a2;
-        }
-        if (add_carry)
-        {
-            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-            register uint32_t a2 asm("x12") = 0x02; // SUB
-            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-        }
-        else
-        {
-            uint32_t borrow;
-            {
-                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                register uint32_t a2 asm("x12") = 0x02; // SUB
-                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                borrow = a2;
-            }
-            if (borrow)
-            {
-                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-                register uint32_t a2 asm("x12") = 0x01; // ADD
-                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-            }
+            const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+            const uintptr_t pY = y_ptr;
+            const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+            uint32_t tmp;
+            asm volatile(
+                // Step 0: ADD(x, y) -> x += y
+                "mv x10, %[pX]\n\t"
+                "mv x11, %[pY]\n\t"
+                "li x12, 0x01\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "mv %[tmp], x12\n\t"    // tmp = carry from ADD
+
+                // Step 1: SUB(x, mod) -> x -= mod  (x10=pX stays)
+                "mv x11, %[pMod]\n\t"
+                "li x12, 0x02\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 2: Conditional ADD back if !carry && borrow
+                // x10=pX, x11=pMod both still valid from step 1
+                "bnez %[tmp], 1f\n\t"   // if carry != 0, SUB was correct
+                "beqz x12, 1f\n\t"      // if borrow == 0, SUB was correct
+                "li x12, 0x01\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "1:\n\t"
+
+                : [tmp] "=&r"(tmp)
+                : [pX] "r"(pX), [pY] "r"(pY), [pMod] "r"(pMod)
+                : "x10", "x11", "x12", "memory"
+            );
         }
     }
 
@@ -976,20 +978,31 @@ public:
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
             : reinterpret_cast<uintptr_t>(&y);
-        uint32_t borrow;
+        // Single asm block: SUB, then conditional ADD mod back.
+        // Saves 1-2 mv instructions vs separate asm blocks (x10 reuse across CSR ops).
         {
-            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-            register uintptr_t a1 asm("x11") = y_ptr;
-            register uint32_t a2 asm("x12") = 0x02; // SUB
-            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-            borrow = a2;
-        }
-        if (borrow)
-        {
-            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
-            register uint32_t a2 asm("x12") = 0x01; // ADD
-            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+            const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+            const uintptr_t pY = y_ptr;
+            const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+            asm volatile(
+                // Step 0: SUB(x, y) -> x -= y
+                "mv x10, %[pX]\n\t"
+                "mv x11, %[pY]\n\t"
+                "li x12, 0x02\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 1: Conditional ADD(x, mod) if borrow
+                // x10=pX stays from step 0
+                "beqz x12, 1f\n\t"      // if borrow == 0, skip ADD
+                "mv x11, %[pMod]\n\t"
+                "li x12, 0x01\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "1:\n\t"
+
+                :
+                : [pX] "r"(pX), [pY] "r"(pY), [pMod] "r"(pMod)
+                : "x10", "x11", "x12", "memory"
+            );
         }
     }
 #endif
