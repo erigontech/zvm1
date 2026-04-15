@@ -67,6 +67,29 @@ constexpr uint64_t compute_mont_mod_inv(const UintT& mod) noexcept
     alignas(32) char name##_raw_[sizeof(UintT)]; \
     auto& name = *reinterpret_cast<UintT*>(name##_raw_)
 
+/// Declares an aligned, uninitialized buffer and copies src into it using CSR MEMCOPY.
+/// Saves 12 instructions vs DECL_UNINIT_BUF + word copy (4 CSR insns vs 16 word insns).
+/// Both name and src MUST be 32-byte aligned (guaranteed by DECL_UNINIT_BUF / FieldElement).
+#define DECL_UNINIT_BUF_COPY(UintT, name, src) \
+    DECL_UNINIT_BUF(UintT, name); \
+    do { \
+        register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&name); \
+        register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&(src)); \
+        register uint32_t a2_ asm("x12") = 0x80; \
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory"); \
+    } while(0)
+
+/// Copy 256 bits between aligned buffers using CSR MEMCOPY (4 insns vs 16 word insns).
+/// Both dst and src MUST be 32-byte aligned.
+static inline __attribute__((always_inline))
+void csr_copy256(void* dst, const void* src) noexcept
+{
+    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(dst);
+    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(src);
+    register uint32_t a2 asm("x12") = 0x80;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+}
+
 /// Compute the full 256-bit Montgomery inverse: N' such that mod⋅N' ≡ -1 (mod 2²⁵⁶).
 /// Uses Newton-Raphson starting from the 64-bit inverse, doubling bits each step.
 template <typename UintT>
@@ -773,6 +796,120 @@ public:
         return result;
     }
 
+#if defined(AIRBENDER) && defined(__riscv)
+    /// In-place repeated squaring: x = x^(2^n) mod p.
+    /// Avoids the return-value copy overhead of square_n (saves ~24 insns per call
+    /// by writing the result back via CSR MEMCOPY instead of word-by-word return copy).
+    /// Requires x to be 32-byte aligned (guaranteed by DECL_UNINIT_BUF / FieldElement).
+    void square_n_inplace(UintT& x, unsigned n) const noexcept
+        requires(UintT::num_bits == 256)
+    {
+        if (n == 0) return;
+
+        DECL_UNINIT_BUF(UintT, A);       // result accumulator
+        DECL_UNINIT_BUF(UintT, B);       // scratch: t_lo -> m -> mN_hi
+        DECL_UNINIT_BUF(UintT, C);       // holds copy of input (y operand for squaring)
+
+        // Initial MEMCOPY x → A.
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+            register uint32_t a2 asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+
+        const uintptr_t pA = reinterpret_cast<uintptr_t>(&A);
+        const uintptr_t pB = reinterpret_cast<uintptr_t>(&B);
+        const uintptr_t pC = reinterpret_cast<uintptr_t>(&C);
+        const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
+        const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+
+        for (unsigned iter = 0; iter < n; ++iter)
+        {
+            uint32_t tmp;
+            asm volatile(
+                // Step 0: MEMCOPY A -> C  (x10=pC, x11=pA)
+                "mv x10, %[pC]\n\t"
+                "mv x11, %[pA]\n\t"
+                "li x12, 0x80\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 1: MEMCOPY A -> B  (x10=pB, x11=pA stays)
+                "mv x10, %[pB]\n\t"
+                "li x12, 0x80\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 2: MUL_LOW(B, C) -> B = t_lo  (x10=pB stays, x11=pC)
+                "mv x11, %[pC]\n\t"
+                "li x12, 0x08\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 3: Zero check on B (t_lo)
+                "lw %[tmp], 0(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 4(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 8(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 12(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 16(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 20(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 24(%[pB])\n\t"
+                "bnez %[tmp], 1f\n\t"
+                "lw %[tmp], 28(%[pB])\n\t"
+                "1:\n\t"
+                "snez %[tmp], %[tmp]\n\t"
+
+                // Step 4: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
+                "mv x11, %[pModInv]\n\t"
+                "li x12, 0x08\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 5: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
+                "mv x11, %[pMod]\n\t"
+                "li x12, 0x10\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 6: MUL_HIGH(A, C) -> A = t_hi  (x10=pA, x11=pC)
+                "mv x10, %[pA]\n\t"
+                "mv x11, %[pC]\n\t"
+                "li x12, 0x10\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 7: ADD(A, B + carry) -> A += B  (x10=pA stays, x11=pB)
+                "mv x11, %[pB]\n\t"
+                "slli x12, %[tmp], 6\n\t"
+                "ori x12, x12, 0x01\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "mv %[tmp], x12\n\t"
+
+                // Step 8: SUB(A, mod) -> A -= mod  (x10=pA stays, x11=pMod)
+                "mv x11, %[pMod]\n\t"
+                "li x12, 0x02\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+
+                // Step 9: Conditional ADD back
+                "bnez %[tmp], 2f\n\t"
+                "beqz x12, 2f\n\t"
+                "li x12, 0x01\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "2:\n\t"
+
+                : [tmp] "=&r"(tmp)
+                : [pA] "r"(pA), [pB] "r"(pB), [pC] "r"(pC),
+                  [pModInv] "r"(pModInv), [pMod] "r"(pMod)
+                : "x10", "x11", "x12", "memory"
+            );
+        }
+
+        // Copy A -> x at the end using CSR MEMCOPY.
+        csr_copy256(&x, &A);
+    }
+#endif
+
     /// Performs a modular addition. It is required that x < mod and y < mod, but x and y may be
     /// but are not required to be in Montgomery form.
     constexpr UintT add(const UintT& x, const UintT& y) const noexcept
@@ -1014,65 +1151,66 @@ public:
     __attribute__((noinline)) UintT inv_bn254_fp(const UintT& x) const noexcept
     {
         // Precomputation: x^2 and odd powers x^3..x^31
-        // copy+mul_assign saves 1 MEMCOPY vs mul per line; DECL_UNINIT_BUF avoids zero-init
-        DECL_UNINIT_BUF(UintT, x2); x2 = x; mul_assign(x2, x);
-        DECL_UNINIT_BUF(UintT, x3); x3 = x; mul_assign(x3, x2);
-        DECL_UNINIT_BUF(UintT, x5); x5 = x3; mul_assign(x5, x2);
-        DECL_UNINIT_BUF(UintT, x7); x7 = x5; mul_assign(x7, x2);
-        DECL_UNINIT_BUF(UintT, x9); x9 = x7; mul_assign(x9, x2);
-        DECL_UNINIT_BUF(UintT, x11); x11 = x9; mul_assign(x11, x2);
-        DECL_UNINIT_BUF(UintT, x13); x13 = x11; mul_assign(x13, x2);
-        DECL_UNINIT_BUF(UintT, x15); x15 = x13; mul_assign(x15, x2);
-        DECL_UNINIT_BUF(UintT, x17); x17 = x15; mul_assign(x17, x2);
-        DECL_UNINIT_BUF(UintT, x19); x19 = x17; mul_assign(x19, x2);
-        DECL_UNINIT_BUF(UintT, x21); x21 = x19; mul_assign(x21, x2);
-        DECL_UNINIT_BUF(UintT, x23); x23 = x21; mul_assign(x23, x2);
-        DECL_UNINIT_BUF(UintT, x25); x25 = x23; mul_assign(x25, x2);
-        DECL_UNINIT_BUF(UintT, x27); x27 = x25; mul_assign(x27, x2);
-        DECL_UNINIT_BUF(UintT, x29); x29 = x27; mul_assign(x29, x2);
-        DECL_UNINIT_BUF(UintT, x31); x31 = x29; mul_assign(x31, x2);
+        // CSR MEMCOPY copy (4 insns) + mul_assign; DECL_UNINIT_BUF avoids zero-init
+        DECL_UNINIT_BUF_COPY(UintT, x2, x); mul_assign(x2, x);
+        DECL_UNINIT_BUF_COPY(UintT, x3, x); mul_assign(x3, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x5, x3); mul_assign(x5, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x7, x5); mul_assign(x7, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x9, x7); mul_assign(x9, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x11, x9); mul_assign(x11, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x13, x11); mul_assign(x13, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x15, x13); mul_assign(x15, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x17, x15); mul_assign(x17, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x19, x17); mul_assign(x19, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x21, x19); mul_assign(x21, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x23, x21); mul_assign(x23, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x25, x23); mul_assign(x25, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x27, x25); mul_assign(x27, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x29, x27); mul_assign(x29, x2);
+        DECL_UNINIT_BUF_COPY(UintT, x31, x29); mul_assign(x31, x2);
         // 16M precomputation
 
         // Sliding window chain: 252S + 38M
-        DECL_UNINIT_BUF(UintT, r); r = x3;                  // initial
-        r = square_n(r, 10); mul_assign(r, x25);   // 10S+1M
-        r = square_n(r, 8); mul_assign(r, x19);    // 8S+1M
-        r = square_n(r, 5); mul_assign(r, x19);    // 5S+1M
-        r = square_n(r, 4); mul_assign(r, x9);     // 4S+1M
-        r = square_n(r, 4); mul_assign(r, x7);     // 4S+1M
-        r = square_n(r, 9); mul_assign(r, x19);    // 9S+1M
-        r = square_n(r, 7); mul_assign(r, x13);    // 7S+1M
-        r = square_n(r, 10); mul_assign(r, x5);    // 10S+1M
-        r = square_n(r, 7); mul_assign(r, x27);    // 7S+1M
-        r = square_n(r, 1); mul_assign(r, x);      // 1S+1M
-        r = square_n(r, 7); mul_assign(r, x5);     // 7S+1M
-        r = square_n(r, 10); mul_assign(r, x17);   // 10S+1M
-        r = square_n(r, 6); mul_assign(r, x27);    // 6S+1M
-        r = square_n(r, 5); mul_assign(r, x13);    // 5S+1M
-        r = square_n(r, 8); mul_assign(r, x3);     // 8S+1M
-        r = square_n(r, 11); mul_assign(r, x21);   // 11S+1M
-        r = square_n(r, 1); mul_assign(r, x);      // 1S+1M
-        r = square_n(r, 9); mul_assign(r, x23);    // 9S+1M
-        r = square_n(r, 6); mul_assign(r, x25);    // 6S+1M
-        r = square_n(r, 5); mul_assign(r, x15);    // 5S+1M
-        r = square_n(r, 10); mul_assign(r, x11);   // 10S+1M
-        r = square_n(r, 6); mul_assign(r, x21);    // 6S+1M
-        r = square_n(r, 7); mul_assign(r, x17);    // 7S+1M
-        r = square_n(r, 5); mul_assign(r, x13);    // 5S+1M
-        r = square_n(r, 7); mul_assign(r, x7);     // 7S+1M
-        r = square_n(r, 6); mul_assign(r, x7);     // 6S+1M
-        r = square_n(r, 7); mul_assign(r, x21);    // 7S+1M
-        r = square_n(r, 7); mul_assign(r, x13);    // 7S+1M
-        r = square_n(r, 6); mul_assign(r, x15);    // 6S+1M
-        r = square_n(r, 5); mul_assign(r, x);      // 5S+1M
-        r = square_n(r, 10); mul_assign(r, x17);   // 10S+1M
-        r = square_n(r, 1); mul_assign(r, x);      // 1S+1M
-        r = square_n(r, 9); mul_assign(r, x11);    // 9S+1M
-        r = square_n(r, 6); mul_assign(r, x27);    // 6S+1M
-        r = square_n(r, 9); mul_assign(r, x31);    // 9S+1M
-        r = square_n(r, 7); mul_assign(r, x31);    // 7S+1M
-        r = square_n(r, 5); mul_assign(r, x21);    // 5S+1M
-        r = square_n(r, 6); mul_assign(r, x5);     // 6S+1M
+        // square_n_inplace avoids return-value copy overhead (~24 insns/call).
+        DECL_UNINIT_BUF_COPY(UintT, r, x3);                  // initial
+        square_n_inplace(r, 10); mul_assign(r, x25);   // 10S+1M
+        square_n_inplace(r, 8); mul_assign(r, x19);    // 8S+1M
+        square_n_inplace(r, 5); mul_assign(r, x19);    // 5S+1M
+        square_n_inplace(r, 4); mul_assign(r, x9);     // 4S+1M
+        square_n_inplace(r, 4); mul_assign(r, x7);     // 4S+1M
+        square_n_inplace(r, 9); mul_assign(r, x19);    // 9S+1M
+        square_n_inplace(r, 7); mul_assign(r, x13);    // 7S+1M
+        square_n_inplace(r, 10); mul_assign(r, x5);    // 10S+1M
+        square_n_inplace(r, 7); mul_assign(r, x27);    // 7S+1M
+        square_n_inplace(r, 1); mul_assign(r, x);      // 1S+1M
+        square_n_inplace(r, 7); mul_assign(r, x5);     // 7S+1M
+        square_n_inplace(r, 10); mul_assign(r, x17);   // 10S+1M
+        square_n_inplace(r, 6); mul_assign(r, x27);    // 6S+1M
+        square_n_inplace(r, 5); mul_assign(r, x13);    // 5S+1M
+        square_n_inplace(r, 8); mul_assign(r, x3);     // 8S+1M
+        square_n_inplace(r, 11); mul_assign(r, x21);   // 11S+1M
+        square_n_inplace(r, 1); mul_assign(r, x);      // 1S+1M
+        square_n_inplace(r, 9); mul_assign(r, x23);    // 9S+1M
+        square_n_inplace(r, 6); mul_assign(r, x25);    // 6S+1M
+        square_n_inplace(r, 5); mul_assign(r, x15);    // 5S+1M
+        square_n_inplace(r, 10); mul_assign(r, x11);   // 10S+1M
+        square_n_inplace(r, 6); mul_assign(r, x21);    // 6S+1M
+        square_n_inplace(r, 7); mul_assign(r, x17);    // 7S+1M
+        square_n_inplace(r, 5); mul_assign(r, x13);    // 5S+1M
+        square_n_inplace(r, 7); mul_assign(r, x7);     // 7S+1M
+        square_n_inplace(r, 6); mul_assign(r, x7);     // 6S+1M
+        square_n_inplace(r, 7); mul_assign(r, x21);    // 7S+1M
+        square_n_inplace(r, 7); mul_assign(r, x13);    // 7S+1M
+        square_n_inplace(r, 6); mul_assign(r, x15);    // 6S+1M
+        square_n_inplace(r, 5); mul_assign(r, x);      // 5S+1M
+        square_n_inplace(r, 10); mul_assign(r, x17);   // 10S+1M
+        square_n_inplace(r, 1); mul_assign(r, x);      // 1S+1M
+        square_n_inplace(r, 9); mul_assign(r, x11);    // 9S+1M
+        square_n_inplace(r, 6); mul_assign(r, x27);    // 6S+1M
+        square_n_inplace(r, 9); mul_assign(r, x31);    // 9S+1M
+        square_n_inplace(r, 7); mul_assign(r, x31);    // 7S+1M
+        square_n_inplace(r, 5); mul_assign(r, x21);    // 5S+1M
+        square_n_inplace(r, 6); mul_assign(r, x5);     // 6S+1M
         // Total: 252S + 54M = 306 Montgomery muls
         return r;
     }
@@ -1115,61 +1253,61 @@ public:
                     DECL_UNINIT_BUF(UintT, f);
 
                     // Step 1: z = x^0x2
-                    z = x; mul_assign(z, x);   // copy+mul_assign saves 1 MEMCOPY vs mul
+                    csr_copy256(&z, &x); mul_assign(z, x);   // CSR copy+mul_assign
                     // Step 2: z = x^0x3
                     mul_assign(z, x);
                     // Step 4: t0 = x^0xc (2 squarings of z)
-                    t0 = square_n(z, 2);
+                    csr_copy256(&t0, &z); square_n_inplace(t0, 2);
                     // Step 5: t0 = x^0xf
                     mul_assign(t0, z);
                     // Save x^15 for computing x^45 later
-                    f = t0;
+                    csr_copy256(&f, &t0);
                     // Step 6: t1 = x^0x1e
-                    t1 = t0; mul_assign(t1, t0);  // copy+mul_assign saves 1 MEMCOPY
+                    csr_copy256(&t1, &t0); mul_assign(t1, t0);  // CSR copy+mul_assign
                     // Step 7: t2 = x^0x1f
-                    t2 = t1; mul_assign(t2, x);   // copy+mul_assign saves 1 MEMCOPY
+                    csr_copy256(&t2, &t1); mul_assign(t2, x);   // CSR copy+mul_assign
                     // Step 9: t1 = x^0x7c (2 squarings of t2)
-                    t1 = square_n(t2, 2);
+                    csr_copy256(&t1, &t2); square_n_inplace(t1, 2);
                     // Step 10: t1 = x^0x7f
                     mul_assign(t1, z);
                     // Step 14: t3 = x^0x7f0 (4 squarings of t1)
-                    t3 = square_n(t1, 4);
+                    csr_copy256(&t3, &t1); square_n_inplace(t3, 4);
                     // Step 15: t0 = x^0x7ff
                     mul_assign(t0, t3);
                     // Step 26: t3 = x^0x3ff800 (11 squarings of t0)
-                    t3 = square_n(t0, 11);
+                    csr_copy256(&t3, &t0); square_n_inplace(t3, 11);
                     // Step 27: t0 = x^0x3fffff  (x22 = x^{2^22-1})
                     mul_assign(t0, t3);
                     // Step 32: t3 = x^0x7ffffe0 (5 squarings of t0)
-                    t3 = square_n(t0, 5);
+                    csr_copy256(&t3, &t0); square_n_inplace(t3, 5);
                     // Step 33: t2 = x^0x7ffffff  (x27)
                     mul_assign(t2, t3);
                     // Step 60: t3 = x^0x3ffffff8000000 (27 squarings of t2)
-                    t3 = square_n(t2, 27);
+                    csr_copy256(&t3, &t2); square_n_inplace(t3, 27);
                     // Step 61: t2 = x^0x3fffffffffffff  (x54)
                     mul_assign(t2, t3);
                     // Step 115: t3 = (54 squarings of t2)
-                    t3 = square_n(t2, 54);
+                    csr_copy256(&t3, &t2); square_n_inplace(t3, 54);
                     // Step 116: t2 = x^0xfffffffffffffffffffffffffff  (x108)
                     mul_assign(t2, t3);
                     // Step 224: t3 = (108 squarings of t2)
-                    t3 = square_n(t2, 108);
+                    csr_copy256(&t3, &t2); square_n_inplace(t3, 108);
                     // Step 225: t2 = x^{2^216-1}  (x216)
                     mul_assign(t2, t3);
                     // Step 232: t2 = x^{(2^216-1)*2^7} (7 squarings)
-                    t2 = square_n(t2, 7);
+                    square_n_inplace(t2, 7);
                     // Step 233: t1 = x^{2^223-1}  (x223)
                     mul_assign(t1, t2);
 
                     // --- Tail for p-2 ---
                     // Step 256: t1 = x^{(2^223-1)*2^23} (23 squarings)
-                    t1 = square_n(t1, 23);
+                    square_n_inplace(t1, 23);
                     // Step 257: t0 = x^{2^246 - 2^22 - 1}
                     mul_assign(t0, t1);
                     // Step 267: t0 = x^{2^256 - 2^32 - 2^10} (10 squarings)
-                    t0 = square_n(t0, 10);
+                    square_n_inplace(t0, 10);
                     // x^45 = (x^15)^3 from saved f
-                    t3 = f; mul_assign(t3, f);    // x^30 (copy+mul_assign saves 1 MEMCOPY)
+                    csr_copy256(&t3, &f); mul_assign(t3, f);    // x^30 (CSR copy+mul_assign)
                     mul_assign(t3, f);  // x^45
                     // x^{p-2} = x^{2^256-2^32-979}
                     mul_assign(t0, t3);           // in-place saves 1 MEMCOPY vs return mul
@@ -1189,81 +1327,82 @@ public:
                     // Total: 251S + 46M = 297 Montgomery muls (vs generic 450).
 
                     // Precomputation: x^2 and odd powers x^3..x^31
-                    // copy+mul_assign saves 1 MEMCOPY vs mul per line; DECL_UNINIT_BUF avoids zero-init
-                    DECL_UNINIT_BUF(UintT, x2); x2 = x; mul_assign(x2, x);
-                    DECL_UNINIT_BUF(UintT, x3); x3 = x; mul_assign(x3, x2);
-                    DECL_UNINIT_BUF(UintT, x5); x5 = x3; mul_assign(x5, x2);
-                    DECL_UNINIT_BUF(UintT, x7); x7 = x5; mul_assign(x7, x2);
-                    DECL_UNINIT_BUF(UintT, x9); x9 = x7; mul_assign(x9, x2);
-                    DECL_UNINIT_BUF(UintT, x11); x11 = x9; mul_assign(x11, x2);
-                    DECL_UNINIT_BUF(UintT, x13); x13 = x11; mul_assign(x13, x2);
-                    DECL_UNINIT_BUF(UintT, x15); x15 = x13; mul_assign(x15, x2);
-                    DECL_UNINIT_BUF(UintT, x17); x17 = x15; mul_assign(x17, x2);
-                    DECL_UNINIT_BUF(UintT, x19); x19 = x17; mul_assign(x19, x2);
-                    DECL_UNINIT_BUF(UintT, x21); x21 = x19; mul_assign(x21, x2);
-                    DECL_UNINIT_BUF(UintT, x23); x23 = x21; mul_assign(x23, x2);
-                    DECL_UNINIT_BUF(UintT, x25); x25 = x23; mul_assign(x25, x2);
-                    DECL_UNINIT_BUF(UintT, x27); x27 = x25; mul_assign(x27, x2);
-                    DECL_UNINIT_BUF(UintT, x29); x29 = x27; mul_assign(x29, x2);
-                    DECL_UNINIT_BUF(UintT, x31); x31 = x29; mul_assign(x31, x2);
+                    // CSR MEMCOPY copy (4 insns) + mul_assign; DECL_UNINIT_BUF avoids zero-init
+                    DECL_UNINIT_BUF_COPY(UintT, x2, x); mul_assign(x2, x);
+                    DECL_UNINIT_BUF_COPY(UintT, x3, x); mul_assign(x3, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x5, x3); mul_assign(x5, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x7, x5); mul_assign(x7, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x9, x7); mul_assign(x9, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x11, x9); mul_assign(x11, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x13, x11); mul_assign(x13, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x15, x13); mul_assign(x15, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x17, x15); mul_assign(x17, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x19, x17); mul_assign(x19, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x21, x19); mul_assign(x21, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x23, x21); mul_assign(x23, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x25, x23); mul_assign(x25, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x27, x25); mul_assign(x27, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x29, x27); mul_assign(x29, x2);
+                    DECL_UNINIT_BUF_COPY(UintT, x31, x29); mul_assign(x31, x2);
 
                     // Phase 1: Build x^(2^125-1) via doubling chain from x^31.
                     // x^(2^5-1) = x^31 (from precomp)
-                    DECL_UNINIT_BUF(UintT, r); r = x31;
+                    DECL_UNINIT_BUF_COPY(UintT, r, x31);
                     DECL_UNINIT_BUF(UintT, t);  // avoid dead zero-init
                     // x^(2^10-1) = sq5(x^31) * x^31
-                    t = square_n(r, 5);
+                    csr_copy256(&t, &r); square_n_inplace(t, 5);
                     mul_assign(t, x31);
-                    DECL_UNINIT_BUF(UintT, x10_1); x10_1 = t;
+                    DECL_UNINIT_BUF_COPY(UintT, x10_1, t);
                     // x^(2^20-1) = sq10(x^(2^10-1)) * x^(2^10-1)
-                    t = square_n(x10_1, 10);
+                    csr_copy256(&t, &x10_1); square_n_inplace(t, 10);
                     mul_assign(t, x10_1);
-                    DECL_UNINIT_BUF(UintT, x20_1); x20_1 = t;
+                    DECL_UNINIT_BUF_COPY(UintT, x20_1, t);
                     // x^(2^25-1) = sq5(x^(2^20-1)) * x^31
-                    t = square_n(x20_1, 5);
+                    csr_copy256(&t, &x20_1); square_n_inplace(t, 5);
                     mul_assign(t, x31);
-                    DECL_UNINIT_BUF(UintT, x25_1); x25_1 = t;
+                    DECL_UNINIT_BUF_COPY(UintT, x25_1, t);
                     // x^(2^50-1) = sq25(x^(2^25-1)) * x^(2^25-1)
-                    t = square_n(x25_1, 25);
+                    csr_copy256(&t, &x25_1); square_n_inplace(t, 25);
                     mul_assign(t, x25_1);
-                    DECL_UNINIT_BUF(UintT, x50_1); x50_1 = t;
+                    DECL_UNINIT_BUF_COPY(UintT, x50_1, t);
                     // x^(2^100-1) = sq50(x^(2^50-1)) * x^(2^50-1)
-                    t = square_n(x50_1, 50);
+                    csr_copy256(&t, &x50_1); square_n_inplace(t, 50);
                     mul_assign(t, x50_1);
-                    DECL_UNINIT_BUF(UintT, x100_1); x100_1 = t;
+                    DECL_UNINIT_BUF_COPY(UintT, x100_1, t);
                     // x^(2^125-1) = sq25(x^(2^100-1)) * x^(2^25-1)
-                    t = square_n(x100_1, 25);
+                    csr_copy256(&t, &x100_1); square_n_inplace(t, 25);
                     mul_assign(t, x25_1);
-                    r = t;
+                    csr_copy256(&r, &t);
                     // r = x^(2^125-1), cost: 120S + 6M
 
                     // Phase 2: Remaining 131 bits of N-2 via sliding window.
+                    // square_n_inplace avoids return-value copy overhead (~24 insns/call).
                     // N-2 remaining after top 125 ones:
                     // 11_0_10111010101011101101110011100110...10011111
-                    r = square_n(r, 4); mul_assign(r, x13);   // 4S+1M
-                    r = square_n(r, 6); mul_assign(r, x29);   // 6S+1M
-                    r = square_n(r, 6); mul_assign(r, x21);   // 6S+1M
-                    r = square_n(r, 5); mul_assign(r, x27);   // 5S+1M
-                    r = square_n(r, 4); mul_assign(r, x7);    // 4S+1M
-                    r = square_n(r, 5); mul_assign(r, x7);    // 5S+1M
-                    r = square_n(r, 6); mul_assign(r, x13);   // 6S+1M
-                    r = square_n(r, 6); mul_assign(r, x23);   // 6S+1M
-                    r = square_n(r, 3); mul_assign(r, x5);    // 3S+1M
-                    r = square_n(r, 7); mul_assign(r, x17);   // 7S+1M
-                    r = square_n(r, 2); mul_assign(r, x);     // 2S+1M
-                    r = square_n(r, 12); mul_assign(r, x29);  // 12S+1M
-                    r = square_n(r, 5); mul_assign(r, x27);   // 5S+1M
-                    r = square_n(r, 5); mul_assign(r, x31);   // 5S+1M
-                    r = square_n(r, 3); mul_assign(r, x5);    // 3S+1M
-                    r = square_n(r, 6); mul_assign(r, x9);    // 6S+1M
-                    r = square_n(r, 5); mul_assign(r, x15);   // 5S+1M
-                    r = square_n(r, 6); mul_assign(r, x17);   // 6S+1M
-                    r = square_n(r, 5); mul_assign(r, x19);   // 5S+1M
-                    r = square_n(r, 2); mul_assign(r, x);     // 2S+1M
-                    r = square_n(r, 11); mul_assign(r, x27);  // 11S+1M
-                    r = square_n(r, 3); mul_assign(r, x);     // 3S+1M
-                    r = square_n(r, 10); mul_assign(r, x19);  // 10S+1M
-                    r = square_n(r, 4); mul_assign(r, x15);   // 4S+1M
+                    square_n_inplace(r, 4); mul_assign(r, x13);   // 4S+1M
+                    square_n_inplace(r, 6); mul_assign(r, x29);   // 6S+1M
+                    square_n_inplace(r, 6); mul_assign(r, x21);   // 6S+1M
+                    square_n_inplace(r, 5); mul_assign(r, x27);   // 5S+1M
+                    square_n_inplace(r, 4); mul_assign(r, x7);    // 4S+1M
+                    square_n_inplace(r, 5); mul_assign(r, x7);    // 5S+1M
+                    square_n_inplace(r, 6); mul_assign(r, x13);   // 6S+1M
+                    square_n_inplace(r, 6); mul_assign(r, x23);   // 6S+1M
+                    square_n_inplace(r, 3); mul_assign(r, x5);    // 3S+1M
+                    square_n_inplace(r, 7); mul_assign(r, x17);   // 7S+1M
+                    square_n_inplace(r, 2); mul_assign(r, x);     // 2S+1M
+                    square_n_inplace(r, 12); mul_assign(r, x29);  // 12S+1M
+                    square_n_inplace(r, 5); mul_assign(r, x27);   // 5S+1M
+                    square_n_inplace(r, 5); mul_assign(r, x31);   // 5S+1M
+                    square_n_inplace(r, 3); mul_assign(r, x5);    // 3S+1M
+                    square_n_inplace(r, 6); mul_assign(r, x9);    // 6S+1M
+                    square_n_inplace(r, 5); mul_assign(r, x15);   // 5S+1M
+                    square_n_inplace(r, 6); mul_assign(r, x17);   // 6S+1M
+                    square_n_inplace(r, 5); mul_assign(r, x19);   // 5S+1M
+                    square_n_inplace(r, 2); mul_assign(r, x);     // 2S+1M
+                    square_n_inplace(r, 11); mul_assign(r, x27);  // 11S+1M
+                    square_n_inplace(r, 3); mul_assign(r, x);     // 3S+1M
+                    square_n_inplace(r, 10); mul_assign(r, x19);  // 10S+1M
+                    square_n_inplace(r, 4); mul_assign(r, x15);   // 4S+1M
                     // Total phase 2: 131S + 24M
                     return r;
                 }

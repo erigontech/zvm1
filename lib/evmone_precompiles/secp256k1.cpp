@@ -812,7 +812,12 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     z *= x;
 
     // Step 4: t0 = x^0xc  (2 squarings of z)
+#if defined(AIRBENDER) && defined(__riscv)
+    // square_n_assign avoids wrap() overhead (~20 insns/call): no zero-init, no word copy, no return copy.
+    t0 = z; t0.square_n_assign(2);
+#else
     t0 = z.square_n(2);
+#endif
 
     // Step 5: t0 = x^0xf
     t0 *= z;
@@ -824,67 +829,111 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     t2 = t1; t2 *= x;             // copy+mul_assign saves 1 MEMCOPY vs operator*
 
     // Step 9: t1 = x^0x7c  (2 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t1 = t2; t1.square_n_assign(2);
+#else
     t1 = t2.square_n(2);
+#endif
 
     // Step 10: t1 = x^0x7f
     t1 *= z;
 
     // Step 14: t3 = x^0x7f0  (4 squarings of t1)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t1; t3.square_n_assign(4);
+#else
     t3 = t1.square_n(4);
+#endif
 
     // Step 15: t0 = x^0x7ff
     t0 *= t3;
 
     // Step 26: t3 = x^0x3ff800  (11 squarings of t0)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t0; t3.square_n_assign(11);
+#else
     t3 = t0.square_n(11);
+#endif
 
     // Step 27: t0 = x^0x3fffff
     t0 *= t3;
 
     // Step 32: t3 = x^0x7ffffe0  (5 squarings of t0)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t0; t3.square_n_assign(5);
+#else
     t3 = t0.square_n(5);
+#endif
 
     // Step 33: t2 = x^0x7ffffff
     t2 *= t3;
 
     // Step 60: t3 = x^0x3ffffff8000000  (27 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t2; t3.square_n_assign(27);
+#else
     t3 = t2.square_n(27);
+#endif
 
     // Step 61: t2 = x^0x3fffffffffffff
     t2 *= t3;
 
     // Step 115: t3 = (54 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t2; t3.square_n_assign(54);
+#else
     t3 = t2.square_n(54);
+#endif
 
     // Step 116: t2 = x^0xfffffffffffffffffffffffffff
     t2 *= t3;
 
     // Step 224: t3 = (108 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t2; t3.square_n_assign(108);
+#else
     t3 = t2.square_n(108);
+#endif
 
     // Step 225: t2 = x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
     t2 *= t3;
 
     // Step 232: t2 = (7 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    t2.square_n_assign(7);
+#else
     t2 = t2.square_n(7);
+#endif
 
     // Step 233: t1 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
     t1 *= t2;
 
     // Step 256: t1 = (23 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    t1.square_n_assign(23);
+#else
     t1 = t1.square_n(23);
+#endif
 
     // Step 257: t0 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
     t0 *= t1;
 
     // Step 263: t0 = (6 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    t0.square_n_assign(6);
+#else
     t0 = t0.square_n(6);
+#endif
 
     // Step 264: z = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
     z *= t0;
 
     // Step 266: z = (2 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    z.square_n_assign(2);
+#else
     z = z.square_n(2);
+#endif
 
     {
         auto zz = z; zz *= z;     // z^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)

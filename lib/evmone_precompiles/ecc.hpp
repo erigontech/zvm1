@@ -204,6 +204,17 @@ public:
     /// Repeated squaring: returns x^(2^n). Uses ModArith::square_n for CSR loop optimization.
     constexpr auto __attribute__((always_inline)) square_n(unsigned n) const noexcept { return wrap(Fp.square_n(value_, n)); }
 
+#if defined(AIRBENDER) && defined(__riscv)
+    /// In-place repeated squaring: x = x^(2^n) mod p.
+    /// Avoids the wrap() overhead (zero-init + word copy + return copy) of the const version.
+    /// Saves ~20-24 instructions per call vs `*this = this->square_n(n)`.
+    auto& __attribute__((always_inline)) square_n_assign(unsigned n) noexcept
+    {
+        Fp.square_n_inplace(value_, n);
+        return *this;
+    }
+#endif
+
     /// Named one element. Needed in the pairing templates.
     static constexpr auto one() noexcept { return FieldElement{1}; }
 };
