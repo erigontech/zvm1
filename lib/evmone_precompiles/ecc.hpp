@@ -75,10 +75,12 @@ public:
     /// CSR MEMCOPY-accelerated copy constructor.
     /// Both source and destination value_ are alignas(32), so CSR MEMCOPY (4 insns)
     /// replaces the default word-by-word copy (16 insns on rv32), saving 12 insns per copy.
-    /// Note: value_ is still default-initialized (zeroed) by uint<256>'s ctor before the
-    /// body runs.  The compiler cannot eliminate this dead store because asm volatile is opaque.
+    /// Uses uninit_tag to skip the dead zero-init that uint<256>'s default ctor would emit;
+    /// CSR MEMCOPY fully overwrites value_ so the zero-init was always dead code.
+    /// In constexpr context, falls back to value-init + copy-assign (the optimizer removes the
+    /// dead zero-init at -O2 anyway since there's no asm volatile barrier).
     __attribute__((always_inline)) constexpr FieldElement(const FieldElement& other) noexcept
-        : value_{}
+        : value_{std::is_constant_evaluated() ? uint_type{} : uint_type{typename uint_type::uninit_tag{}}}
     {
         if (!std::is_constant_evaluated())
         {
