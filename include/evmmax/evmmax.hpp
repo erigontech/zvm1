@@ -564,10 +564,15 @@ public:
                 // CSR requires x10 != x11. If x and y alias, fall back to mul().
                 if (&x == &y) { x = mul(x, y); return; }
 
-                // x is alignas(32) FieldElement::value_, y likewise (or DECL_UNINIT_BUF).
-                // Only called from operator*= on FieldElement or inversion chains
-                // where both operands are always 32-byte aligned.
-                // Alignment checks removed to save ~8 branch+compare insns per call.
+                // x is alignas(32) (FieldElement::value_ or DECL_UNINIT_BUF), but
+                // y may be a const UintT& parameter passed from inv chains where
+                // the caller's UintT has only natural alignment. Fall back to
+                // out-of-place mul() when y is unaligned.
+                if ((reinterpret_cast<uintptr_t>(&y) & 31) != 0) {
+                    x = mul(x, y);
+                    return;
+                }
+
                 DECL_UNINIT_BUF(UintT, B);       // scratch: x_copy -> t_lo -> m -> mN_hi
 
                 {
@@ -1057,17 +1062,25 @@ public:
     void __attribute__((always_inline)) add_assign(UintT& x, const UintT& y) const noexcept
         requires(UintT::num_bits == 256)
     {
-        // CSR requires x10 != x11. Copy y to buffer only if aliased.
-        // Alignment checks removed: only called from FieldElement::operator+=
-        // and inversion chains where both operands are always alignas(32).
-        // Self-add (x += x) uses CSR MEMCOPY (1 insn) instead of word copy (16 insns).
+        // CSR requires x10 != x11 AND both 32-byte aligned. x is alignas(32),
+        // but y may be an unaligned const UintT& from inv chains. If y is not
+        // 32-aligned, copy it to an aligned scratch (same path as self-alias).
+        // Self-add (x += x): copy via CSR MEMCOPY to yy_buf (1 insn vs word copy).
         DECL_UNINIT_BUF(UintT, yy_buf);
-        const bool y_needs_copy = (&x == &y);
-        if (y_needs_copy) {
+        const bool y_aliased = (&x == &y);
+        const bool y_unaligned = (reinterpret_cast<uintptr_t>(&y) & 31) != 0;
+        const bool y_needs_copy = y_aliased || y_unaligned;
+        if (y_aliased) {
             register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&yy_buf);
             register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&y);
             register uint32_t a2_ asm("x12") = 0x80;
             asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+        } else if (y_unaligned) {
+            // Word copy from unaligned y into aligned yy_buf (8 word stores).
+            auto* d_ = reinterpret_cast<uint32_t*>(&yy_buf);
+            const auto* s_ = reinterpret_cast<const uint32_t*>(&y);
+            d_[0]=s_[0]; d_[1]=s_[1]; d_[2]=s_[2]; d_[3]=s_[3];
+            d_[4]=s_[4]; d_[5]=s_[5]; d_[6]=s_[6]; d_[7]=s_[7];
         }
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
@@ -1112,17 +1125,23 @@ public:
     void __attribute__((always_inline)) sub_assign(UintT& x, const UintT& y) const noexcept
         requires(UintT::num_bits == 256)
     {
-        // CSR requires x10 != x11. Copy y to buffer only if aliased.
-        // Alignment checks removed: only called from FieldElement::operator-=
-        // and inversion chains where both operands are always alignas(32).
-        // Self-sub (x -= x) uses CSR MEMCOPY (1 insn) instead of word copy (16 insns).
+        // CSR requires x10 != x11 AND both 32-byte aligned. x is alignas(32),
+        // but y may be an unaligned const UintT& from inv chains. If y is not
+        // 32-aligned, copy it to an aligned scratch (same path as self-alias).
         DECL_UNINIT_BUF(UintT, yy_buf);
-        const bool y_needs_copy = (&x == &y);
-        if (y_needs_copy) {
+        const bool y_aliased = (&x == &y);
+        const bool y_unaligned = (reinterpret_cast<uintptr_t>(&y) & 31) != 0;
+        const bool y_needs_copy = y_aliased || y_unaligned;
+        if (y_aliased) {
             register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&yy_buf);
             register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&y);
             register uint32_t a2_ asm("x12") = 0x80;
             asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+        } else if (y_unaligned) {
+            auto* d_ = reinterpret_cast<uint32_t*>(&yy_buf);
+            const auto* s_ = reinterpret_cast<const uint32_t*>(&y);
+            d_[0]=s_[0]; d_[1]=s_[1]; d_[2]=s_[2]; d_[3]=s_[3];
+            d_[4]=s_[4]; d_[5]=s_[5]; d_[6]=s_[6]; d_[7]=s_[7];
         }
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
