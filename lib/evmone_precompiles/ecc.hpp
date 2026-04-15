@@ -9,6 +9,24 @@
 
 namespace evmmax::ecc
 {
+
+#if defined(AIRBENDER) && defined(__riscv)
+/// Declares a FieldElement `name` as an uninitialized copy of `src`, using CSR MEMCOPY.
+/// Avoids the 8-word dead zero-init that FieldElement's copy ctor generates
+/// (uint<256>'s default ctor zero-inits words_[4]{} before the asm volatile MEMCOPY).
+/// MUST only be used when `name` will be fully overwritten by CSR MEMCOPY (always true here).
+#define DECL_FE_COPY(FE_TYPE, name, src) \
+    alignas(32) char name##_raw_[sizeof(FE_TYPE)]; \
+    auto& name = *reinterpret_cast<FE_TYPE*>(name##_raw_); \
+    do { \
+        register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&name); \
+        register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&(src)); \
+        register uint32_t a2_ asm("x12") = 0x80; \
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory"); \
+    } while(0)
+#else
+#define DECL_FE_COPY(FE_TYPE, name, src) auto name = src
+#endif
 template <int N>
 struct Constant : std::integral_constant<int, N>
 {
@@ -57,8 +75,8 @@ public:
     /// CSR MEMCOPY-accelerated copy constructor.
     /// Both source and destination value_ are alignas(32), so CSR MEMCOPY (4 insns)
     /// replaces the default word-by-word copy (16 insns on rv32), saving 12 insns per copy.
-    /// The member-init zero of value_ is dead-store eliminated by the compiler since
-    /// the asm volatile MEMCOPY immediately overwrites the entire buffer.
+    /// Note: value_ is still default-initialized (zeroed) by uint<256>'s ctor before the
+    /// body runs.  The compiler cannot eliminate this dead store because asm volatile is opaque.
     __attribute__((always_inline)) constexpr FieldElement(const FieldElement& other) noexcept
         : value_{}
     {
@@ -386,32 +404,31 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
     const auto& [x1, y1, z1] = p;
     const auto& [x2, y2, z2] = q;
 
-    auto z1z1 = z1; z1z1 *= z1;    // z1^2 (copy+mul_assign saves 1 MEMCOPY)
-    auto z2z2 = z2; z2z2 *= z2;    // z2^2 (copy+mul_assign saves 1 MEMCOPY)
-    auto u1 = x1; u1 *= z2z2;     // x1*z2^2 (copy+mul_assign saves 1 MEMCOPY)
-    auto u2 = x2; u2 *= z1z1;     // x2*z1^2 (copy+mul_assign saves 1 MEMCOPY)
-    z1z1 *= z1;                 // z1z1 now = z1^3 (saves 1 MEMCOPY)
-    z2z2 *= z2;                 // z2z2 now = z2^3 (saves 1 MEMCOPY)
-    z2z2 *= y1;                 // z2z2 now = s1 = y1*z2^3 (saves 1 MEMCOPY)
-    z1z1 *= y2;                 // z1z1 now = s2 = y2*z1^3 (saves 1 MEMCOPY)
-    u2 -= u1;                  // u2 now = h = u2 - u1 (in-place, saves 1 MEMCOPY)
+    using FE = typename Curve::Fp;
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;    // z1^2
+    DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;    // z2^2
+    DECL_FE_COPY(FE, u1, x1); u1 *= z2z2;     // x1*z2^2
+    DECL_FE_COPY(FE, u2, x2); u2 *= z1z1;     // x2*z1^2
+    z1z1 *= z1;                 // z1z1 now = z1^3
+    z2z2 *= z2;                 // z2z2 now = z2^3
+    z2z2 *= y1;                 // z2z2 now = s1 = y1*z2^3
+    z1z1 *= y2;                 // z1z1 now = s2 = y2*z1^3
+    u2 -= u1;                  // u2 now = h = u2 - u1
     auto& h = u2;
-    z1z1 -= z2z2;              // z1z1 now = r = s2 - s1 (in-place, saves 1 MEMCOPY)
+    z1z1 -= z2z2;              // z1z1 now = r = s2 - s1
     auto& r = z1z1;
 
     // Handle point doubling in case p == q, i.e. when u1 == u2 and s1 == s2.
-    // TODO: Untested case of two points having the same y coordinate but different x.
-    //       The following assertion (r == 0) => (h == 0) should fail in that case.
     assert(r != 0 || h == 0);
     if (h == 0 && r == 0) [[unlikely]]
         return dbl(p);
 
-    auto hh = h; hh *= h;         // h^2 (copy+mul_assign saves 1 MEMCOPY)
-    u1 *= hh;                  // u1 now = v = u1 * hh (in-place, saves 1 MEMCOPY)
+    DECL_FE_COPY(FE, hh, h); hh *= h;         // h^2
+    u1 *= hh;                  // u1 now = v = u1 * hh
     auto& v = u1;
-    hh *= h;                    // hh now = hhh = h^3 (saves 1 MEMCOPY)
-    auto x3 = r; x3 *= r;         // r^2 (copy+mul_assign saves 1 MEMCOPY)
-    auto t3 = v;
+    hh *= h;                    // hh now = hhh = h^3
+    DECL_FE_COPY(FE, x3, r); x3 *= r;         // r^2
+    DECL_FE_COPY(FE, t3, v);
     t3 += v;                   // t3 = 2*v    (in-place, saves 1 MEMCOPY)
     x3 -= hh;                 // t4 = t2 - hhh (in-place, saves 1 MEMCOPY)
     x3 -= t3;                 // x3 = t4 - t3  (in-place, saves 1 MEMCOPY)
@@ -446,29 +463,29 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     const auto& [x1, y1, z1] = p;
     const auto& [x2, y2] = q;
 
-    auto z1z1 = z1; z1z1 *= z1;    // z1^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
-    auto u2 = x2; u2 *= z1z1;     // x2*z1^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
-    z1z1 *= z1;                 // z1z1 now = z1^3 (saves 1 MEMCOPY vs z1z1z1 = z1 * z1z1)
-    z1z1 *= y2;                 // z1z1 now = s2 = y2 * z1^3 (saves 1 MEMCOPY vs s2 = y2 * z1z1z1)
-    u2 -= x1;                   // u2 now = h = u2 - x1 (in-place, saves 1 MEMCOPY)
+    using FE = typename Curve::Fp;
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;    // z1^2
+    DECL_FE_COPY(FE, u2, x2); u2 *= z1z1;     // x2*z1^2
+    z1z1 *= z1;                 // z1z1 now = z1^3
+    z1z1 *= y2;                 // z1z1 now = s2 = y2 * z1^3
+    u2 -= x1;                   // u2 now = h = u2 - x1
     auto& h = u2;
-    auto t1 = h;
-    t1 += h;                    // t1 = 2*h  (in-place, saves 1 MEMCOPY)
-    auto i = t1; i *= t1;         // (2h)^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
-    z1z1 -= y1;                 // z1z1 now = t2 = s2 - y1 (in-place, saves 1 MEMCOPY)
+    DECL_FE_COPY(FE, t1, h);
+    t1 += h;                    // t1 = 2*h
+    DECL_FE_COPY(FE, i, t1); i *= t1;         // (2h)^2
+    z1z1 -= y1;                 // z1z1 now = t2 = s2 - y1
     auto& t2 = z1z1;
 
     // Handle point doubling in case p == q.
-    // p == q (in jacobian coordinates) if and only if x1 == x2 * z1z1 and y1 = y2 * z1z1z1
     if (h == 0 && t2 == 0) [[unlikely]]
         return dbl(p);
 
-    auto r = t2;
-    r += t2;                    // r = 2*t2  (in-place, saves 1 MEMCOPY)
-    auto v = x1; v *= i;          // x1*i (copy+mul_assign saves 1 MEMCOPY vs operator*)
-    i *= h;                     // i now = j = h * i (saves 1 MEMCOPY vs j = h * i)
-    auto x3 = r; x3 *= r;         // r^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
-    auto t4 = v;
+    DECL_FE_COPY(FE, r, t2);
+    r += t2;                    // r = 2*t2
+    DECL_FE_COPY(FE, v, x1); v *= i;          // x1*i
+    i *= h;                     // i now = j = h * i
+    DECL_FE_COPY(FE, x3, r); x3 *= r;         // r^2
+    DECL_FE_COPY(FE, t4, v);
     t4 += v;                    // t4 = 2*v  (in-place, saves 1 MEMCOPY)
     x3 -= i;                   // t5 = t3 - j  (in-place, saves 1 MEMCOPY)
     x3 -= t4;                  // x3 = t5 - t4 (in-place, saves 1 MEMCOPY)
@@ -497,16 +514,17 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         // Formula: S = 4*X*Y^2, M = 3*X^2, X' = M^2 - 2S, Y' = M(S-X') - 8Y^4, Z' = 2YZ.
         // Cost: 7M + 9A + 3S = 7M + 12(A+S) vs original 7M + 9A + 5S = 7M + 14(A+S).
 
-        auto xx = x1; xx *= x1;       // X^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
-        auto yy = y1; yy *= y1;       // Y^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
-        auto yyyy = yy; yyyy *= yy;   // Y^4 (copy+mul_assign saves 1 MEMCOPY vs operator*)
+        using FE = typename Curve::Fp;
+        DECL_FE_COPY(FE, xx, x1); xx *= x1;       // X^2 (uninit copy + mul_assign)
+        DECL_FE_COPY(FE, yy, y1); yy *= y1;       // Y^2
+        DECL_FE_COPY(FE, yyyy, yy); yyyy *= yy;   // Y^4
         yy *= x1;              // yy now = s = X*Y^2 (saves 1 MEMCOPY vs s = x1 * yy)
         yy += yy;              // s = 2*X*Y^2        (in-place, saves 1 MEMCOPY)
         yy += yy;              // S = 4*X*Y^2        (in-place, saves 1 MEMCOPY)
-        auto m = xx;            // copy X^2
+        DECL_FE_COPY(FE, m, xx);  // copy X^2
         m += xx;                // 2*X^2             (in-place, saves 1 MEMCOPY vs m = xx + xx)
         m += xx;                // M = 3*X^2         (in-place)
-        auto x3 = m; x3 *= m;         // M^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
+        DECL_FE_COPY(FE, x3, m); x3 *= m;         // M^2 (uninit copy + mul_assign)
         x3 -= yy;              // M^2 - S   (eliminates s2 copy: was `s2=yy; s2+=yy; x3-=s2`)
         x3 -= yy;              // X' = M^2 - 2*S    (in-place)
         yy -= x3;              // yy now = S - X'   (in-place, eliminates temporary t)
@@ -515,7 +533,7 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         yyyy += yyyy;           // 8*Y^4             (in-place, saves 1 MEMCOPY)
         m *= yy;                // m now = Y' = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
         m -= yyyy;             // Y' = M*(S - X') - 8*Y^4  (in-place, saves 1 MEMCOPY)
-        auto z3 = y1; z3 *= z1;       // Y*Z (copy+mul_assign saves 1 MEMCOPY vs operator*)
+        DECL_FE_COPY(FE, z3, y1); z3 *= z1;       // Y*Z (uninit copy + mul_assign)
         z3 += z3;              // Z' = 2*Y*Z        (in-place, saves 1 MEMCOPY)
         return {x3, m, z3};
     }
