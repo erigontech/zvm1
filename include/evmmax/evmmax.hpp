@@ -541,26 +541,16 @@ public:
                 // CSR requires x10 != x11. If x and y alias, fall back to mul().
                 if (&x == &y) { x = mul(x, y); return; }
 
-                // x is alignas(32) FieldElement::value_, use directly as x10.
-                // Only 1 stack buffer needed (B for scratch).
-                // Saves 1 MEMCOPY vs mul() which needs MEMCOPY x->A and x->B.
-
+                // x is alignas(32) FieldElement::value_, y likewise (or DECL_UNINIT_BUF).
+                // Only called from operator*= on FieldElement or inversion chains
+                // where both operands are always 32-byte aligned.
+                // Alignment checks removed to save ~8 branch+compare insns per call.
                 DECL_UNINIT_BUF(UintT, B);       // scratch: x_copy -> t_lo -> m -> mN_hi
 
-                // Resolve y pointer: use &y directly if 32-byte aligned, else copy.
-                DECL_UNINIT_BUF(UintT, Y_buf);
-                const bool y_al = (reinterpret_cast<uintptr_t>(&y) % 32 == 0);
-                if (!y_al) Y_buf = y;
-                const uintptr_t y_ptr = y_al
-                    ? reinterpret_cast<uintptr_t>(&y)
-                    : reinterpret_cast<uintptr_t>(&Y_buf);
-
-                const bool x_al = (reinterpret_cast<uintptr_t>(&x) % 32 == 0);
-                if (x_al) {
-                    // Aligned fast path: x used directly as accumulator (saves 1 MEMCOPY).
+                {
                     const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
                     const uintptr_t pB = reinterpret_cast<uintptr_t>(&B);
-                    const uintptr_t pY = y_ptr;
+                    const uintptr_t pY = reinterpret_cast<uintptr_t>(&y);
                     const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
                     const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
 
@@ -641,9 +631,6 @@ public:
                           [pY] "r"(pY), [pModInv] "r"(pModInv), [pMod] "r"(pMod)
                         : "x10", "x11", "x12", "memory"
                     );
-                } else {
-                    // Unaligned x: fall back to regular mul and assign.
-                    x = mul(x, y);
                 }
                 return;
             }
@@ -667,14 +654,12 @@ public:
                 DECL_UNINIT_BUF(UintT, B);       // scratch: t_lo -> m -> mN_hi
                 DECL_UNINIT_BUF(UintT, C);       // holds copy of input (y operand for squaring)
 
-                // Initial copy of x into A
-                if (reinterpret_cast<uintptr_t>(&x) % 32 == 0) {
+                // Initial MEMCOPY x → A (x always 32-byte aligned from callers).
+                {
                     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
                     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&x);
                     register uint32_t a2 asm("x12") = 0x80;
                     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                } else {
-                    A = x;
                 }
 
                 const uintptr_t pA = reinterpret_cast<uintptr_t>(&A);
@@ -928,16 +913,16 @@ public:
 
 #if defined(AIRBENDER) && defined(__riscv)
     /// In-place modular addition: x += y (mod p).
-    /// Requires x to be 32-byte aligned (FieldElement::value_ always is).
+    /// Requires x and y to be 32-byte aligned (FieldElement::value_ always is).
     /// Saves one MEMCOPY CSR call vs the out-of-place add().
     void __attribute__((always_inline)) add_assign(UintT& x, const UintT& y) const noexcept
         requires(UintT::num_bits == 256)
     {
-        // Resolve y pointer: must differ from &x (CSR requires x10 != x11).
-        // Also must be 32-byte aligned. Copy to buffer if same address or unaligned.
+        // CSR requires x10 != x11. Copy y to buffer only if aliased.
+        // Alignment checks removed: only called from FieldElement::operator+=
+        // and inversion chains where both operands are always alignas(32).
         DECL_UNINIT_BUF(UintT, yy_buf);
-        const bool y_needs_copy = (&x == &y) ||
-            (reinterpret_cast<uintptr_t>(&y) % 32 != 0);
+        const bool y_needs_copy = (&x == &y);
         if (y_needs_copy) yy_buf = y;
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
@@ -978,14 +963,15 @@ public:
     }
 
     /// In-place modular subtraction: x -= y (mod p).
-    /// Requires x to be 32-byte aligned.
+    /// Requires x and y to be 32-byte aligned.
     void __attribute__((always_inline)) sub_assign(UintT& x, const UintT& y) const noexcept
         requires(UintT::num_bits == 256)
     {
-        // Resolve y pointer: must differ from &x (CSR requires x10 != x11).
+        // CSR requires x10 != x11. Copy y to buffer only if aliased.
+        // Alignment checks removed: only called from FieldElement::operator-=
+        // and inversion chains where both operands are always alignas(32).
         DECL_UNINIT_BUF(UintT, yy_buf);
-        const bool y_needs_copy = (&x == &y) ||
-            (reinterpret_cast<uintptr_t>(&y) % 32 != 0);
+        const bool y_needs_copy = (&x == &y);
         if (y_needs_copy) yy_buf = y;
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
