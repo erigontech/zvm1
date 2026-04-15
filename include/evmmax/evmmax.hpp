@@ -1060,9 +1060,15 @@ public:
         // CSR requires x10 != x11. Copy y to buffer only if aliased.
         // Alignment checks removed: only called from FieldElement::operator+=
         // and inversion chains where both operands are always alignas(32).
+        // Self-add (x += x) uses CSR MEMCOPY (1 insn) instead of word copy (16 insns).
         DECL_UNINIT_BUF(UintT, yy_buf);
         const bool y_needs_copy = (&x == &y);
-        if (y_needs_copy) yy_buf = y;
+        if (y_needs_copy) {
+            register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&yy_buf);
+            register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&y);
+            register uint32_t a2_ asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+        }
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
             : reinterpret_cast<uintptr_t>(&y);
@@ -1109,9 +1115,15 @@ public:
         // CSR requires x10 != x11. Copy y to buffer only if aliased.
         // Alignment checks removed: only called from FieldElement::operator-=
         // and inversion chains where both operands are always alignas(32).
+        // Self-sub (x -= x) uses CSR MEMCOPY (1 insn) instead of word copy (16 insns).
         DECL_UNINIT_BUF(UintT, yy_buf);
         const bool y_needs_copy = (&x == &y);
-        if (y_needs_copy) yy_buf = y;
+        if (y_needs_copy) {
+            register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&yy_buf);
+            register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&y);
+            register uint32_t a2_ asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+        }
         const uintptr_t y_ptr = y_needs_copy
             ? reinterpret_cast<uintptr_t>(&yy_buf)
             : reinterpret_cast<uintptr_t>(&y);
