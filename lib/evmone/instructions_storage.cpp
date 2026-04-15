@@ -106,7 +106,7 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
         // Here we need to apply additional cold storage access cost.
         constexpr auto additional_cold_sload_cost =
             instr::cold_sload_cost - instr::warm_storage_read_cost;
-        if ((gas_left -= additional_cold_sload_cost) < 0)
+        if (!deduct_gas(gas_left, additional_cold_sload_cost))
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -136,7 +136,7 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     const auto [gas_cost_warm, gas_refund] = sstore_costs[state.rev][status];
     const auto gas_cost = gas_cost_warm + gas_cost_cold;
 
-    if ((gas_left -= gas_cost) < 0)
+    if (!deduct_gas(gas_left, gas_cost))
         return {EVMC_OUT_OF_GAS, gas_left};
     state.gas_refund += gas_refund;
     return {EVMC_SUCCESS, gas_left};

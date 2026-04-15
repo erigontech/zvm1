@@ -61,6 +61,21 @@ struct TermResult : Result
 
 constexpr auto max_buffer_size = std::numeric_limits<uint32_t>::max();
 
+/// Deducts a gas cost from gas_left and returns true if gas_left >= 0 after deduction.
+/// On rv32im, narrows to int32_t arithmetic (2 instructions vs 5 for int64_t sub+check).
+/// Safe because EVM gas fits in 32 bits (block gas limit ~30M << 2^31).
+inline bool deduct_gas(int64_t& gas_left, int64_t cost) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    auto g32 = static_cast<int32_t>(gas_left);
+    g32 -= static_cast<int32_t>(cost);
+    gas_left = static_cast<int64_t>(g32);
+    return g32 >= 0;
+#else
+    return (gas_left -= cost) >= 0;
+#endif
+}
+
 /// The size of the EVM 256-bit word.
 constexpr auto word_size = 32;
 
@@ -100,8 +115,7 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     const auto current_cost = 3 * current_words + (current_words * current_words >> 9);
     const auto cost = static_cast<int64_t>(new_cost - current_cost);
 
-    gas_left -= cost;
-    if (gas_left >= 0) [[likely]]
+    if (deduct_gas(gas_left, cost)) [[likely]]
         memory.grow(static_cast<size_t>(new_words) * word_size);
     return gas_left;
 }
@@ -374,7 +388,7 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
         static_cast<int>(intx::count_significant_bytes(exponent));
     const auto exponent_cost = state.rev >= EVMC_SPURIOUS_DRAGON ? 50 : 10;
     const auto additional_cost = exponent_significant_bytes * exponent_cost;
-    if ((gas_left -= additional_cost) < 0)
+    if (!deduct_gas(gas_left, additional_cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
 #if defined(AIRBENDER) && defined(__riscv)
@@ -452,7 +466,13 @@ inline void signextend(StackTop stack) noexcept
     const auto& ext = stack.pop();
     auto& x = stack.top();
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, check ext < 31 using 32-bit words to avoid constructing uint256{31}.
+    const auto* ew = reinterpret_cast<const uint32_t*>(&ext);
+    if ((ew[1] | ew[2] | ew[3] | ew[4] | ew[5] | ew[6] | ew[7]) == 0 && ew[0] < 31)
+#else
     if (ext < 31)  // For 31 we also don't need to do anything.
+#endif
     {
         const auto e = ext[0];  // uint256 -> uint64.
         const auto sign_word_index =
@@ -544,9 +564,27 @@ inline void eq(StackTop stack) noexcept
 
 inline void iszero(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks with early exit for the common case.
+    // Most EVM values tested for zero (booleans, counters, addresses) have non-zero
+    // low bits, so checking the low 32-bit word first avoids loading all 8 words.
+    auto& x = stack.top();
+    const auto* w = reinterpret_cast<const uint32_t*>(&x);
+    // Fast path: if any of the low 2 words (first uint64_t) are non-zero,
+    // value is not zero → result is 0.
+    if ((w[0] | w[1]) != 0)
+    {
+        x = 0;
+        return;
+    }
+    // Slow path: low 64 bits are zero, check remaining.
+    const uint32_t upper = w[2] | w[3] | w[4] | w[5] | w[6] | w[7];
+    x = uint64_t{upper == 0};
+#else
     // Direct word check avoids constructing a uint256{0} for comparison.
     auto& x = stack.top();
     x = uint64_t{(x[0] | x[1] | x[2] | x[3]) == 0};
+#endif
 }
 
 inline void and_(StackTop stack) noexcept
@@ -574,7 +612,15 @@ inline void byte(StackTop stack) noexcept
     const auto& n = stack.pop();
     auto& x = stack.top();
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, check if n < 32 using 32-bit words to avoid constructing uint256{32}.
+    // n < 32 iff upper words are all zero and low word < 32.
+    const auto* nw = reinterpret_cast<const uint32_t*>(&n);
+    const bool n_valid =
+        (nw[1] | nw[2] | nw[3] | nw[4] | nw[5] | nw[6] | nw[7]) == 0 && nw[0] < 32;
+#else
     const bool n_valid = n < 32;
+#endif
     const uint64_t byte_mask = (n_valid ? 0xff : 0);
 
     const auto index = 31 - static_cast<unsigned>(n[0] % 32);
@@ -623,7 +669,7 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     const auto s = static_cast<size_t>(size);
     const auto w = num_words(s);
     const auto cost = w * 6;
-    if ((gas_left -= cost) < 0)
+    if (!deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     auto data = s != 0 ? &state.memory[i] : nullptr;
@@ -644,7 +690,7 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if (!deduct_gas(gas_left, instr::additional_cold_account_access_cost))
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -671,7 +717,16 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
+    // if index overflows 32 bits (any high word non-zero → index > any size_t value).
+    const auto* iw = reinterpret_cast<const uint32_t*>(&index);
+    const bool index_overflows_32bit =
+        (iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0;
+    if (index_overflows_32bit || state.msg->input_size <= iw[0])
+#else
     if (state.msg->input_size < index)
+#endif
         index = 0;
     else
     {
@@ -713,7 +768,7 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
     auto s = static_cast<size_t>(size);
     auto copy_size = std::min(s, state.msg->input_size - src);
 
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    if (const auto cost = copy_cost(s); !deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (copy_size > 0)
@@ -747,7 +802,7 @@ inline Result codecopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
     const auto s = static_cast<size_t>(size);
     const auto copy_size = std::min(s, code_size - src);
 
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    if (const auto cost = copy_cost(s); !deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     // TODO: Add unit tests for each combination of conditions.
@@ -793,7 +848,7 @@ inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if (!deduct_gas(gas_left, instr::additional_cold_account_access_cost))
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -812,12 +867,12 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
         return {EVMC_OUT_OF_GAS, gas_left};
 
     const auto s = static_cast<size_t>(size);
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    if (const auto cost = copy_cost(s); !deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if (!deduct_gas(gas_left, instr::additional_cold_account_access_cost))
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -858,7 +913,7 @@ inline Result returndatacopy(StackTop stack, int64_t gas_left, ExecutionState& s
     if (src + s > state.return_data.size())
         return {EVMC_INVALID_MEMORY_ACCESS, gas_left};
 
-    if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
+    if (const auto cost = copy_cost(s); !deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (s > 0)
@@ -874,7 +929,7 @@ inline Result extcodehash(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if (!deduct_gas(gas_left, instr::additional_cold_account_access_cost))
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -1212,7 +1267,7 @@ inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     const auto src = static_cast<size_t>(src_u256);
     const auto size = static_cast<size_t>(size_u256);
 
-    if (const auto cost = copy_cost(size); (gas_left -= cost) < 0)
+    if (const auto cost = copy_cost(size); !deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     if (size > 0)
@@ -1239,7 +1294,7 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     const auto s = static_cast<size_t>(size);
 
     const auto cost = int64_t(s) * 8;
-    if ((gas_left -= cost) < 0)
+    if (!deduct_gas(gas_left, cost))
         return {EVMC_OUT_OF_GAS, gas_left};
 
     std::array<evmc::bytes32, NumTopics> topics;  // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -1293,7 +1348,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(beneficiary) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::cold_account_access_cost) < 0)
+        if (!deduct_gas(gas_left, instr::cold_account_access_cost))
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -1305,7 +1360,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
             // sending value to a non-existing account.
             if (!state.host.account_exists(beneficiary))
             {
-                if ((gas_left -= 25000) < 0)
+                if (!deduct_gas(gas_left, 25000))
                     return {EVMC_OUT_OF_GAS, gas_left};
             }
         }
