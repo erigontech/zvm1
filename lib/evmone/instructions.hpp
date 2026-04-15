@@ -490,62 +490,14 @@ inline void gt(StackTop stack) noexcept
 
 inline void slt(StackTop stack) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
-    // SLT: signed(a < b) where a = old_top, b = new_top after pop.
-    // 1. Check sign bits (byte offset 31 = MSB of uint256, little-endian).
-    // 2. If signs differ: negative one is smaller.
-    // 3. If same sign: unsigned comparison via CSR SUB (same as LT).
-    auto& x = stack.pop();  // a (old top); b is now stack[0].
-    const auto* x_bytes = reinterpret_cast<const uint8_t*>(&x);
-    const auto* b_bytes = reinterpret_cast<const uint8_t*>(&stack[0]);
-    const auto x_neg = (x_bytes[31] >> 7) & 1;
-    const auto b_neg = (b_bytes[31] >> 7) & 1;
-    if (x_neg != b_neg)
-    {
-        stack[0] = uint64_t{x_neg};  // a is negative → a < b
-    }
-    else
-    {
-        // Same sign: signed comparison == unsigned comparison.
-        register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&x);
-        register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
-        register uint32_t r12 asm("x12") = 0x02;  // SUB
-        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-        stack[0] = uint64_t{r12 != 0};  // borrow != 0 means a < b
-    }
-#else
     const auto& x = stack.pop();
     stack[0] = uint64_t{slt(x, stack[0])};
-#endif
 }
 
 inline void sgt(StackTop stack) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
-    // SGT: signed(a > b) = signed(b < a) where a = old_top, b = new_top after pop.
-    auto& x = stack.pop();  // a (old top); b is now stack[0].
-    const auto* x_bytes = reinterpret_cast<const uint8_t*>(&x);
-    const auto* b_bytes = reinterpret_cast<const uint8_t*>(&stack[0]);
-    const auto x_neg = (x_bytes[31] >> 7) & 1;
-    const auto b_neg = (b_bytes[31] >> 7) & 1;
-    if (x_neg != b_neg)
-    {
-        stack[0] = uint64_t{b_neg};  // b is negative → b < a → a > b
-    }
-    else
-    {
-        // Same sign: signed(b < a) == unsigned(b < a).
-        // CSR SUB(&stack[0], &x) → borrow means stack[0] < x means b < a.
-        register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[0]);
-        register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&x);
-        register uint32_t r12 asm("x12") = 0x02;  // SUB
-        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-        stack[0] = uint64_t{r12 != 0};  // borrow != 0 means b < a
-    }
-#else
     const auto& x = stack.pop();
     stack[0] = uint64_t{slt(stack[0], x)};  // Arguments are swapped and SLT is used.
-#endif
 }
 
 inline void eq(StackTop stack) noexcept
