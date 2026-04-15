@@ -130,14 +130,28 @@ inline auto to_le(std::integral auto x) noexcept
 template <typename T>
 inline T load_le(const std::byte* data) noexcept
 {
+#ifdef AIRBENDER
+    // Avoid std::copy_n → memmove for small types on RISC-V.
+    T v;
+    __builtin_memcpy(&v, data, sizeof(T));
+    return to_le(v);
+#else
     std::array<std::byte, sizeof(T)> bytes{};
     std::copy_n(data, sizeof(T), bytes.begin());
     return to_le(std::bit_cast<T>(bytes));
+#endif
 }
 
 inline std::byte* store_le(std::byte* out, std::integral auto x) noexcept
 {
+#ifdef AIRBENDER
+    // Avoid std::ranges::copy → memmove for small types on RISC-V.
+    auto v = to_le(x);
+    __builtin_memcpy(out, &v, sizeof(v));
+    return out + sizeof(v);
+#else
     return std::ranges::copy(std::bit_cast<std::array<std::byte, sizeof(x)>>(to_le(x)), out).out;
+#endif
 }
 
 template <size_t J>
