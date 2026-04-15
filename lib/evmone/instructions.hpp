@@ -110,6 +110,26 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
 inline bool check_memory(
     int64_t& gas_left, Memory& memory, const uint256& offset, uint64_t size) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks to avoid 64-bit OR decomposition overhead.
+    // Check that all uint32 words above word[0] are zero (offset fits in 32 bits).
+    const auto* w = reinterpret_cast<const uint32_t*>(&offset);
+    if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
+        return false;
+
+    // offset fits in 32 bits. On rv32, size_t is 32-bit and memory.size() < 2^32.
+    // size is at most max_buffer_size (32-bit). new_size may need 33 bits in theory,
+    // but EVM gas limits keep real memory under ~8MB, so 32-bit is safe in practice.
+    // Use uint64_t for new_size to avoid any theoretical overflow.
+    const auto new_size = static_cast<uint64_t>(w[0]) + size;
+    if (new_size > memory.size())
+    {
+        gas_left = grow_memory(gas_left, memory, new_size);
+        if (gas_left < 0) [[unlikely]]
+            return false;
+    }
+    return true;
+#else
     // TODO: This should be done in intx.
     // There is "branchless" variant of this using | instead of ||, but benchmarks difference
     // is within noise. This should be decided when moving the implementation to intx.
@@ -125,6 +145,7 @@ inline bool check_memory(
     }
 
     return true;
+#endif
 }
 
 /// Check memory requirements for "copy" instructions.
@@ -134,11 +155,18 @@ inline bool check_memory(
     if (size == 0)  // Copy of size 0 is always valid (even if offset is huge).
         return true;
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks to avoid 64-bit OR decomposition overhead.
+    const auto* sw = reinterpret_cast<const uint32_t*>(&size);
+    if ((sw[1] | sw[2] | sw[3] | sw[4] | sw[5] | sw[6] | sw[7]) != 0)
+        return false;
+#else
     // This check has 3 same word checks with the check above.
     // However, compilers do decent although not perfect job unifying common instructions.
     // TODO: This should be done in intx.
     if (((size[3] | size[2] | size[1]) != 0) || (size[0] > max_buffer_size))
         return false;
+#endif
 
     return check_memory(gas_left, memory, offset, static_cast<uint64_t>(size));
 }
