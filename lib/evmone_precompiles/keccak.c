@@ -19,16 +19,71 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
 // Shared between syscall_keccak_permute and direct-access optimized paths.
 static uint64_t __attribute__((aligned(256))) buf[32];
 
+// 32-byte-aligned zero source for CSR 0x7CA MEMCOPY-based bulk zeroing.
+// Each MEMCOPY(dst, zeros, 0x80) clears 32 bytes (= 4 uint64_t) in 4 insns,
+// replacing 8 sw-zero stores that the scalar loop emits.
+static const uint64_t __attribute__((aligned(32))) keccak_zeros[4] = {0, 0, 0, 0};
+
+/// Zero buf[0..31] (256 bytes) via 8 CSR MEMCOPY calls from keccak_zeros.
+/// Replaces scalar loop (~82 insns: 62 sw + 20 loop overhead) with ~40 insns.
+/// Single asm block keeps x11 (source) pinned across all 8 calls; x10 (dest) advances.
+static inline __attribute__((always_inline))
+void buf_zero_all(void)
+{
+    const unsigned long src = (unsigned long)keccak_zeros;
+    const unsigned long dst = (unsigned long)buf;
+    __asm__ __volatile__(
+        "mv x11, %[src]\n\t"
+        // chunk 0: buf[0..3]
+        "mv x10, %[dst]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 1: buf[4..7]
+        "addi x10, %[dst], 32\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 2: buf[8..11]
+        "addi x10, %[dst], 64\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 3: buf[12..15]
+        "addi x10, %[dst], 96\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 4: buf[16..19]
+        "addi x10, %[dst], 128\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 5: buf[20..23]
+        "addi x10, %[dst], 160\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 6: buf[24..27]
+        "addi x10, %[dst], 192\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 7: buf[28..31]
+        "addi x10, %[dst], 224\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [src] "r"(src), [dst] "r"(dst)
+        : "x10", "x11", "x12", "memory"
+    );
+}
+
 /// Keccak-f[1600] via airbender CSR 0x7CB delegation.
 /// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
 /// scans for exactly 649 contiguous csrrw instructions.
 static void syscall_keccak_permute(uint64_t state[25])
 {
     int i;
-    for (i = 0; i < 25; i++)
-        buf[i] = state[i];
+    // Zero buf[25..31] before copying state. 48 bytes = 6 uint64_t.
+    // Use scalar stores (simpler than CSR for this small range).
     for (i = 25; i < 31; i++)
         buf[i] = 0;
+    for (i = 0; i < 25; i++)
+        buf[i] = state[i];
 
     register uint32_t ctrl __asm__("x10") = 0;
     register void*    sptr __asm__("x11") = (void*)buf;
@@ -378,8 +433,7 @@ static inline ALWAYS_INLINE void keccak(
     // Work directly on the static CSR-aligned buf[] to avoid the
     // state→buf→state copies that syscall_keccak_permute would do
     // on every permutation call (saves 50 word copies per call).
-    for (i = 0; i < 25; i++) buf[i] = 0;
-    for (i = 25; i < 31; i++) buf[i] = 0;
+    buf_zero_all();
 
     while (size >= block_size)
     {
@@ -500,7 +554,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
         // Write directly to the static CSR-aligned buf — avoid state→buf→state copies.
         {
             int i;
-            for (i = 0; i < 31; i++) buf[i] = 0;
+            buf_zero_all();
 
             uint64_t* buf_iter = buf;
             const uint8_t* d = data;
@@ -578,16 +632,15 @@ union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
 #if defined(AIRBENDER)
     // Write directly to the CSR-aligned static buffer — skip the state→buf→state copies.
     {
-        // Use file-level static buf[] directly — no copy overhead.
-        int i;
+        // Bulk-zero buf via CSR MEMCOPY (32 insns) then write data + padding.
+        // Replaces scalar loops (~60 sw + overhead) with 8 CSR calls.
+        buf_zero_all();
         buf[0] = load_le(data);
         buf[1] = load_le(data + 8);
         buf[2] = load_le(data + 16);
         buf[3] = load_le(data + 24);
         buf[4] = 0x0000000000000001ULL;
-        for (i = 5; i < 16; i++) buf[i] = 0;
         buf[16] = 0x8000000000000000ULL;
-        for (i = 17; i < 31; i++) buf[i] = 0;
 
         register uint32_t ctrl __asm__("x10") = 0;
         register void*    sptr __asm__("x11") = (void*)buf;
