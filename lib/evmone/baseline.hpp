@@ -16,7 +16,13 @@ class VM;
 /// A span type for a bitset.
 struct BitsetSpan
 {
+    // On rv32im, 64-bit shift/mask/load in test() costs ~6-8 instructions per JUMP/JUMPI.
+    // Using 32-bit words makes each bitset access a single-instruction shift, AND, and load.
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    using word_type = uint32_t;
+#else
     using word_type = uint64_t;
+#endif
     static constexpr size_t WORD_BITS = sizeof(word_type) * 8;
 
     word_type* m_array = nullptr;
@@ -82,7 +88,13 @@ public:
     [[nodiscard]] bytes_view executable_code() const noexcept { return m_executable_code; }
 
     /// Check if given position is valid jump destination. Use only for legacy code.
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, callers already verified position fits in 32 bits.
+    // Use uint32_t to avoid 64-bit comparison with size().
+    [[nodiscard]] bool check_jumpdest(uint32_t position) const noexcept
+#else
     [[nodiscard]] bool check_jumpdest(uint64_t position) const noexcept
+#endif
     {
         if (position >= m_raw_code.size())
             return false;
