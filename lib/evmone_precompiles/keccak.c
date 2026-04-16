@@ -22,7 +22,8 @@ static uint64_t __attribute__((aligned(256))) buf[32];
 // 32-byte-aligned zero source for CSR 0x7CA MEMCOPY-based bulk zeroing.
 // Each MEMCOPY(dst, zeros, 0x80) clears 32 bytes (= 4 uint64_t) in 4 insns,
 // replacing 8 sw-zero stores that the scalar loop emits.
-static const uint64_t __attribute__((aligned(32))) keccak_zeros[4] = {0, 0, 0, 0};
+// Not const: must be in RAM (.bss), not .rodata (ROM), because CSR requires x11 in RAM.
+static uint64_t __attribute__((aligned(32))) keccak_zeros[4] = {0, 0, 0, 0};
 
 /// Zero buf[0..31] (256 bytes) via 8 CSR MEMCOPY calls from keccak_zeros.
 /// Replaces scalar loop (~82 insns: 62 sw + 20 loop overhead) with ~40 insns.

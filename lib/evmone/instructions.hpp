@@ -1149,7 +1149,8 @@ inline void push0(StackTop stack) noexcept
 #if defined(AIRBENDER) && defined(__riscv)
     // CSR MEMCOPY from static zero buffer: 4 insns vs ~32 for uint256{} + word copy.
     // Stack slots are 32-byte aligned. PUSH0 is very common in modern Solidity contracts.
-    static const uint256 __attribute__((aligned(32))) zero_buf_{};
+    // Not const: must be in RAM (.bss), not .rodata (ROM), because CSR requires x11 in RAM.
+    static uint256 __attribute__((aligned(32))) zero_buf_{};
     register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(stack.end());
     register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&zero_buf_);
     register uint32_t r12 asm("x12") = 0x80;  // MEMCOPY
