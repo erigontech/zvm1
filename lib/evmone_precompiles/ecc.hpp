@@ -255,6 +255,15 @@ struct AffinePoint
 
     friend constexpr bool operator==(const AffinePoint& p, zero_t) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        // Use FieldElement::operator==(zero_t) which has short-circuit on rv32
+        // (exits on first nonzero word). The old `p == AffinePoint{}` used the
+        // general XOR-fold comparison (~64 insns on rv32 vs ~8 insns short-circuit).
+        // In constexpr context, fall back to the general comparison (operator bool
+        // uses reinterpret_cast which isn't constexpr).
+        if (!std::is_constant_evaluated())
+            return p.x == 0 && p.y == 0;
+#endif
         return p == AffinePoint{};
     }
 
