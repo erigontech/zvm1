@@ -45,6 +45,20 @@ public:
 
     /// Assigns the value to the stack top and moves the stack top pointer up.
     void push(const uint256& value) noexcept { *m_end++ = value; }
+
+#if defined(AIRBENDER) && defined(__riscv)
+    /// Push a zero uint256 onto the stack using CSR MEMCOPY from a static zero buffer.
+    /// Saves ~12 insns vs push({}) which zero-inits a temp then word-copies (~16 insns).
+    void push_zero() noexcept
+    {
+        static const uint256 __attribute__((aligned(32))) z_{};
+        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(m_end);
+        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&z_);
+        register uint32_t a2 asm("x12") = 0x80;
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        ++m_end;
+    }
+#endif
 };
 
 
@@ -1159,7 +1173,11 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
     static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
     static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
 
+#if defined(AIRBENDER) && defined(__riscv)
+    stack.push_zero();
+#else
     stack.push({});
+#endif
     auto& r = stack.top();
     pos += 1;  // Skip the opcode.
 
