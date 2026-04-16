@@ -450,10 +450,9 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
     auto& v = u1;
     hh *= h;                    // hh now = hhh = h^3
     DECL_FE_COPY(FE, x3, r); x3 *= r;         // r^2
-    DECL_FE_COPY(FE, t3, v);
-    t3 += v;                   // t3 = 2*v    (in-place, saves 1 MEMCOPY)
-    x3 -= hh;                 // t4 = t2 - hhh (in-place, saves 1 MEMCOPY)
-    x3 -= t3;                 // x3 = t4 - t3  (in-place, saves 1 MEMCOPY)
+    x3 -= hh;                 // x3 -= hhh (in-place)
+    x3 -= v;                  // x3 -= v   (double-subtract replaces DECL_FE_COPY+add+sub)
+    x3 -= v;                  // x3 -= v   (x3 = r^2 - hhh - 2*v)
     v -= x3;                   // v now = v - x3 (in-place, eliminates temporary t5)
     hh *= z2z2;                // hh now = s1*hhh = t6 (saves 1 MEMCOPY; z2z2 holds s1)
     r *= v;                    // r now = r*(v-x3) = t7 (saves 1 MEMCOPY)
@@ -507,15 +506,14 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     DECL_FE_COPY(FE, v, x1); v *= i;          // x1*i
     i *= h;                     // i now = j = h * i
     DECL_FE_COPY(FE, x3, r); x3 *= r;         // r^2
-    DECL_FE_COPY(FE, t4, v);
-    t4 += v;                    // t4 = 2*v  (in-place, saves 1 MEMCOPY)
-    x3 -= i;                   // t5 = t3 - j  (in-place, saves 1 MEMCOPY)
-    x3 -= t4;                  // x3 = t5 - t4 (in-place, saves 1 MEMCOPY)
+    x3 -= i;                   // x3 -= j  (in-place)
+    x3 -= v;                   // x3 -= v  (double-subtract replaces DECL_FE_COPY+add+sub)
+    x3 -= v;                   // x3 -= v  (x3 = r^2 - j - 2*v)
     v -= x3;                    // v now = v - x3 (in-place, eliminates temporary t6)
     i *= y1;                    // i now = y1 * j = t7 (saves 1 MEMCOPY vs t7 = y1 * j)
     r *= v;                     // r now = y3 = r * (v-x3) (saves 1 MEMCOPY)
-    i += i;                     // t8 = 2*t7 (in-place, saves 1 MEMCOPY)
-    r -= i;                     // y3 = t9 - t8 (in-place, saves 1 MEMCOPY)
+    r -= i;                     // r -= y1*j  (double-subtract replaces self-add+sub)
+    r -= i;                     // r -= y1*j  (y3 = r*(v-x3) - 2*y1*j)
     h *= z1;                    // h now = z3 = z1 * h (saves 1 MEMCOPY vs z3 = z1 * h)
     h += h;                     // z3 = 2*t10 (in-place, saves 1 MEMCOPY)
 
