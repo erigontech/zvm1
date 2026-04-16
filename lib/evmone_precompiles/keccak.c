@@ -133,11 +133,16 @@ static void syscall_keccak_permute(uint64_t state[25])
 /// Loads 64-bit integer from given memory location as little-endian number.
 static inline ALWAYS_INLINE uint64_t load_le(const uint8_t* data)
 {
-    /* memcpy is the best way of expressing the intention. Every compiler will
-       optimize is to single load instruction if the target architecture
-       supports unaligned memory access (GCC and clang even in O0).
-       This is great trick because we are violating C/C++ memory alignment
-       restrictions with no performance penalty. */
+#if defined(__riscv) && __riscv_xlen == 32
+    // On rv32im with -mstrict-align, __builtin_memcpy generates byte-by-byte loads
+    // (~16 insns for 8 bytes). Use word loads when 4-byte aligned (~4 insns).
+    // RISC-V is little-endian so to_le64 is a no-op.
+    if (__builtin_expect(((uintptr_t)data & 3) == 0, 1))
+    {
+        const uint32_t* w = (const uint32_t*)data;
+        return (uint64_t)w[0] | ((uint64_t)w[1] << 32);
+    }
+#endif
     uint64_t word;
     __builtin_memcpy(&word, data, sizeof(word));
     return to_le64(word);

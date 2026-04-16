@@ -554,8 +554,8 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         m *= yy;                // m now = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
         m -= yyyy;             // m -= 4*Y^4
         m -= yyyy;             // Y' = M*(S - X') - 8*Y^4  (double-subtract)
-        DECL_FE_COPY(FE, z3, y1); z3 *= z1;       // Y*Z (uninit copy + mul_assign)
-        z3 += z3;              // Z' = 2*Y*Z        (in-place, saves 1 MEMCOPY)
+        DECL_FE_COPY(FE, z3, y1); z3 += y1;       // 2*Y (non-self add, avoids self-add MEMCOPY)
+        z3 *= z1;              // Z' = 2*Y*Z        (mul_assign)
         return {x3, m, z3};
     }
     else if constexpr (Curve::A == Curve::FIELD_PRIME - 3)
