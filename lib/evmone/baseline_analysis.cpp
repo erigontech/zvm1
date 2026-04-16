@@ -4,6 +4,7 @@
 
 #include "baseline.hpp"
 #include "instructions.hpp"
+#include <cstring>
 #include <memory>
 
 namespace evmone::baseline
@@ -48,8 +49,15 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto total_size = aligned_code_size + bitset_words * sizeof(BitsetSpan::word_type);
 
     auto storage = std::make_unique_for_overwrite<uint8_t[]>(total_size);
+#if defined(AIRBENDER) && defined(__riscv)
+    // Use explicit memcpy/memset — std::ranges::copy and std::fill_n may not dispatch
+    // to our optimized builtins on bare-metal toolchains (riscv-none-elf-gcc).
+    std::memcpy(storage.get(), code.data(), code.size());
+    std::memset(&storage[code.size()], 0, total_size - code.size());
+#else
     std::ranges::copy(code, storage.get());                           // Copy code.
     std::fill_n(&storage[code.size()], total_size - code.size(), 0);  // Pad code and init bitset.
+#endif
 
     const auto bitset_storage =
         new (&storage[aligned_code_size]) BitsetSpan::word_type[bitset_words];
