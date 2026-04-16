@@ -45,20 +45,6 @@ public:
 
     /// Assigns the value to the stack top and moves the stack top pointer up.
     void push(const uint256& value) noexcept { *m_end++ = value; }
-
-#if defined(AIRBENDER) && defined(__riscv)
-    /// Push a zero uint256 onto the stack using CSR MEMCOPY from a static zero buffer.
-    /// Saves ~12 insns vs push({}) which zero-inits a temp then word-copies (~16 insns).
-    void push_zero() noexcept
-    {
-        static const uint256 __attribute__((aligned(32))) z_{};
-        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(m_end);
-        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&z_);
-        register uint32_t a2 asm("x12") = 0x80;
-        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-        ++m_end;
-    }
-#endif
 };
 
 
@@ -1146,18 +1132,7 @@ inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
 
 inline void push0(StackTop stack) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
-    // CSR MEMCOPY from static zero buffer: 4 insns vs ~32 for uint256{} + word copy.
-    // Stack slots are 32-byte aligned. PUSH0 is very common in modern Solidity contracts.
-    // Not const: must be in RAM (.bss), not .rodata (ROM), because CSR requires x11 in RAM.
-    static uint256 __attribute__((aligned(32))) zero_buf_{};
-    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(stack.end());
-    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&zero_buf_);
-    register uint32_t r12 asm("x12") = 0x80;  // MEMCOPY
-    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-#else
     stack.push({});
-#endif
 }
 
 
@@ -1206,11 +1181,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
     static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
     static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
 
-#if defined(AIRBENDER) && defined(__riscv)
-    stack.push_zero();
-#else
     stack.push({});
-#endif
     auto& r = stack.top();
     pos += 1;  // Skip the opcode.
 
