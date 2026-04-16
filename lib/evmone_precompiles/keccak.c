@@ -556,27 +556,77 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
     if (size < 136)
     {
 #if defined(AIRBENDER)
-        // Write directly to the static CSR-aligned buf — avoid state→buf→state copies.
+        // Direct copy to CSR-aligned buf: skip buf_zero_all() + XOR loop since
+        // XOR-with-zero is identity. Copy data via uint32_t when aligned (~2x faster
+        // than load_le + XOR), then zero only the remaining buf words.
         {
             int i;
-            buf_zero_all();
-
-            uint64_t* buf_iter = buf;
+            uint32_t* bufW = (uint32_t*)buf;
             const uint8_t* d = data;
             size_t remaining = size;
-            while (remaining >= 8)
+
+            // Fast path: copy full 4-byte words when data is 4-byte aligned.
+            if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
             {
-                *buf_iter++ ^= load_le(d);
-                d += 8;
-                remaining -= 8;
+                const uint32_t* dW = (const uint32_t*)d;
+                size_t full_words = remaining / 4;
+                for (size_t j = 0; j < full_words; ++j)
+                    bufW[j] = dW[j];
+                d += full_words * 4;
+                bufW += full_words;
+                remaining -= full_words * 4;
             }
+            else
+            {
+                // Unaligned: use load_le for full uint64_t chunks.
+                uint64_t* buf_iter = buf;
+                while (remaining >= 8)
+                {
+                    *buf_iter++ = load_le(d);
+                    d += 8;
+                    remaining -= 8;
+                }
+                bufW = (uint32_t*)buf_iter;
+            }
+
+            // Handle remaining bytes + padding byte 0x01.
             uint64_t last_word = 0;
             uint8_t* lw = (uint8_t*)&last_word;
             for (i = 0; i < (int)remaining; ++i)
                 lw[i] = d[i];
             lw[remaining] = 0x01;
-            *buf_iter ^= to_le64(last_word);
-            buf[16] ^= 0x8000000000000000ULL;
+            {
+                // Write last_word at current position (may be uint32_t-misaligned).
+                uint32_t* lwd = (uint32_t*)&last_word;
+                bufW[0] = lwd[0];
+                bufW[1] = lwd[1];
+                bufW += 2;
+            }
+
+            // Zero remaining buf words up to buf[31] (256 bytes total).
+            // Use CSR MEMCOPY when 32-byte aligned, else word stores.
+            {
+                uint32_t* end = (uint32_t*)buf + 64;  // buf[32] uint64_t = 64 uint32_t
+                while (bufW < end)
+                {
+                    if (((uintptr_t)bufW & 31) == 0 && (end - bufW) >= 8)
+                    {
+                        // Inline CSR MEMCOPY (keccak.c has its own; csr_memcopy32 is in mem_builtins).
+                        register uintptr_t a0_ __asm__("x10") = (uintptr_t)bufW;
+                        register uintptr_t a1_ __asm__("x11") = (uintptr_t)keccak_zeros;
+                        register uint32_t  a2_ __asm__("x12") = 0x80;
+                        __asm__ __volatile__("csrrw x0, 0x7CA, x0"
+                            : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+                        bufW += 8;
+                    }
+                    else
+                    {
+                        *bufW++ = 0;
+                    }
+                }
+            }
+
+            buf[16] |= 0x8000000000000000ULL;
 
             register uint32_t ctrl __asm__("x10") = 0;
             register void*    sptr __asm__("x11") = (void*)buf;
