@@ -600,22 +600,54 @@ inline void iszero(StackTop stack) noexcept
 
 inline void and_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // In-place 32-bit word ops: 32 insns vs ~48 for temp+copy via operator&=.
+    auto& y = stack.pop();
+    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
+    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    xw[0] &= yw[0]; xw[1] &= yw[1]; xw[2] &= yw[2]; xw[3] &= yw[3];
+    xw[4] &= yw[4]; xw[5] &= yw[5]; xw[6] &= yw[6]; xw[7] &= yw[7];
+#else
     stack.top() &= stack.pop();
+#endif
 }
 
 inline void or_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    auto& y = stack.pop();
+    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
+    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    xw[0] |= yw[0]; xw[1] |= yw[1]; xw[2] |= yw[2]; xw[3] |= yw[3];
+    xw[4] |= yw[4]; xw[5] |= yw[5]; xw[6] |= yw[6]; xw[7] |= yw[7];
+#else
     stack.top() |= stack.pop();
+#endif
 }
 
 inline void xor_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    auto& y = stack.pop();
+    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
+    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    xw[0] ^= yw[0]; xw[1] ^= yw[1]; xw[2] ^= yw[2]; xw[3] ^= yw[3];
+    xw[4] ^= yw[4]; xw[5] ^= yw[5]; xw[6] ^= yw[6]; xw[7] ^= yw[7];
+#else
     stack.top() ^= stack.pop();
+#endif
 }
 
 inline void not_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // In-place inversion: 24 insns vs ~32 for operator~ + assign.
+    auto* w = reinterpret_cast<uint32_t*>(&stack.top());
+    w[0] = ~w[0]; w[1] = ~w[1]; w[2] = ~w[2]; w[3] = ~w[3];
+    w[4] = ~w[4]; w[5] = ~w[5]; w[6] = ~w[6]; w[7] = ~w[7];
+#else
     stack.top() = ~stack.top();
+#endif
 }
 
 inline void byte(StackTop stack) noexcept
