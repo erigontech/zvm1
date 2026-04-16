@@ -550,9 +550,10 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         yy -= x3;              // yy now = S - X'   (in-place, eliminates temporary t)
         yyyy += yyyy;           // 2*Y^4             (in-place, saves 1 MEMCOPY)
         yyyy += yyyy;           // 4*Y^4             (in-place, saves 1 MEMCOPY)
-        yyyy += yyyy;           // 8*Y^4             (in-place, saves 1 MEMCOPY)
-        m *= yy;                // m now = Y' = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
-        m -= yyyy;             // Y' = M*(S - X') - 8*Y^4  (in-place, saves 1 MEMCOPY)
+        // 8*Y^4 via double-subtract: m -= 4Y^4 twice, avoids 1 self-add MEMCOPY.
+        m *= yy;                // m now = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
+        m -= yyyy;             // m -= 4*Y^4
+        m -= yyyy;             // Y' = M*(S - X') - 8*Y^4  (double-subtract)
         DECL_FE_COPY(FE, z3, y1); z3 *= z1;       // Y*Z (uninit copy + mul_assign)
         z3 += z3;              // Z' = 2*Y*Z        (in-place, saves 1 MEMCOPY)
         return {x3, m, z3};
