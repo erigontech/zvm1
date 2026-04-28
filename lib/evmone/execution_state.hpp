@@ -123,16 +123,6 @@ public:
     void clear() noexcept { m_size = 0; }
 };
 
-/// Initcode read from Initcode Transaction (EIP-7873).
-struct TransactionInitcode
-{
-    /// Initcode bytes.
-    bytes_view code;
-    /// Result of initcode validation, if it was validated.
-    /// std::nullopt if initcode was not validated yet.
-    std::optional<bool> is_valid;
-};
-
 /// Generic execution state for generic instructions implementations.
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class ExecutionState
