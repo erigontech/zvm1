@@ -6,7 +6,6 @@
 #include "create_address.hpp"
 #include "delegation.hpp"
 #include "instructions.hpp"
-#include "vm.hpp"
 #include <cstddef>
 
 namespace evmone::instr::core
@@ -317,12 +316,6 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
-    // Dense layout: nested frame's stack starts where outer frame's live items end.
-    // state.vm is nullptr only when the Advanced interpreter is in use (it owns its
-    // own stack independently and does not hand off through vm.stack_tail).
-    if (state.vm != nullptr)
-        state.vm->stack_tail = stack.end();
-
     auto result = host_call(state, msg);
 #ifdef EVMONE_WORD_LAYOUT
     state.return_data.take(result);
@@ -459,11 +452,6 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
 #ifdef EVMONE_WORD_LAYOUT
     msg.flags = wl::FLAG_WORD_OUTPUT;  // The REVERT data is read as return data.
 #endif
-
-    // Dense layout: nested frame's stack starts where outer frame's live items end.
-    // state.vm is nullptr only when the Advanced interpreter is in use.
-    if (state.vm != nullptr)
-        state.vm->stack_tail = stack.end();
 
     auto result = host_call(state, msg);
     gas_left -= msg.gas - result.gas_left;

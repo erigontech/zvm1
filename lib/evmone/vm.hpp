@@ -87,36 +87,38 @@ public:
 class VM : public evmc_vm
 {
 public:
-    /// Max EVM call depth (1024) and max EVM stack items per frame (1024).
+    /// EVM call depth limit (1024) and max EVM stack items per frame (1024).
+    /// Up to MAX_DEPTH + 1 frames may execute: depths 0..MAX_DEPTH inclusive,
+    /// because the inter-frame guard rejects only when `state.msg->depth >=
+    /// MAX_DEPTH`, so a frame at depth MAX_DEPTH still runs (it just cannot
+    /// call deeper). This matches `m_execution_states.reserve(MAX_DEPTH + 1)`.
     static constexpr size_t MAX_DEPTH = 1024;
     static constexpr size_t MAX_STACK_PER_FRAME = 1024;
 
+    /// Per-frame stride in bytes. Twice the live stack space so the buffer
+    /// itself plus every frame bottom lands on a 64 KB boundary; the low 16
+    /// bits of any in-frame stack pointer then encode the byte offset from
+    /// that frame's bottom (i.e. the stack height in bytes).
+    static constexpr size_t FRAME_STRIDE =
+        2 * MAX_STACK_PER_FRAME * sizeof(intx::uint256);
+    static_assert(FRAME_STRIDE == 0x10000);
+
     bool cgoto = EVMONE_CGOTO_SUPPORTED;
 
-    /// Shared EVM stack buffer used densely across call frames in a single
-    /// transaction. ~32 MB. Single-threaded per VM: only one execution may be
-    /// active at a time, and the host must not re-enter execute() at depth 0
-    /// while another frame on this VM is still on the call stack.
+    /// Shared EVM stack buffer. ~64 MB. Frame N's bottom is at
+    /// `stack_buffer_storage + N * FRAME_STRIDE`; only the lower
+    /// `MAX_STACK_PER_FRAME * sizeof(uint256)` (= 32 KB) of each 64 KB slot is
+    /// used for items, the upper 32 KB is alignment padding that keeps the
+    /// next frame on a 64 KB boundary. Untouched pages of the padding cost
+    /// nothing on real hosts and nothing on SP1.
     ///
-    /// Storage is a raw POD byte array to skip the value-initialization that
-    /// `intx::uint256` would otherwise force on every slot (its `words_[4]{}`
-    /// member initializer zero-fills, which on SP1 costs ~8M cycles up front
-    /// before any block is even executed).
+    /// Storage is a raw POD byte array so it is left uninitialized at VM
+    /// construction (an `intx::uint256[]` member would otherwise zero-init
+    /// every slot via its `words_[4]{}` member initializer).
     ///
-    /// This buffer could also live in process-wide static storage (BSS) — SP1
-    /// does not charge for untouched BSS pages and the EVM is single-threaded.
-    /// We keep it inline in VM so the 32 MB is reclaimed when the VM is
-    /// destroyed; making it static would bloat the program image by 32 MB for
-    /// no measurable cycle/prover-gas benefit.
-    alignas(sizeof(intx::uint256)) std::byte
-        stack_buffer_storage[MAX_DEPTH * MAX_STACK_PER_FRAME * sizeof(intx::uint256)];
-
-    /// Typed view of the buffer.
-    intx::uint256* stack_buffer =
-        reinterpret_cast<intx::uint256*>(stack_buffer_storage);
-
-    /// Bottom slot for the next frame to be entered.
-    intx::uint256* stack_tail = stack_buffer;
+    /// Single-threaded per VM.
+    alignas(FRAME_STRIDE) std::byte
+        stack_buffer_storage[(MAX_DEPTH + 1) * FRAME_STRIDE];
 
 private:
     std::vector<ExecutionState> m_execution_states;
@@ -126,8 +128,8 @@ private:
 public:
     VM() noexcept;
 
-    // stack_buffer and ExecutionState::vm both contain pointers into this
-    // object's storage; moving would invalidate them.
+    // ExecutionState::stack_bottom points into this object's storage;
+    // moving the VM would invalidate the pointer.
     VM(const VM&) = delete;
     VM(VM&&) = delete;
     VM& operator=(const VM&) = delete;

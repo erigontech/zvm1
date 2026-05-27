@@ -24,7 +24,6 @@ namespace baseline
 {
 class CodeAnalysis;
 }
-class VM;
 
 using evmc::bytes;
 using evmc::bytes_view;
@@ -252,13 +251,9 @@ public:
     /// The frame's state-gas counters (EIP-8037).
     StateGas state_gas;
 
-    /// Back-pointer to the owning VM. Set by the executor entry (e.g. baseline::execute).
-    /// Non-owning, never null during dispatch.
-    VM* vm = nullptr;
-
-    /// Bottom of this frame's EVM stack. Points into VM::stack_buffer at the
-    /// position where the parent frame's live stack ended (dense layout).
-    /// Set by the executor entry right after reset(); never null during dispatch.
+    /// Bottom of this frame's EVM stack. Points into VM::stack_buffer_storage
+    /// at offset `msg.depth * VM::FRAME_STRIDE`. Set by the executor entry
+    /// right after reset(); never null during dispatch.
     uint256* stack_bottom = nullptr;
 
     ExecutionState() noexcept = default;
@@ -297,10 +292,9 @@ public:
         // else reads m_tx: resetting that field invalidates it, where zeroing all 240 bytes was
         // a memset per message.
         m_tx.block_timestamp = 0;
-        // The executor entry MUST set these before dispatch; cleared here so
-        // any caller that calls reset() without re-wiring fails fast on a
-        // nullptr dereference rather than dispatching with a stale value.
-        vm = nullptr;
+        // The executor entry MUST set stack_bottom before dispatch; cleared
+        // here so any caller that forgets fails fast on a nullptr dereference
+        // rather than dispatching with a stale value.
         stack_bottom = nullptr;
     }
 

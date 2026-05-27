@@ -2107,17 +2107,10 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
     auto& state = vm.get_execution_state(static_cast<size_t>(msg.depth));
     state.reset(msg, rev, host, ctx, code);
 
-    // Wire up the shared stack buffer. At depth 0 (tx root call) the tail
-    // is rewound; deeper frames pick up the position the parent left at the
-    // call site (set by call_impl / create_impl before host.call(msg)).
-    state.vm = &vm;
-    if (msg.depth == 0)
-        vm.stack_tail = vm.stack_buffer;
-    state.stack_bottom = vm.stack_tail;
-    // Buffer is sized for the worst-case dense layout (1024 frames * 1024 slots).
-    // This guards against accidental over-advance of the tail by a future opcode.
-    assert(state.stack_bottom + StackSpace::limit <=
-           vm.stack_buffer + VM::MAX_DEPTH * VM::MAX_STACK_PER_FRAME);
+    // Frame N's bottom lives at a 64 KB stride within the shared buffer.
+    // No tail-tracking, no back-pointer: layout is a pure function of depth.
+    state.stack_bottom = reinterpret_cast<uint256*>(
+        vm.stack_buffer_storage + static_cast<size_t>(msg.depth) * VM::FRAME_STRIDE);
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 
