@@ -33,30 +33,41 @@ static_assert(sizeof(BlockInfo) == 8);
 
 
 /// The execution state specialized for the Advanced interpreter.
+///
+/// Advanced interpreter does not go through VM::get_execution_state and does not
+/// share the VM's stack buffer. It owns its own stack storage on the heap so that
+/// move construction/assignment transfers stack ownership cleanly (the StackTop
+/// pointer remains valid after the move).
 struct AdvancedExecutionState : ExecutionState
 {
+    /// Heap-owned stack storage for this Advanced frame.
+    std::unique_ptr<intx::uint256[]> own_stack =
+        std::make_unique<intx::uint256[]>(StackSpace::limit);
+
     int64_t gas_left = 0;
 
     /// Pointer to the stack top.
-    StackTop stack = stack_space.bottom();
+    StackTop stack{own_stack.get()};
 
     /// The gas cost of the current block.
     ///
     /// This is only needed to correctly calculate the "current gas left" value.
     uint32_t current_block_cost = 0;
 
-    AdvancedExecutionState() noexcept = default;
+    AdvancedExecutionState() noexcept { stack_bottom = own_stack.get(); }
 
     AdvancedExecutionState(const evmc_message& message, evmc_revision revision,
         const evmc_host_interface& host_interface, evmc_host_context* host_ctx,
         bytes_view _code) noexcept
       : ExecutionState{message, revision, host_interface, host_ctx, _code}, gas_left{message.gas}
-    {}
+    {
+        stack_bottom = own_stack.get();
+    }
 
     /// Computes the current EVM stack height.
     [[nodiscard]] int stack_size() noexcept
     {
-        return static_cast<int>(stack.end() - stack_space.bottom());
+        return static_cast<int>(stack.end() - stack_bottom);
     }
 
     /// Adjust the EVM stack height by given change.
@@ -76,7 +87,8 @@ struct AdvancedExecutionState : ExecutionState
     {
         ExecutionState::reset(message, revision, host_interface, host_ctx, _code);
         gas_left = message.gas;
-        stack = stack_space.bottom();
+        stack_bottom = own_stack.get();
+        stack = own_stack.get();
         analysis.advanced = nullptr;  // For consistency with previous behavior.
         current_block_cost = 0;
     }

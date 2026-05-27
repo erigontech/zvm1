@@ -24,34 +24,20 @@ namespace baseline
 {
 class CodeAnalysis;
 }
+class VM;
 
 using evmc::bytes;
 using evmc::bytes_view;
 using intx::uint256;
 
 
-/// Provides memory for EVM stack.
-class StackSpace
+/// Constants describing the EVM stack. Storage now lives on the owning VM
+/// (see VM::stack_buffer); this struct keeps the limit constant referenced by
+/// stack-overflow checks throughout the codebase.
+struct StackSpace
 {
-    struct Storage
-    {
-        /// The maximum number of EVM stack items.
-        static constexpr auto limit = 1024;
-
-        /// Stack space items are aligned to 256 bits for better packing in cache lines.
-        static constexpr auto alignment = sizeof(uint256);
-
-        alignas(alignment) uint256 items[limit];
-    };
-
-    /// The storage allocated for maximum possible number of items.
-    std::unique_ptr<Storage> m_stack_space = std::make_unique<Storage>();
-
-public:
-    static constexpr auto limit = Storage::limit;
-
-    /// Returns the pointer to the "bottom", i.e. below the stack space.
-    [[nodiscard]] uint256* bottom() noexcept { return &m_stack_space->items[0]; }
+    /// The maximum number of EVM stack items per call frame.
+    static constexpr auto limit = 1024;
 };
 
 
@@ -266,10 +252,14 @@ public:
     /// The frame's state-gas counters (EIP-8037).
     StateGas state_gas;
 
-    /// Stack space allocation.
-    ///
-    /// This is the last field to make other fields' offsets of reasonable values.
-    StackSpace stack_space;
+    /// Back-pointer to the owning VM. Set by the executor entry (e.g. baseline::execute).
+    /// Non-owning, never null during dispatch.
+    VM* vm = nullptr;
+
+    /// Bottom of this frame's EVM stack. Points into VM::stack_buffer at the
+    /// position where the parent frame's live stack ended (dense layout).
+    /// Set by the executor entry right after reset(); never null during dispatch.
+    uint256* stack_bottom = nullptr;
 
     ExecutionState() noexcept = default;
 
@@ -307,6 +297,11 @@ public:
         // else reads m_tx: resetting that field invalidates it, where zeroing all 240 bytes was
         // a memset per message.
         m_tx.block_timestamp = 0;
+        // The executor entry MUST set these before dispatch; cleared here so
+        // any caller that calls reset() without re-wiring fails fast on a
+        // nullptr dereference rather than dispatching with a stale value.
+        vm = nullptr;
+        stack_bottom = nullptr;
     }
 
     [[nodiscard]] bool in_static_mode() const { return (msg->flags & EVMC_STATIC) != 0; }

@@ -2384,7 +2384,7 @@ inline code_iterator dupn(StackTop stack, ExecutionState& state, code_iterator p
     }
 
     // Stack overflow is checked by check_requirements() (stack_height_change=+1).
-    const auto stack_size = stack.end() - state.stack_space.bottom();
+    const auto stack_size = stack.end() - state.stack_bottom;
     if (*n > stack_size)
     {
         state.status = EVMC_STACK_UNDERFLOW;
@@ -2404,7 +2404,7 @@ inline code_iterator swapn(StackTop stack, ExecutionState& state, code_iterator 
         return nullptr;
     }
 
-    if (const auto stack_size = stack.end() - state.stack_space.bottom(); *n >= stack_size)
+    if (const auto stack_size = stack.end() - state.stack_bottom; *n >= stack_size)
     {
         state.status = EVMC_STACK_UNDERFLOW;
         return nullptr;
@@ -2424,7 +2424,7 @@ inline code_iterator exchange(StackTop stack, ExecutionState& state, code_iterat
     }
 
     const auto [n, m] = *decoded;
-    if (const auto stack_size = stack.end() - state.stack_space.bottom(); m >= stack_size)
+    if (const auto stack_size = stack.end() - state.stack_bottom; m >= stack_size)
     {
         state.status = EVMC_STACK_UNDERFLOW;
         return nullptr;

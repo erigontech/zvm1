@@ -11,6 +11,7 @@
 #include "vm.hpp"
 
 #include <bit>
+#include <cassert>
 #include <memory>
 
 #ifdef NDEBUG
@@ -1384,7 +1385,7 @@ template <bool TracingEnabled>
 int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas,
     const uint8_t* code, Tracer* tracer = nullptr) noexcept
 {
-    const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_bottom = state.stack_bottom;
     const auto stack_limit = stack_limit_of(stack_bottom);
     const auto jb = jump_base(code, state);
     const auto bottom1 = stack_floor_of(stack_bottom);
@@ -1932,7 +1933,7 @@ int64_t dispatch_cgoto(
 #define CGOTO(OP) cgoto_table[OP]
 #endif
 
-    const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_bottom = state.stack_bottom;
     const auto stack_limit = stack_limit_of(stack_bottom);
     auto jb = jump_base(code, state);
 #if EVMONE_RV32_DISPATCH
@@ -2105,6 +2106,18 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
 
     auto& state = vm.get_execution_state(static_cast<size_t>(msg.depth));
     state.reset(msg, rev, host, ctx, code);
+
+    // Wire up the shared stack buffer. At depth 0 (tx root call) the tail
+    // is rewound; deeper frames pick up the position the parent left at the
+    // call site (set by call_impl / create_impl before host.call(msg)).
+    state.vm = &vm;
+    if (msg.depth == 0)
+        vm.stack_tail = vm.stack_buffer;
+    state.stack_bottom = vm.stack_tail;
+    // Buffer is sized for the worst-case dense layout (1024 frames * 1024 slots).
+    // This guards against accidental over-advance of the tail by a future opcode.
+    assert(state.stack_bottom + StackSpace::limit <=
+           vm.stack_buffer + VM::MAX_DEPTH * VM::MAX_STACK_PER_FRAME);
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 

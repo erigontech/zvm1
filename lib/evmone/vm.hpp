@@ -9,6 +9,7 @@
 #include "tracing.hpp"
 #include <evmc/evmc.h>
 
+#include <cstddef>
 #include <list>
 #include <unordered_map>
 #include <vector>
@@ -86,7 +87,36 @@ public:
 class VM : public evmc_vm
 {
 public:
+    /// Max EVM call depth (1024) and max EVM stack items per frame (1024).
+    static constexpr size_t MAX_DEPTH = 1024;
+    static constexpr size_t MAX_STACK_PER_FRAME = 1024;
+
     bool cgoto = EVMONE_CGOTO_SUPPORTED;
+
+    /// Shared EVM stack buffer used densely across call frames in a single
+    /// transaction. ~32 MB. Single-threaded per VM: only one execution may be
+    /// active at a time, and the host must not re-enter execute() at depth 0
+    /// while another frame on this VM is still on the call stack.
+    ///
+    /// Storage is a raw POD byte array to skip the value-initialization that
+    /// `intx::uint256` would otherwise force on every slot (its `words_[4]{}`
+    /// member initializer zero-fills, which on SP1 costs ~8M cycles up front
+    /// before any block is even executed).
+    ///
+    /// This buffer could also live in process-wide static storage (BSS) — SP1
+    /// does not charge for untouched BSS pages and the EVM is single-threaded.
+    /// We keep it inline in VM so the 32 MB is reclaimed when the VM is
+    /// destroyed; making it static would bloat the program image by 32 MB for
+    /// no measurable cycle/prover-gas benefit.
+    alignas(sizeof(intx::uint256)) std::byte
+        stack_buffer_storage[MAX_DEPTH * MAX_STACK_PER_FRAME * sizeof(intx::uint256)];
+
+    /// Typed view of the buffer.
+    intx::uint256* stack_buffer =
+        reinterpret_cast<intx::uint256*>(stack_buffer_storage);
+
+    /// Bottom slot for the next frame to be entered.
+    intx::uint256* stack_tail = stack_buffer;
 
 private:
     std::vector<ExecutionState> m_execution_states;
@@ -95,6 +125,13 @@ private:
 
 public:
     VM() noexcept;
+
+    // stack_buffer and ExecutionState::vm both contain pointers into this
+    // object's storage; moving would invalidate them.
+    VM(const VM&) = delete;
+    VM(VM&&) = delete;
+    VM& operator=(const VM&) = delete;
+    VM& operator=(VM&&) = delete;
 
     /// Whether execute_cached_code() applies: only the Baseline interpreter caches analyses.
     [[nodiscard]] bool has_cached_execution() const noexcept;
