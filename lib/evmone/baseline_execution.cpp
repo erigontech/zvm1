@@ -28,6 +28,21 @@ namespace evmone::baseline
 {
 namespace
 {
+/// The gas charged for @p Op before its implementation runs: the instruction's own cost, except
+/// where the implementation takes over. JUMP also pays for the JUMPDEST it lands on, which is
+/// unconditional. JUMPI cannot know until the condition is popped, so it charges nothing here --
+/// a const cost of zero compiles the check below away, leaving one check on either path.
+template <Opcode Op>
+inline constexpr int16_t DISPATCH_GAS_COST = instr::gas_costs[EVMC_FRONTIER][Op];
+template <>
+inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMP> =
+    instr::gas_costs[EVMC_FRONTIER][OP_JUMP] + instr::core::JUMPDEST_GAS;
+template <>
+inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMPI> = 0;
+
+static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP_JUMPI),
+    "the jump instructions must charge a compile-time constant gas cost");
+
 /// Checks instruction requirements before execution.
 ///
 /// This checks:
@@ -55,7 +70,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
         "undefined instructions must not be handled by check_requirements()");
 
-    auto gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
+    auto gas_cost = DISPATCH_GAS_COST<Op>;  // Init assuming const cost.
     if constexpr (!instr::has_const_gas_cost(Op))
     {
         gas_cost = cost_table[Op];  // If not, load the cost from the current revision cost table.
@@ -87,7 +102,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
             return EVMC_STACK_UNDERFLOW;
     }
 
-    if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
+    if constexpr (!instr::has_const_gas_cost(Op) || DISPATCH_GAS_COST<Op> > 0)
     {
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
@@ -139,6 +154,13 @@ struct Position
     int64_t& /*gas*/, ExecutionState& state) noexcept
 {
     return instr_fn(pos.stack_end, state, pos.code_it);
+}
+
+[[release_inline]] inline code_iterator invoke(
+    code_iterator (*instr_fn)(StackTop, ExecutionState&, int64_t&, code_iterator) noexcept,
+    Position pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    return instr_fn(pos.stack_end, state, gas, pos.code_it);
 }
 
 [[release_inline]] inline code_iterator invoke(

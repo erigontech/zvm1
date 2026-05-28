@@ -814,6 +814,12 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 
 Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 
+/// The cost of the JUMPDEST a taken jump lands on and therefore never dispatches.
+/// JUMP pays it in its dispatch cost, JUMPI inline once the branch is known taken.
+inline constexpr auto JUMPDEST_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPDEST];
+static_assert(instr::has_const_gas_cost(OP_JUMPDEST),
+    "skipping JUMPDEST assumes its cost is the same in every revision");
+
 /// Internal jump implementation for JUMP/JUMPI instructions.
 inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexcept
 {
@@ -824,7 +830,7 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
         return nullptr;
     }
 
-    return &state.analysis.baseline->code()[static_cast<size_t>(dst[0])];
+    return state.analysis.baseline->code().data() + static_cast<size_t>(dst[0]) + 1;
 }
 
 /// JUMP instruction implementation using baseline::CodeAnalysis.
@@ -834,11 +840,30 @@ inline code_iterator jump(StackTop stack, ExecutionState& state, code_iterator /
 }
 
 /// JUMPI instruction implementation using baseline::CodeAnalysis.
-inline code_iterator jumpi(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
+inline code_iterator jumpi(
+    StackTop stack, ExecutionState& state, int64_t& gas_left, code_iterator pos) noexcept
 {
+    static constexpr auto BASE_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+
     const auto& dst = stack.pop();
     const auto& cond = stack.pop();
-    return cond ? jump_impl(state, dst) : pos + 1;
+
+    if (!cond)
+    {
+        if ((gas_left -= BASE_GAS) < 0) [[unlikely]]
+        {
+            state.status = EVMC_OUT_OF_GAS;
+            return nullptr;
+        }
+        return pos + 1;
+    }
+
+    if ((gas_left -= BASE_GAS + JUMPDEST_GAS) < 0) [[unlikely]]
+    {
+        state.status = EVMC_OUT_OF_GAS;
+        return nullptr;
+    }
+    return jump_impl(state, dst);
 }
 
 inline code_iterator pc(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
