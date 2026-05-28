@@ -815,7 +815,11 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 
 /// Internal jump implementation for JUMP/JUMPI instructions.
-inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexcept
+///
+/// The bitmap check proves the byte at dst is JUMPDEST, a 1-gas no-op, so resume at dst + 1 and
+/// charge its gas here. The code padding keeps dst + 1 inside the executable buffer.
+inline code_iterator jump_impl(
+    ExecutionState& state, int64_t& gas_left, const uint256& dst) noexcept
 {
     const auto hi_part_is_nonzero = (dst[3] | dst[2] | dst[1]) != 0;
     if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(dst[0])) [[unlikely]]
@@ -824,21 +828,30 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
         return nullptr;
     }
 
-    return &state.analysis.baseline->code()[static_cast<size_t>(dst[0])];
+    if (--gas_left < 0) [[unlikely]]
+    {
+        state.status = EVMC_OUT_OF_GAS;
+        return nullptr;
+    }
+
+    // .data() rather than operator[]: dst + 1 may be exactly one past the code view.
+    return state.analysis.baseline->code().data() + static_cast<size_t>(dst[0]) + 1;
 }
 
 /// JUMP instruction implementation using baseline::CodeAnalysis.
-inline code_iterator jump(StackTop stack, ExecutionState& state, code_iterator /*pos*/) noexcept
+inline code_iterator jump(
+    StackTop stack, ExecutionState& state, int64_t& gas_left, code_iterator /*pos*/) noexcept
 {
-    return jump_impl(state, stack.pop());
+    return jump_impl(state, gas_left, stack.pop());
 }
 
 /// JUMPI instruction implementation using baseline::CodeAnalysis.
-inline code_iterator jumpi(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
+inline code_iterator jumpi(
+    StackTop stack, ExecutionState& state, int64_t& gas_left, code_iterator pos) noexcept
 {
     const auto& dst = stack.pop();
     const auto& cond = stack.pop();
-    return cond ? jump_impl(state, dst) : pos + 1;
+    return cond ? jump_impl(state, gas_left, dst) : pos + 1;
 }
 
 inline code_iterator pc(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
