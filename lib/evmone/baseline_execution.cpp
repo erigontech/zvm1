@@ -12,7 +12,6 @@
 
 #include <bit>
 #include <cassert>
-#include <cstdint>
 #include <memory>
 
 #ifdef NDEBUG
@@ -91,10 +90,6 @@ static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP
     return floor;
 }
 
-/// Stack height checks exploit the 64 KB-aligned per-frame layout: the low 16
-/// bits of `stack_top` encode the byte offset from the current frame's bottom,
-/// so the height (in elements) is `(stack_top & 0xFFFF) >> 5`.
-///
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
@@ -105,9 +100,8 @@ static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP
 ///          or EVMC_SUCCESS if everything is fine.
 template <Opcode Op>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
-    const uint256* stack_top, [[maybe_unused]] const uint256* stack_bottom,
-    [[maybe_unused]] const uint256* bottom1, [[maybe_unused]] const uint256* bottom2,
-    [[maybe_unused]] const uint256* stack_limit) noexcept
+    const uint256* stack_top, const uint256* stack_bottom, const uint256* bottom1,
+    const uint256* bottom2, const uint256* stack_limit) noexcept
 {
     static_assert(
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
@@ -132,70 +126,27 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         }
     }
 
-    // Stack height in BYTES within the current frame, picked up from the low
-    // 16 bits of any in-frame stack pointer (the buffer is 64 KB-aligned and
-    // each frame's bottom lands on a 64 KB boundary, so FRAME_STRIDE - 1 is
-    // exactly 0xFFFF). Bytes (not elements) skips an extra shift the compiler
-    // would otherwise emit. `>=` (rather than `==`) on overflow lets the
-    // compiler fold the test into a sign-bit check under the invariant
-    // `stack_height_bytes ∈ [0, MAX_STACK_PER_FRAME * sizeof(uint256)]`.
-    const auto stack_height_bytes = static_cast<size_t>(
-        reinterpret_cast<std::uintptr_t>(stack_top) & (VM::FRAME_STRIDE - 1));
-
-    if constexpr (instr::traits[Op].stack_height_change > 0 &&
-                  instr::traits[Op].stack_height_required > 0)
-    {
-        // Combined range check for opcodes with both overflow and underflow
-        // checks (only DUP1..DUP16): pre-op height must be in [required, 1023].
-        // Place height_bytes into bits 48..63 of a 64-bit value and treat as
-        // signed: bit 63 set iff overflow (height == 1024); positive values
-        // < threshold iff underflow. A single signed `blt` catches both.
-        // Returns OVERFLOW for both since EVMC semantics fail the transaction
-        // either way.
-        const auto shifted = static_cast<std::int64_t>(
-            static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(stack_top)) << (64 - 16));
-        constexpr std::int64_t threshold =
-            static_cast<std::int64_t>(instr::traits[Op].stack_height_required) *
-            static_cast<std::int64_t>(sizeof(uint256)) * (1LL << 48);
-        if (INTX_UNLIKELY(shifted < threshold))
-            return EVMC_STACK_OVERFLOW;
-    }
-    else if constexpr (instr::traits[Op].stack_height_change > 0)
+    // Check stack requirements first. This order is not required,
+    // but it is nicer because a complete gas check may need to inspect operands.
+    if constexpr (instr::traits[Op].stack_height_change > 0)
     {
         static_assert(instr::traits[Op].stack_height_change == 1,
             "unexpected instruction with multiple results");
-        if (INTX_UNLIKELY(stack_height_bytes >= VM::MAX_STACK_PER_FRAME * sizeof(uint256)))
+        if (INTX_UNLIKELY(stack_top == stack_limit))
             return EVMC_STACK_OVERFLOW;
     }
-    if constexpr (instr::traits[Op].stack_height_change <= 0 &&
-                  instr::traits[Op].stack_height_required == 1)
+    if constexpr (instr::traits[Op].stack_height_required > 0)
     {
-        // Stack pointers are 32-byte aligned, so `height_bytes == 0` ⇔ low
-        // 16 bits of `stack_top` are all zero. Place those into the high half
-        // of a 64-bit value and test with `beqz` — 2 ops.
-        const auto low16_in_high =
-            static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(stack_top)) << (64 - 16);
-        if (INTX_UNLIKELY(low16_in_high == 0))
-            return EVMC_STACK_UNDERFLOW;
-    }
-    else if constexpr (instr::traits[Op].stack_height_change <= 0 &&
-                       instr::traits[Op].stack_height_required > 1)
-    {
-        // Lookahead trick: compute `stack_top - required` (in pointer-arith =
-        // -required*32 bytes). If pre-op height < required, the subtraction
-        // wraps within the low 16 bits — borrow propagates into bit 16,
-        // leaving bit 15 of the result's low 16 set. Detect with the same
-        // sign-bit-on-shifted-low-16 form used for overflow:
-        //   slli ...,48 ; bltz
-        // This is 3 ops uniformly for any required (pow2 or non-pow2),
-        // beating the 4-op `slli ; srli ; li ; bltu` shape for non-pow2.
-        // For ops where required == -change (POP, MSTORE, LOG3, LOG4, RETURN,
-        // REVERT, MCOPY, CREATE2, CALL, CALLCODE, …) the subtracted pointer
-        // equals the dispatch's `new_stack_top` and the compiler CSEs.
-        const auto sub_ptr = stack_top - instr::traits[Op].stack_height_required;
-        const auto sub_low16_in_high =
-            static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(sub_ptr)) << (64 - 16);
-        if (INTX_UNLIKELY(static_cast<std::int64_t>(sub_low16_in_high) < 0))
+        // Check stack underflow using pointer comparison <= (better optimization).
+        static constexpr auto min_offset = instr::traits[Op].stack_height_required - 1;
+        const uint256* floor;
+        if constexpr (min_offset == 1)
+            floor = bottom1;
+        else if constexpr (min_offset == 2)
+            floor = bottom2;
+        else
+            floor = stack_bottom + min_offset;
+        if (INTX_UNLIKELY(stack_top <= floor))
             return EVMC_STACK_UNDERFLOW;
     }
 

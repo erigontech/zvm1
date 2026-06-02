@@ -88,36 +88,27 @@ class VM : public evmc_vm
 {
 public:
     /// EVM call depth limit (1024) and max EVM stack items per frame (1024).
-    /// Up to MAX_DEPTH + 1 frames may execute: depths 0..MAX_DEPTH inclusive,
-    /// because the inter-frame guard rejects only when `state.msg->depth >=
-    /// MAX_DEPTH`, so a frame at depth MAX_DEPTH still runs (it just cannot
-    /// call deeper). This matches `m_execution_states.reserve(MAX_DEPTH + 1)`.
+    /// The buffer covers MAX_DEPTH + 1 frame slots at depths 0..MAX_DEPTH: a frame at
+    /// depth MAX_DEPTH still runs (it just cannot call deeper).
     static constexpr size_t MAX_DEPTH = 1024;
     static constexpr size_t MAX_STACK_PER_FRAME = 1024;
 
-    /// Per-frame stride in bytes. Twice the live stack space so the buffer
-    /// itself plus every frame bottom lands on a 64 KB boundary; the low 16
-    /// bits of any in-frame stack pointer then encode the byte offset from
-    /// that frame's bottom (i.e. the stack height in bytes).
-    static constexpr size_t FRAME_STRIDE =
-        2 * MAX_STACK_PER_FRAME * sizeof(intx::uint256);
-    static_assert(FRAME_STRIDE == 0x10000);
+    /// Per-frame stride in bytes — exactly the live stack space.
+    /// Frame N's bottom is at `stack_buffer_storage + N * FRAME_STRIDE`.
+    static constexpr size_t FRAME_STRIDE = MAX_STACK_PER_FRAME * sizeof(intx::uint256);
+    static_assert(FRAME_STRIDE == 0x8000);
 
     bool cgoto = EVMONE_CGOTO_SUPPORTED;
 
-    /// Shared EVM stack buffer. ~64 MB. Frame N's bottom is at
-    /// `stack_buffer_storage + N * FRAME_STRIDE`; only the lower
-    /// `MAX_STACK_PER_FRAME * sizeof(uint256)` (= 32 KB) of each 64 KB slot is
-    /// used for items, the upper 32 KB is alignment padding that keeps the
-    /// next frame on a 64 KB boundary. Untouched pages of the padding cost
-    /// nothing on real hosts and nothing on SP1.
+    /// Shared EVM stack buffer. ~32 MiB ((MAX_DEPTH + 1) * 32 KB).
+    /// Frame N's bottom is at `stack_buffer_storage + N * FRAME_STRIDE`.
     ///
     /// Storage is a raw POD byte array so it is left uninitialized at VM
     /// construction (an `intx::uint256[]` member would otherwise zero-init
     /// every slot via its `words_[4]{}` member initializer).
     ///
     /// Single-threaded per VM.
-    alignas(FRAME_STRIDE) std::byte
+    alignas(sizeof(intx::uint256)) std::byte
         stack_buffer_storage[(MAX_DEPTH + 1) * FRAME_STRIDE];
 
 private:
