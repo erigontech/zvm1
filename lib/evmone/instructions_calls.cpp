@@ -6,6 +6,7 @@
 #include "create_address.hpp"
 #include "delegation.hpp"
 #include "instructions.hpp"
+#include "vm.hpp"
 #include <cstddef>
 
 namespace evmone::instr::core
@@ -316,6 +317,17 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
+    // Place the sub-frame's stack right after this frame's live EVM memory
+    // (or right after this frame's stack if memory has already spilled to
+    // the heap, in which case the buffer's memory region is free again).
+    // state.vm is nullptr only when the Advanced interpreter is in use.
+    if (state.vm != nullptr)
+    {
+        state.vm->stack_tail = state.memory.is_borrowed() ?
+            reinterpret_cast<std::byte*>(state.memory.borrowed_end()) :
+            reinterpret_cast<std::byte*>(state.stack_bottom) + VM::FRAME_STRIDE;
+    }
+
     auto result = host_call(state, msg);
 #ifdef EVMONE_WORD_LAYOUT
     state.return_data.take(result);
@@ -452,6 +464,16 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
 #ifdef EVMONE_WORD_LAYOUT
     msg.flags = wl::FLAG_WORD_OUTPUT;  // The REVERT data is read as return data.
 #endif
+
+    // Place the sub-frame's stack right after this frame's live EVM memory
+    // (or right after this frame's stack if memory has spilled to the heap).
+    // state.vm is nullptr only when the Advanced interpreter is in use.
+    if (state.vm != nullptr)
+    {
+        state.vm->stack_tail = state.memory.is_borrowed() ?
+            reinterpret_cast<std::byte*>(state.memory.borrowed_end()) :
+            reinterpret_cast<std::byte*>(state.stack_bottom) + VM::FRAME_STRIDE;
+    }
 
     auto result = host_call(state, msg);
     gas_left -= msg.gas - result.gas_left;

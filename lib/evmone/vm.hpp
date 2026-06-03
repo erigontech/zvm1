@@ -100,8 +100,19 @@ public:
 
     bool cgoto = EVMONE_CGOTO_SUPPORTED;
 
-    /// Shared EVM stack buffer. ~32 MiB ((MAX_DEPTH + 1) * 32 KB).
-    /// Frame N's bottom is at `stack_buffer_storage + N * FRAME_STRIDE`.
+    /// The part of the buffer beyond the stack slots of all depths, lent to the frames'
+    /// EVM memories.
+    static constexpr size_t MEMORY_HEADROOM = 4 * 1024 * 1024;
+
+    /// Shared EVM stack buffer. ~36 MiB ((MAX_DEPTH + 1) * 32 KB + MEMORY_HEADROOM).
+    ///
+    /// Frames are packed densely starting at `stack_buffer_storage`. Each
+    /// frame's bottom is handed out as the current `stack_tail` — see
+    /// `baseline::execute` for entry and `call_impl`/`create_impl` for the
+    /// pre-call update. The spare space beyond a frame's stack is lent to
+    /// that frame's EVM `Memory` as its initial borrowed backing, up to the
+    /// stack slots kept free for the deeper frames, so that the frame at
+    /// any depth up to MAX_DEPTH has its whole stack inside the buffer.
     ///
     /// Storage is a raw POD byte array so it is left uninitialized at VM
     /// construction (an `intx::uint256[]` member would otherwise zero-init
@@ -109,7 +120,19 @@ public:
     ///
     /// Single-threaded per VM.
     alignas(sizeof(intx::uint256)) std::byte
-        stack_buffer_storage[(MAX_DEPTH + 1) * FRAME_STRIDE];
+        stack_buffer_storage[(MAX_DEPTH + 1) * FRAME_STRIDE + MEMORY_HEADROOM];
+
+    /// Next free byte in `stack_buffer_storage`. The next frame to be
+    /// entered starts its stack at this address. Reset to the buffer base
+    /// on depth-0 entry; updated by `call_impl`/`create_impl` before each
+    /// nested call to skip past the parent's stack + live EVM memory.
+    std::byte* stack_tail = stack_buffer_storage;
+
+    /// One past the last byte of the shared buffer.
+    [[nodiscard]] std::byte* stack_buffer_end() noexcept
+    {
+        return stack_buffer_storage + sizeof(stack_buffer_storage);
+    }
 
 private:
     std::vector<ExecutionState> m_execution_states;

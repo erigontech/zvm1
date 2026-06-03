@@ -25,6 +25,8 @@ namespace baseline
 class CodeAnalysis;
 }
 
+class VM;
+
 using evmc::bytes;
 using evmc::bytes_view;
 using intx::uint256;
@@ -45,20 +47,21 @@ struct StackSpace
 /// With EVMONE_WORD_LAYOUT the byte of EVM address a is at index a ^ 3 and the pointers into it
 /// are W pointers, see word_layout.hpp. The allocation is 8-byte aligned, which the layout needs.
 ///
-/// The implementations uses initial allocation of 4k and then grows capacity with 2x factor.
-/// Some benchmarks have been done to confirm 4k is ok-ish value.
+/// On each frame entry the executor calls `set_borrowed()` with a pointer
+/// into VM::stack_buffer_storage (the spare space after this frame's stack)
+/// — initial capacity is everything between the frame's stack top and the
+/// end of the shared buffer. If `grow()` would exceed that, the data is
+/// copied to a heap buffer once and subsequent grows `realloc()` it.
+/// A Memory not given a borrowed buffer (or given one smaller than a page)
+/// uses a heap page, so the capacity is never below page_size.
 class Memory
 {
     /// The size of allocation "page".
     static constexpr size_t page_size = 4 * 1024;
 
-    struct FreeDeleter
-    {
-        void operator()(uint8_t* p) const noexcept { std::free(p); }
-    };
-
-    /// Owned pointer to allocated memory.
-    std::unique_ptr<uint8_t[], FreeDeleter> m_data;
+    /// Pointer to the active backing storage. Either borrowed (a slice of
+    /// VM::stack_buffer_storage) or heap-owned (malloc-allocated).
+    uint8_t* m_data = nullptr;
 
     /// The "virtual" size of the memory.
     size_t m_size = 0;
@@ -67,8 +70,11 @@ class Memory
     /// empty (see limit32()). Written only together with m_size, by set_size().
     size_t m_lim = 0;
 
-    /// The size of allocated memory. The initialization value is the initial capacity.
-    size_t m_capacity = page_size;
+    /// The size of the active backing storage.
+    size_t m_capacity = 0;
+
+    /// True when `m_data` was allocated on the heap and must be freed.
+    bool m_heap_owned = false;
 
     [[noreturn, gnu::cold]] static void handle_out_of_memory() noexcept { std::terminate(); }
 
@@ -99,24 +105,111 @@ class Memory
 #endif
     }
 
-    void allocate_capacity() noexcept
+    /// Move the contents to a heap buffer of `new_capacity`. Called when growing
+    /// past the borrowed capacity, or when growing an existing heap buffer.
+    void allocate_heap(size_t new_capacity) noexcept
     {
-        m_data.reset(static_cast<uint8_t*>(std::realloc(m_data.release(), m_capacity)));
-        if (!m_data) [[unlikely]]
+        if (m_heap_owned)
+        {
+            m_data = static_cast<uint8_t*>(std::realloc(m_data, new_capacity));
+        }
+        else
+        {
+            auto* p = static_cast<uint8_t*>(std::malloc(new_capacity));
+            if (p != nullptr && m_size != 0)
+                std::memcpy(p, m_data, m_size);
+            m_data = p;
+            m_heap_owned = true;
+        }
+        if (m_data == nullptr) [[unlikely]]
             handle_out_of_memory();
 #ifdef EVMONE_WORD_LAYOUT
-        assert(wl::is_aligned4(m_data.get()));
+        assert(wl::is_aligned4(m_data));
 #endif
+        m_capacity = new_capacity;
     }
 
 public:
-    /// Creates Memory object with initial capacity allocation.
-    Memory() noexcept { allocate_capacity(); }
+    /// Creates Memory object with initial heap capacity allocation.
+    Memory() noexcept { allocate_heap(page_size); }
+
+    Memory(const Memory&) = delete;
+    Memory& operator=(const Memory&) = delete;
+
+    Memory(Memory&& other) noexcept
+      : m_data{other.m_data},
+        m_size{other.m_size},
+        m_lim{other.m_lim},
+        m_capacity{other.m_capacity},
+        m_heap_owned{other.m_heap_owned}
+    {
+        other.m_data = nullptr;
+        other.m_size = 0;
+        other.m_lim = 0;
+        other.m_capacity = 0;
+        other.m_heap_owned = false;
+    }
+
+    Memory& operator=(Memory&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (m_heap_owned)
+                std::free(m_data);
+            m_data = other.m_data;
+            m_size = other.m_size;
+            m_lim = other.m_lim;
+            m_capacity = other.m_capacity;
+            m_heap_owned = other.m_heap_owned;
+            other.m_data = nullptr;
+            other.m_size = 0;
+            other.m_lim = 0;
+            other.m_capacity = 0;
+            other.m_heap_owned = false;
+        }
+        return *this;
+    }
+
+    ~Memory() noexcept
+    {
+        if (m_heap_owned)
+            std::free(m_data);
+    }
+
+    /// Rebind to a borrowed buffer and clear the memory. Frees any heap
+    /// allocation owned from a previous frame execution at this depth slot.
+    /// A buffer smaller than a page is not borrowed: the memory keeps (or
+    /// allocates) a heap page instead, so the capacity stays at least a page.
+    void set_borrowed(uint8_t* buf, size_t capacity) noexcept
+    {
+        set_size(0, 0);
+        if (capacity < page_size)
+        {
+            if (!m_heap_owned)
+                allocate_heap(page_size);
+            return;
+        }
+        if (m_heap_owned)
+        {
+            std::free(m_data);
+            m_heap_owned = false;
+        }
+        m_data = buf;
+        m_capacity = capacity;
+    }
 
     uint8_t& operator[](size_t index) noexcept { return m_data[index]; }
     const uint8_t& operator[](size_t index) const noexcept { return m_data[index]; }
 
     [[nodiscard]] size_t size() const noexcept { return m_size; }
+
+    /// True iff the active backing storage is the borrowed shared buffer.
+    [[nodiscard]] bool is_borrowed() const noexcept { return !m_heap_owned; }
+
+    /// Pointer one past the last byte of the live memory contents (only
+    /// meaningful when borrowed). Used by call_impl to place the next frame's
+    /// stack right after the parent's memory.
+    [[nodiscard]] uint8_t* borrowed_end() const noexcept { return m_data + m_size; }
 
     /// The offset below which a 32-byte access lies inside the memory, whatever the offset: the
     /// size is a multiple of 32, so w + 32 <= size exactly when w < size - 31, which is one
@@ -139,17 +232,17 @@ public:
         // Allow only growing memory. Include hint for optimizing compiler.
         INTX_REQUIRE(new_size > m_size);
 
-        if (new_size > m_capacity)
+        if (new_size > m_capacity) [[unlikely]]
         {
-            m_capacity *= 2;  // Double the capacity.
+            auto new_capacity = m_capacity * 2;  // Double the capacity.
 
-            if (m_capacity < new_size)  // If not enough.
+            if (new_capacity < new_size)  // If not enough.
             {
                 // Set capacity to required size rounded to multiple of page_size.
-                m_capacity = ((new_size + (page_size - 1)) / page_size) * page_size;
+                new_capacity = ((new_size + (page_size - 1)) / page_size) * page_size;
             }
 
-            allocate_capacity();
+            allocate_heap(new_capacity);
         }
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
         // Every size is a multiple of 32 and m_data comes from the 8-aligned allocator, so the new
@@ -252,9 +345,13 @@ public:
     StateGas state_gas;
 
     /// Bottom of this frame's EVM stack. Points into VM::stack_buffer_storage
-    /// at offset `msg.depth * VM::FRAME_STRIDE`. Set by the executor entry
-    /// right after reset(); never null during dispatch.
+    /// at the position the executor entry handed out (= `vm->stack_tail` at
+    /// the moment of entry). Never null during dispatch.
     uint256* stack_bottom = nullptr;
+
+    /// Back-pointer to the owning VM. Used by call/create instructions to
+    /// update `VM::stack_tail` before invoking a sub-frame.
+    VM* vm = nullptr;
 
     ExecutionState() noexcept = default;
 

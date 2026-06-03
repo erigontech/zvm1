@@ -2106,11 +2106,26 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
 
     auto& state = vm.get_execution_state(static_cast<size_t>(msg.depth));
     state.reset(msg, rev, host, ctx, code);
+    state.vm = &vm;
 
-    // Frame N's bottom lives at a 64 KB stride within the shared buffer.
-    // No tail-tracking, no back-pointer: layout is a pure function of depth.
-    state.stack_bottom = reinterpret_cast<uint256*>(
-        vm.stack_buffer_storage + static_cast<size_t>(msg.depth) * VM::FRAME_STRIDE);
+    // Top-level entry: rewind the dense buffer to the base.
+    if (msg.depth == 0)
+        vm.stack_tail = vm.stack_buffer_storage;
+
+    // This frame's stack lives at the current tail; its EVM memory borrows
+    // the rest of the buffer as its initial backing, short of a stack slot for
+    // each deeper frame. The tail then never passes the slot of its depth, so
+    // the stack of every frame up to MAX_DEPTH fits. If memory grows past
+    // this, Memory transparently falls back to a heap allocation.
+    const auto depth = static_cast<size_t>(msg.depth);
+    assert(depth <= VM::MAX_DEPTH);
+    state.stack_bottom = reinterpret_cast<uint256*>(vm.stack_tail);
+    auto* const mem_buf =
+        reinterpret_cast<uint8_t*>(vm.stack_tail + VM::FRAME_STRIDE);
+    auto* const mem_end = reinterpret_cast<uint8_t*>(
+        vm.stack_buffer_end() - (VM::MAX_DEPTH - depth) * VM::FRAME_STRIDE);
+    state.memory.set_borrowed(
+        mem_buf, mem_buf < mem_end ? static_cast<size_t>(mem_end - mem_buf) : 0);
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 
