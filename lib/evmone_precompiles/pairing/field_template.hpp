@@ -107,7 +107,8 @@ struct ExtFieldElem
         return ExtFieldElem(ret);
     }
 
-    friend constexpr ExtFieldElem operator*(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
+    [[gnu::always_inline]] friend constexpr ExtFieldElem operator*(
+        const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
     {
 #if defined(SP1) || defined(SP1TURBO)
         if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
@@ -119,6 +120,11 @@ struct ExtFieldElem
         }
 #endif
 
+        if constexpr (requires { sqr(e1); })  // Use sqr() if available.
+        {
+            if (&e1 == &e2)
+                return sqr(e1);
+        }
         return multiply(e1, e2);
     }
 

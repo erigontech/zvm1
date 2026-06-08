@@ -1,16 +1,17 @@
-// EVMC: Ethereum Client-VM Connector API.
-// Copyright 2019-2020 The EVMC Authors.
-// Licensed under the Apache License, Version 2.0.
+// evmone: Fast Ethereum Virtual Machine implementation
+// Copyright 2019 The evmone Authors.
+// SPDX-License-Identifier: Apache-2.0
 
-#include <evmc/evmc.hpp>
+#include "run.hpp"
 #include <evmc/hex.hpp>
 #include <evmc/mocked_host.hpp>
-#include <evmc/tooling.hpp>
 #include <chrono>
 #include <ostream>
 
-namespace evmc::tooling
+namespace evmone::tooling
 {
+using namespace evmc;
+
 namespace
 {
 /// The address where a new contract is created with --create option.
@@ -19,16 +20,8 @@ constexpr auto create_address = 0xc9ea7ed000000000000000000000000000000001_addre
 /// The gas limit for contract creation.
 constexpr auto create_gas = 10'000'000;
 
-/// MAGIC bytes denoting an EOF container.
-constexpr uint8_t MAGIC[] = {0xef, 0x00};
-
-auto bench(MockedHost& host,
-           evmc::VM& vm,
-           evmc_revision rev,
-           const evmc_message& msg,
-           bytes_view code,
-           const evmc::Result& expected_result,
-           std::ostream& out)
+auto bench(MockedHost& host, evmc::VM& vm, evmc_revision rev, const evmc_message& msg,
+    bytes_view code, const evmc::Result& expected_result, std::ostream& out)
 {
     {
         using clock = std::chrono::steady_clock;
@@ -60,21 +53,10 @@ auto bench(MockedHost& host,
             << " (avg of " << num_iterations << " iterations)\n";
     }
 }
-
-bool is_eof_container(bytes_view code)
-{
-    return code.size() >= 2 && code[0] == MAGIC[0] && code[1] == MAGIC[1];
-}
 }  // namespace
 
-int run(VM& vm,
-        evmc_revision rev,
-        int64_t gas,
-        bytes_view code,
-        bytes_view input,
-        bool create,
-        bool bench,
-        std::ostream& out)
+int run(VM& vm, evmc_revision rev, int64_t gas, bytes_view code, bytes_view input, bool create,
+    bool bench, std::ostream& out)
 {
     out << (create ? "Creating and executing on " : "Executing on ") << rev << " with " << gas
         << " gas limit\n";
@@ -90,7 +72,7 @@ int run(VM& vm,
     if (create)
     {
         evmc_message create_msg{};
-        create_msg.kind = is_eof_container(code) ? EVMC_EOFCREATE : EVMC_CREATE;
+        create_msg.kind = EVMC_CREATE;
         create_msg.recipient = create_address;
         create_msg.gas = create_gas;
 
@@ -122,4 +104,4 @@ int run(VM& vm,
 
     return 0;
 }
-}  // namespace evmc::tooling
+}  // namespace evmone::tooling

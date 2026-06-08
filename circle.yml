@@ -53,7 +53,7 @@ executors:
   linux-base:
     docker:
       - image: cimg/base:edge-22.04
-    resource_class: small
+    resource_class: medium
     environment:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
   macos:
@@ -324,7 +324,7 @@ jobs:
           name: "Check code format"
           command: |
             clang-format --version
-            find include lib test tools -name '*.hpp' -o -name '*.cpp' -o -name '*.h' -o -name '*.c' | xargs clang-format -i
+            find evmc include lib test tools -name '*.hpp' -o -name '*.cpp' -o -name '*.h' -o -name '*.c' | xargs clang-format -i
             git diff --color --exit-code
       - run:
           name: "Check spelling"
@@ -503,8 +503,6 @@ jobs:
 
   gcc-min:
     executor: linux-gcc-min
-    environment:
-      CMAKE_OPTIONS: -DEVMONE_TOOLS=OFF
     steps:
       - build
       - test
@@ -543,7 +541,7 @@ jobs:
     executor: linux-clang-selfhosted
     environment:
       TOOLCHAIN: clang-libcxx-debug
-      CMAKE_OPTIONS: -DBUILD_SHARED_LIBS=NO -DASSERTIONS=ON -DSANITIZE=address,undefined,shift-exponent,implicit-conversion,nullability
+      CMAKE_OPTIONS: -DBUILD_SHARED_LIBS=NO -DASSERTIONS=ON -DSANITIZE=address,undefined,implicit-conversion,local-bounds,nullability
       UBSAN_OPTIONS: halt_on_error=1
     steps:
       - build
