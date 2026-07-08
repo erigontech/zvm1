@@ -44,7 +44,7 @@ enum
      *
      * @see @ref versioning
      */
-    EVMC_ABI_VERSION = 12
+    EVMC_ABI_VERSION = 14
 };
 
 
@@ -79,7 +79,7 @@ enum evmc_call_kind
                                 The value param ignored. */
     EVMC_CALLCODE = 2,     /**< Request CALLCODE. */
     EVMC_CREATE = 3,       /**< Request CREATE. */
-    EVMC_CREATE2 = 4,      /**< Request CREATE2. Valid since Constantinople.*/
+    EVMC_CREATE2 = 4,      /**< Request CREATE2. Valid since Petersburg. */
 };
 
 /** The flags for ::evmc_message. */
@@ -950,13 +950,6 @@ enum evmc_revision
      * https://eips.ethereum.org/EIPS/eip-609
      */
     EVMC_BYZANTIUM,
-
-    /**
-     * The Constantinople revision.
-     *
-     * https://eips.ethereum.org/EIPS/eip-1013
-     */
-    EVMC_CONSTANTINOPLE,
 
     /**
      * The Petersburg revision.
