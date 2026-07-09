@@ -1183,7 +1183,6 @@ public:
             );
         }
     }
-#endif
 
     /// Optimized BN254 Fp Fermat inversion: x^(p-2) mod p.
     /// p-2 = 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd45
@@ -1255,6 +1254,7 @@ public:
         // Total: 252S + 54M = 306 Montgomery muls
         return r;
     }
+#endif
 
     /// Compute the modular inversion of the x in Montgomery form. The result is in Montgomery form.
     /// If x is not invertible, the result is 0.

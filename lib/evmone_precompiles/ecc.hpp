@@ -430,7 +430,7 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
     const auto& [x1, y1, z1] = p;
     const auto& [x2, y2, z2] = q;
 
-    using FE = typename Curve::Fp;
+    using FE [[maybe_unused]] = typename Curve::Fp;
     DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;    // z1^2
     DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;    // z2^2
     DECL_FE_COPY(FE, u1, x1); u1 *= z2z2;     // x1*z2^2
@@ -488,7 +488,7 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     const auto& [x1, y1, z1] = p;
     const auto& [x2, y2] = q;
 
-    using FE = typename Curve::Fp;
+    using FE [[maybe_unused]] = typename Curve::Fp;
     DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;    // z1^2
     DECL_FE_COPY(FE, u2, x2); u2 *= z1z1;     // x2*z1^2
     z1z1 *= z1;                 // z1z1 now = z1^3
@@ -538,7 +538,7 @@ ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
         // Formula: S = 4*X*Y^2, M = 3*X^2, X' = M^2 - 2S, Y' = M(S-X') - 8Y^4, Z' = 2YZ.
         // Cost: 7M + 9A + 3S = 7M + 12(A+S) vs original 7M + 9A + 5S = 7M + 14(A+S).
 
-        using FE = typename Curve::Fp;
+        using FE [[maybe_unused]] = typename Curve::Fp;
         DECL_FE_COPY(FE, xx, x1); xx *= x1;       // X^2 (uninit copy + mul_assign)
         DECL_FE_COPY(FE, yy, y1); yy *= y1;       // Y^2
         DECL_FE_COPY(FE, yyyy, yy); yyyy *= yy;   // Y^4
