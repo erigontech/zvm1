@@ -150,3 +150,121 @@ TEST_F(state_transition, tx_data_min_cost_exec_51)
     expect.gas_used = 21000 + MIN_GAS + 1;
     expect.post[To].exists = true;
 }
+
+TEST_F(state_transition, tx_data_floor_amsterdam_exec_0)
+{
+    // EIP-7976: the floor is 64 gas per calldata byte. Execution gas is 0.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = "0001"_hex;
+    static constexpr auto MIN_GAS = 64 * 2;
+
+    expect.gas_used = 21000 + MIN_GAS;
+}
+
+TEST_F(state_transition, tx_data_floor_amsterdam_exec_below_floor)
+{
+    // EIP-7976: standard cost (intrinsic data + execution) is 1 below the floor.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = "0001"_hex;
+    static constexpr auto DATA_GAS = 16 + 4;
+    static constexpr auto MIN_GAS = 64 * 2;
+
+    pre[To] = {.code = (MIN_GAS - DATA_GAS - 1) * OP_JUMPDEST};
+    expect.gas_used = 21000 + MIN_GAS;
+    expect.post[To].exists = true;
+}
+
+TEST_F(state_transition, tx_data_floor_amsterdam_exec_at_floor)
+{
+    // EIP-7976: standard cost (intrinsic data + execution) equals the floor.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = "0001"_hex;
+    static constexpr auto DATA_GAS = 16 + 4;
+    static constexpr auto MIN_GAS = 64 * 2;
+
+    pre[To] = {.code = (MIN_GAS - DATA_GAS) * OP_JUMPDEST};
+    expect.gas_used = 21000 + MIN_GAS;
+    expect.post[To].exists = true;
+}
+
+TEST_F(state_transition, tx_data_floor_amsterdam_exec_above_floor)
+{
+    // EIP-7976: standard cost (intrinsic data + execution) is 1 above the floor.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = "0001"_hex;
+    static constexpr auto DATA_GAS = 16 + 4;
+    static constexpr auto MIN_GAS = 64 * 2;
+
+    pre[To] = {.code = (MIN_GAS - DATA_GAS + 1) * OP_JUMPDEST};
+    expect.gas_used = 21000 + MIN_GAS + 1;
+    expect.post[To].exists = true;
+}
+
+TEST_F(state_transition, tx_data_floor_amsterdam_zero_bytes)
+{
+    // EIP-7976: zero bytes pay the same 64-gas floor as nonzero bytes.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = "0000"_hex;
+    static constexpr auto MIN_GAS = 64 * 2;
+
+    expect.gas_used = 21000 + MIN_GAS;
+}
+
+TEST_F(state_transition, tx_data_floor_osaka_uses_eip7623)
+{
+    // EIP-7976 is not yet active in Osaka; the EIP-7623 floor (10 gas per token) still applies.
+    rev = EVMC_OSAKA;
+    tx.to = To;
+    tx.data = "0001"_hex;  // tokens = 4 (nonzero) + 1 (zero) = 5
+    static constexpr auto MIN_GAS = 10 * 5;
+
+    expect.gas_used = 21000 + MIN_GAS;
+}
+
+TEST_F(state_transition, access_list_cost_amsterdam)
+{
+    // EIP-7981: 1280 gas (64*20) per address, 2048 gas (64*32) per storage key.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.access_list = {{To, {0x01_bytes32}}};
+    // intrinsic = 21000 + 2400 + 1900 + 1280 + 2048 = 28628
+    expect.gas_used = 28628;
+}
+
+TEST_F(state_transition, access_list_cost_osaka_unchanged)
+{
+    // EIP-7981 is inactive before Amsterdam.
+    rev = EVMC_OSAKA;
+    tx.to = To;
+    tx.access_list = {{To, {0x01_bytes32}}};
+    // intrinsic = 21000 + 2400 + 1900 = 25300
+    expect.gas_used = 25300;
+}
+
+TEST_F(state_transition, access_list_floor_amsterdam)
+{
+    // EIP-7981: access-list bytes count toward the floor.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = bytes(100, 0x00);
+    tx.access_list = {{To, {}}};
+    // intrinsic = 21000 + 100*4 + 2400 + 1280 = 25080
+    // floor     = 21000 + 64*(100 + 20)       = 28680  (dominates)
+    expect.gas_used = 28680;
+}
+
+TEST_F(state_transition, invalid_access_list_amsterdam_gas_limit_below_floor)
+{
+    // EIP-7981: gas limit must cover the floor (28680) — pre-7981 intrinsic (23800) is not enough.
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.data = bytes(100, 0x00);
+    tx.access_list = {{To, {}}};
+    tx.gas_limit = 28679;
+    expect.tx_error = INTRINSIC_GAS_TOO_LOW;
+}

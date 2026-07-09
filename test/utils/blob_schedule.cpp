@@ -4,15 +4,15 @@
 
 namespace evmone::test
 {
-state::BlobParams get_blob_params(evmc_revision rev)
+state::BlobParams get_blob_params(evmc_revision rev) noexcept
 {
-    if (rev == EVMC_PRAGUE || rev == EVMC_EXPERIMENTAL)
+    if (rev >= EVMC_AMSTERDAM)
+        return {14, 21, 11684671};
+    if (rev >= EVMC_PRAGUE)
         return {6, 9, 5007716};
-    else if (rev > EVMC_PRAGUE)
-        throw std::invalid_argument{
-            "no hardcoded blob params for " + std::string{evmc::to_string(rev)}};
-    else
+    if (rev == EVMC_CANCUN)
         return {3, 6, 3338477};
+    return {0, 0, 1};
 }
 
 state::BlobParams get_blob_params(evmc_revision rev, const BlobSchedule& blob_schedule)
@@ -34,6 +34,8 @@ state::BlobParams get_blob_params(
         fork = timestamp >= 15'000 ? "BPO3" : "BPO2";
     else if (network == "BPO3ToBPO4AtTime15k")
         fork = timestamp >= 15'000 ? "BPO4" : "BPO3";
+    else if (network == "BPO2ToAmsterdamAtTime15k")
+        fork = timestamp >= 15'000 ? "Amsterdam" : "BPO2";
     else
         fork = network;
     if (const auto it = blob_schedule.find(fork); it != blob_schedule.end())

@@ -111,7 +111,7 @@
     ON_OPCODE_IDENTIFIER(OP_BASEFEE, basefee)               \
     ON_OPCODE_IDENTIFIER(OP_BLOBHASH, blobhash)             \
     ON_OPCODE_IDENTIFIER(OP_BLOBBASEFEE, blobbasefee)       \
-    ON_OPCODE_UNDEFINED(0x4b)                               \
+    ON_OPCODE_IDENTIFIER(OP_SLOTNUM, slotnum)               \
     ON_OPCODE_UNDEFINED(0x4c)                               \
     ON_OPCODE_UNDEFINED(0x4d)                               \
     ON_OPCODE_UNDEFINED(0x4e)                               \
@@ -276,9 +276,9 @@
     ON_OPCODE_UNDEFINED(0xe3)                               \
     ON_OPCODE_UNDEFINED(0xe4)                               \
     ON_OPCODE_UNDEFINED(0xe5)                               \
-    ON_OPCODE_UNDEFINED(0xe6)                               \
-    ON_OPCODE_UNDEFINED(0xe7)                               \
-    ON_OPCODE_UNDEFINED(0xe8)                               \
+    ON_OPCODE_IDENTIFIER(OP_DUPN, dupn)                     \
+    ON_OPCODE_IDENTIFIER(OP_SWAPN, swapn)                   \
+    ON_OPCODE_IDENTIFIER(OP_EXCHANGE, exchange)             \
     ON_OPCODE_UNDEFINED(0xe9)                               \
     ON_OPCODE_UNDEFINED(0xea)                               \
     ON_OPCODE_UNDEFINED(0xeb)                               \

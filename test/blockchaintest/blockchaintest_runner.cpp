@@ -56,6 +56,7 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
     std::vector<state::TransactionReceipt> receipts;
 
     int64_t cumulative_gas_used = 0;
+    int64_t block_gas_used = 0;
 
     for (size_t i = 0; i < txs.size(); ++i)
     {
@@ -82,7 +83,11 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
             if (rev < EVMC_BYZANTIUM)
                 receipt.post_state = state::mpt_hash(block_state);
 
-            block_gas_left -= receipt.gas_used;
+            // Block gas accounting, refunds excluded (EIP-7778).
+            const auto block_tx_gas =
+                (rev >= EVMC_AMSTERDAM) ? receipt.gas_used + receipt.gas_refund : receipt.gas_used;
+            block_gas_used += block_tx_gas;
+            block_gas_left -= block_tx_gas;
             blob_gas_left -= static_cast<int64_t>(tx.blob_gas_used());
             receipts.emplace_back(std::move(receipt));
         }
@@ -111,7 +116,7 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
 
     const auto bloom = compute_bloom_filter(receipts);
 
-    return {std::move(receipts), std::move(rejected_txs), std::move(requests), cumulative_gas_used,
+    return {std::move(receipts), std::move(rejected_txs), std::move(requests), block_gas_used,
         bloom, blob_gas_left, std::move(block_state)};
 }
 
@@ -287,6 +292,7 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
         std::unordered_map<hash256, BlockData> block_data{{{c.genesis_block_header.hash,
             {&c.genesis_block_header, false, c.pre_state, c.genesis_block_header.difficulty}}}};
         const auto* canonical_state = &c.pre_state;
+        hash256 canonical_tip_hash = c.genesis_block_header.hash;
         intx::uint256 max_total_difficulty = c.genesis_block_header.difficulty;
 
         for (size_t i = 0; i < c.test_blocks.size(); ++i)
@@ -334,6 +340,7 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
                 if (inserted_it->second.total_difficulty >= max_total_difficulty)
                 {
                     canonical_state = &inserted_it->second.post_state;
+                    canonical_tip_hash = test_block.expected_block_header.hash;
                     max_total_difficulty = inserted_it->second.total_difficulty;
                 }
 
@@ -405,6 +412,9 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
                 EXPECT_TRUE(false) << "Expected block to be invalid but resulted valid";
             }
         }
+        EXPECT_EQ(canonical_tip_hash, c.expectation.last_block_hash)
+            << "Canonical chain tip differs from expected `lastblockhash`";
+
         const auto expected_post_hash =
             std::holds_alternative<TestState>(c.expectation.post_state) ?
                 state::mpt_hash(std::get<TestState>(c.expectation.post_state)) :

@@ -10,6 +10,7 @@
 #include <evmone/delegation.hpp>
 #include <evmone_precompiles/secp256k1.hpp>
 #include <algorithm>
+#include <ranges>
 
 using namespace intx;
 
@@ -38,15 +39,18 @@ size_t compute_tx_data_tokens(evmc_revision rev, bytes_view data) noexcept
     return (nonzero_byte_multiplier * num_nonzero_bytes) + num_zero_bytes;
 }
 
-int64_t compute_access_list_cost(const AccessList& access_list) noexcept
+struct AccessListCounts
 {
-    static constexpr auto ADDRESS_COST = 2400;
-    static constexpr auto STORAGE_KEY_COST = 1900;
+    size_t num_addresses = 0;
+    size_t num_storage_keys = 0;
+};
 
-    int64_t cost = 0;
-    for (const auto& [_, keys] : access_list)
-        cost += ADDRESS_COST + static_cast<int64_t>(keys.size()) * STORAGE_KEY_COST;
-    return cost;
+AccessListCounts count_access_list(const AccessList& access_list) noexcept
+{
+    size_t num_storage_keys = 0;
+    for (const auto& keys : access_list | std::views::values)
+        num_storage_keys += keys.size();
+    return {access_list.size(), num_storage_keys};
 }
 
 struct TransactionCost
@@ -55,14 +59,19 @@ struct TransactionCost
     int64_t min = 0;
 };
 
-/// Compute the transaction intrinsic gas 𝑔₀ (Yellow Paper, 6.2) and minimal gas (EIP-7623).
+/// Compute the transaction intrinsic gas 𝑔₀ (Yellow Paper, 6.2) and minimal gas (floor cost).
 TransactionCost compute_tx_intrinsic_cost(evmc_revision rev, const Transaction& tx) noexcept
 {
     static constexpr auto TX_BASE_COST = 21000;
     static constexpr auto TX_CREATE_COST = 32000;
+    static constexpr auto ACCESS_LIST_ADDRESS_COST = 2400;
+    static constexpr auto ACCESS_LIST_STORAGE_KEY_COST = 1900;
+    static constexpr auto ACCESS_LIST_ADDRESS_BYTES = 20;
+    static constexpr auto ACCESS_LIST_STORAGE_KEY_BYTES = 32;
     static constexpr auto DATA_TOKEN_COST = 4;
     static constexpr auto INITCODE_WORD_COST = 2;
     static constexpr auto TOTAL_COST_FLOOR_PER_TOKEN = 10;
+    static constexpr auto TOTAL_COST_FLOOR_PER_BYTE = 16 * 4;
 
     const auto is_create = !tx.to.has_value();
 
@@ -71,7 +80,12 @@ TransactionCost compute_tx_intrinsic_cost(evmc_revision rev, const Transaction& 
     const auto num_tokens = static_cast<int64_t>(compute_tx_data_tokens(rev, tx.data));
     const auto data_cost = num_tokens * DATA_TOKEN_COST;
 
-    const auto access_list_cost = compute_access_list_cost(tx.access_list);
+    const auto [num_addresses, num_storage_keys] = count_access_list(tx.access_list);
+    const auto access_list_num_bytes =
+        static_cast<int64_t>(num_addresses * ACCESS_LIST_ADDRESS_BYTES +
+                             num_storage_keys * ACCESS_LIST_STORAGE_KEY_BYTES);
+    const auto access_list_cost = static_cast<int64_t>(
+        num_addresses * ACCESS_LIST_ADDRESS_COST + num_storage_keys * ACCESS_LIST_STORAGE_KEY_COST);
 
     const auto auth_list_cost =
         static_cast<int64_t>(tx.authorization_list.size()) * AUTHORIZATION_EMPTY_ACCOUNT_COST;
@@ -79,12 +93,22 @@ TransactionCost compute_tx_intrinsic_cost(evmc_revision rev, const Transaction& 
     const auto initcode_cost =
         (is_create && rev >= EVMC_SHANGHAI) ? INITCODE_WORD_COST * num_words(tx.data.size()) : 0;
 
-    const auto intrinsic_cost =
-        TX_BASE_COST + create_cost + data_cost + access_list_cost + auth_list_cost + initcode_cost;
+    // Charge a flat cost per access-list byte (EIP-7981).
+    const auto access_list_data_cost =
+        (rev >= EVMC_AMSTERDAM) ? access_list_num_bytes * TOTAL_COST_FLOOR_PER_BYTE : 0;
 
-    // EIP-7623: Compute the minimum cost for the transaction by. If disabled, just use 0.
+    const auto intrinsic_cost = TX_BASE_COST + create_cost + data_cost + access_list_data_cost +
+                                access_list_cost + auth_list_cost + initcode_cost;
+
+    int64_t data_min_cost = 0;
+    if (rev >= EVMC_AMSTERDAM)  // Unified cost per byte (EIP-7976).
+        data_min_cost = TOTAL_COST_FLOOR_PER_BYTE * static_cast<int64_t>(tx.data.size());
+    else if (rev >= EVMC_PRAGUE)  // Cost per token capturing num of zero-nonzero bytes (EIP-7623).
+        data_min_cost = TOTAL_COST_FLOOR_PER_TOKEN * num_tokens;
+
+    // Compute "floor" cost (EIP-7623).
     const auto min_cost =
-        rev >= EVMC_PRAGUE ? TX_BASE_COST + num_tokens * TOTAL_COST_FLOOR_PER_TOKEN : 0;
+        (rev >= EVMC_PRAGUE) ? TX_BASE_COST + data_min_cost + access_list_data_cost : 0;
 
     return {intrinsic_cost, min_cost};
 }
@@ -623,22 +647,26 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
 
     const auto result = host.call(message);
 
-    auto gas_used = tx.gas_limit - result.gas_left;
+    const auto gas_used_b4_refund = tx.gas_limit - result.gas_left;
 
     const auto max_refund_quotient = rev >= EVMC_LONDON ? 5 : 2;
-    const auto refund_limit = gas_used / max_refund_quotient;
+    const auto refund_limit = gas_used_b4_refund / max_refund_quotient;
     const auto refund = std::min(delegation_refund + result.gas_refund, refund_limit);
-    gas_used -= refund;
+    auto gas_used = gas_used_b4_refund - refund;
     assert(gas_used > 0);
 
-    // EIP-7623: The gas used by the transaction must be at least the min_gas_cost.
+    // The gas used by the transaction must be at least the min_gas_cost (EIP-7623).
     gas_used = std::max(gas_used, tx_props.min_gas_cost);
+
+    // For block gas accounting, compute the gas refund capped by the min gas cost (EIP-7778).
+    const auto block_gas_used = std::max(gas_used_b4_refund, tx_props.min_gas_cost);
+    const auto gas_refund = block_gas_used - gas_used;
 
     sender_acc.balance += tx_max_cost - gas_used * effective_gas_price;
     state.touch(block.coinbase).balance += gas_used * priority_gas_price;
 
     // Cumulative gas used is unknown in this scope.
-    return TransactionReceipt{
-        tx.type, result.status_code, gas_used, {}, host.take_logs(), state.build_diff(rev)};
+    return TransactionReceipt{tx.type, result.status_code, gas_used, gas_refund, {},
+        host.take_logs(), state.build_diff(rev)};
 }
 }  // namespace evmone::state

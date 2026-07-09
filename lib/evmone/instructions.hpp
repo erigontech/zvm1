@@ -59,6 +59,83 @@ struct Result
 struct TermResult : Result
 {};
 
+
+/// Swap two values.
+#if defined(AIRBENDER) && defined(__riscv)
+inline void fast_swap(uint256& x, uint256& y) noexcept
+{
+    // Use BigInt CSR MEMCOPY for 256-bit swap via temp buffer.
+    // 3 CSR calls vs ~32 rv32im instructions for manual word-by-word swap.
+    // Use uninitialized buffer: MEMCOPY overwrites immediately, skip zero-init.
+    // Requires x and y to be 32-byte aligned (stack slots always are).
+    alignas(32) char tmp_raw_[sizeof(uint256)];
+    const uintptr_t pTmp = reinterpret_cast<uintptr_t>(tmp_raw_);
+    const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+    const uintptr_t pY = reinterpret_cast<uintptr_t>(&y);
+
+    // Fused 3-way MEMCOPY swap in a single asm block.
+    // x12 must be re-set before each CSR call (CSR may modify x12).
+    asm volatile(
+        // Step 1: tmp = x
+        "mv x10, %[pTmp]\n\t"
+        "mv x11, %[pX]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // Step 2: x = y
+        "mv x10, %[pX]\n\t"
+        "mv x11, %[pY]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // Step 3: y = tmp
+        "mv x10, %[pY]\n\t"
+        "mv x11, %[pTmp]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [pTmp] "r"(pTmp), [pX] "r"(pX), [pY] "r"(pY)
+        : "x10", "x11", "x12", "memory"
+    );
+}
+#else
+constexpr void fast_swap(uint256& x, uint256& y) noexcept
+{
+    // The simple std::swap(stack.top(), stack[N]) is not used to work around
+    // clang missed optimization: https://github.com/llvm/llvm-project/issues/59116
+    // TODO(clang): Check if #59116 bug fix has been released.
+
+    auto t0 = x[0];
+    auto t1 = x[1];
+    auto t2 = x[2];
+    auto t3 = x[3];
+    x = y;
+    y[0] = t0;
+    y[1] = t1;
+    y[2] = t2;
+    y[3] = t3;
+}
+#endif
+
+/// Decode DUPN/SWAPN immediate. Returns the stack depth n [17–235],
+/// or std::nullopt if the immediate is in the forbidden range [0x5b–0x7f].
+constexpr std::optional<int> decode_dupn_swapn_imm(uint8_t imm) noexcept
+{
+    if (imm >= 0x5b && imm <= 0x7f)
+        return std::nullopt;
+    return static_cast<uint8_t>(imm + 0x91);
+}
+
+/// Decode EXCHANGE immediate. Returns the pair (n, m) with 1 <= n < m and n + m <= 30,
+/// or std::nullopt if the immediate is in the forbidden range [0x52–0x7f].
+constexpr std::optional<std::pair<int, int>> decode_exchange_imm(uint8_t imm) noexcept
+{
+    if (imm >= 0x52 && imm <= 0x7f)
+        return std::nullopt;
+    const auto k = imm ^ 0x8f;
+    const auto q = k / 16;
+    const auto r = k % 16;
+    return (q < r) ? std::pair{q + 1, r + 1} : std::pair{r + 1, 29 - q};
+}
+
 constexpr auto max_buffer_size = std::numeric_limits<uint32_t>::max();
 
 /// Deducts a gas cost from gas_left and returns true if gas_left >= 0 after deduction.
@@ -105,7 +182,7 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     int64_t gas_left, Memory& memory, uint64_t new_size) noexcept
 {
     // This implementation recomputes memory.size(). This value is already known to the caller
-    // and can be passed as a parameter, but this make no difference to the performance.
+    // and can be passed as a parameter, but this makes no difference to the performance.
 
     // Use unsigned arithmetic to avoid signed division overhead on rv32im.
     // Memory word counts are always non-negative and bounded by ~8MB/32 < 2^18.
@@ -870,6 +947,11 @@ inline void blobbasefee(StackTop stack, ExecutionState& state) noexcept
     stack.push(intx::be::load<uint256>(state.get_tx_context().blob_base_fee));
 }
 
+inline void slotnum(StackTop stack, ExecutionState& state) noexcept
+{
+    stack.push(state.get_tx_context().block_slot_number);
+}
+
 inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     auto& x = stack.top();
@@ -1074,9 +1156,9 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
     }
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    return &state.analysis.baseline->executable_code()[w[0]];
+    return &state.analysis.baseline->code()[w[0]];
 #else
-    return &state.analysis.baseline->executable_code()[static_cast<size_t>(dst[0])];
+    return &state.analysis.baseline->code()[static_cast<size_t>(dst[0])];
 #endif
 }
 
@@ -1096,7 +1178,7 @@ inline code_iterator jumpi(StackTop stack, ExecutionState& state, code_iterator 
 
 inline code_iterator pc(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
 {
-    stack.push(static_cast<uint64_t>(pos - state.analysis.baseline->executable_code().data()));
+    stack.push(static_cast<uint64_t>(pos - state.analysis.baseline->code().data()));
     return pos + 1;
 }
 
@@ -1232,55 +1314,67 @@ template <int N>
 inline void swap(StackTop stack) noexcept
 {
     static_assert(N >= 1 && N <= 16);
+    fast_swap(stack.top(), stack[N]);
+}
 
-#if defined(AIRBENDER) && defined(__riscv)
-    // Use BigInt CSR MEMCOPY for 256-bit swap via temp buffer.
-    // 3 CSR calls vs ~32 rv32im instructions for manual word-by-word swap.
-    // Use uninitialized buffer: MEMCOPY overwrites immediately, skip zero-init.
-    alignas(32) char tmp_raw_[sizeof(uint256)];
-    const uintptr_t pTmp = reinterpret_cast<uintptr_t>(tmp_raw_);
-    const uintptr_t pTop = reinterpret_cast<uintptr_t>(&stack.top());
-    const uintptr_t pA = reinterpret_cast<uintptr_t>(&stack[N]);
+inline code_iterator dupn(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
+{
+    const auto n = decode_dupn_swapn_imm(pos[1]);
+    if (!n)
+    {
+        state.status = EVMC_UNDEFINED_INSTRUCTION;
+        return nullptr;
+    }
 
-    // Fused 3-way MEMCOPY swap in a single asm block.
-    // x12 must be re-set before each CSR call (CSR may modify x12).
-    asm volatile(
-        // Step 1: tmp = top
-        "mv x10, %[pTmp]\n\t"
-        "mv x11, %[pTop]\n\t"
-        "li x12, 0x80\n\t"
-        "csrrw x0, 0x7CA, x0\n\t"
-        // Step 2: top = a
-        "mv x10, %[pTop]\n\t"
-        "mv x11, %[pA]\n\t"
-        "li x12, 0x80\n\t"
-        "csrrw x0, 0x7CA, x0\n\t"
-        // Step 3: a = tmp
-        "mv x10, %[pA]\n\t"
-        "mv x11, %[pTmp]\n\t"
-        "li x12, 0x80\n\t"
-        "csrrw x0, 0x7CA, x0\n\t"
-        :
-        : [pTmp] "r"(pTmp), [pTop] "r"(pTop), [pA] "r"(pA)
-        : "x10", "x11", "x12", "memory"
-    );
-#else
-    // The simple std::swap(stack.top(), stack[N]) is not used to workaround
-    // clang missed optimization: https://github.com/llvm/llvm-project/issues/59116
-    // TODO(clang): Check if #59116 bug fix has been released.
+    // Stack overflow is checked by check_requirements() (stack_height_change=+1).
+    const auto stack_size = stack.end() - state.stack_space.bottom();
+    if (*n > stack_size)
+    {
+        state.status = EVMC_STACK_UNDERFLOW;
+        return nullptr;
+    }
 
-    auto& a = stack[N];
-    auto& t = stack.top();
-    auto t0 = t[0];
-    auto t1 = t[1];
-    auto t2 = t[2];
-    auto t3 = t[3];
-    t = a;
-    a[0] = t0;
-    a[1] = t1;
-    a[2] = t2;
-    a[3] = t3;
-#endif
+    stack.push(stack[*n - 1]);
+    return pos + 2;
+}
+
+inline code_iterator swapn(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
+{
+    const auto n = decode_dupn_swapn_imm(pos[1]);
+    if (!n)
+    {
+        state.status = EVMC_UNDEFINED_INSTRUCTION;
+        return nullptr;
+    }
+
+    if (const auto stack_size = stack.end() - state.stack_space.bottom(); *n >= stack_size)
+    {
+        state.status = EVMC_STACK_UNDERFLOW;
+        return nullptr;
+    }
+
+    fast_swap(stack.top(), stack[*n]);
+    return pos + 2;
+}
+
+inline code_iterator exchange(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
+{
+    const auto decoded = decode_exchange_imm(pos[1]);
+    if (!decoded)
+    {
+        state.status = EVMC_UNDEFINED_INSTRUCTION;
+        return nullptr;
+    }
+
+    const auto [n, m] = *decoded;
+    if (const auto stack_size = stack.end() - state.stack_space.bottom(); m >= stack_size)
+    {
+        state.status = EVMC_STACK_UNDERFLOW;
+        return nullptr;
+    }
+
+    fast_swap(stack[n], stack[m]);
+    return pos + 2;
 }
 
 inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept

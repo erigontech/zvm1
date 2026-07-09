@@ -21,7 +21,9 @@ target_sources(
     evm_eip3860_initcode_test.cpp
     evm_eip4844_blobhash_test.cpp
     evm_eip7516_blobbasefee_test.cpp
+    evm_eip7843_slotnum_test.cpp
     evm_eip7939_clz_test.cpp
+    evm_eip8024_swapn_dupn_exchange_test.cpp
     evm_memory_test.cpp
     evm_state_test.cpp
     evm_storage_test.cpp
@@ -65,6 +67,7 @@ target_sources(
     state_transition_call_test.cpp
     state_transition_create_test.cpp
     state_transition_eip7702_test.cpp
+    state_transition_eip7778_block_gas_test.cpp
     state_transition_extcode_test.cpp
     state_transition_selfdestruct_test.cpp
     state_transition_snippets_test.cpp
@@ -78,10 +81,21 @@ target_sources(
     statetest_loader_tx_test.cpp
     statetest_logs_hash_test.cpp
     statetest_withdrawals_test.cpp
+    tooling_run_test.cpp
+    tooling_t8n_test.cpp
     tracing_test.cpp
 )
-target_link_libraries(evmone-unittests PRIVATE evmone evmone::evmmax evmone::experimental evmone::state evmone::testutils GTest::gtest GTest::gtest_main)
+target_link_libraries(evmone-unittests PRIVATE evmone evmone::evmmax evmone::experimental evmone::precompiles evmone::state evmone::testutils blst::blst GTest::gtest GTest::gtest_main)
 target_include_directories(evmone-unittests PRIVATE ${evmone_private_include_dir})
+if(NOT CMAKE_CXX_CLANG_TIDY)
+    target_precompile_headers(
+        evmone-unittests PRIVATE
+        <intx/intx.hpp>
+        <evmc/evmc.hpp>
+        <evmc/hex.hpp>
+        <gtest/gtest.h>
+    )
+endif()
 
 gtest_discover_tests(
     evmone-unittests

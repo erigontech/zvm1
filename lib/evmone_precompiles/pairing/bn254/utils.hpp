@@ -15,7 +15,7 @@ consteval Fq2 make_fq2(const uint256& a, const uint256& b) noexcept
 /// Defines coefficients needed for fast Frobenius endomorphism computation.
 /// For more ref see https://eprint.iacr.org/2010/354.pdf 3.2 Frobenius Operator.
 /// TODO: Make it constexpr.
-static inline std::array<std::array<Fq2, 5>, 3> FROBENIUS_COEFFS = {
+static inline const std::array<std::array<Fq2, 5>, 3> FROBENIUS_COEFFS = {
     {
         {
             make_fq2(
@@ -105,7 +105,7 @@ constexpr bool g2_is_infinity(const evmmax::ecc::Point<Fq2>& p)
     return p.x == Fq2::zero() && p.y == Fq2::zero();
 }
 
-// Forbenius endomorphism related functions are implemented based on
+// Frobenius endomorphism related functions are implemented based on
 // https://hackmd.io/@jpw/bn254#mathbb-G_2-membership-check-using-efficient-endomorphism
 // and
 // https://eprint.iacr.org/2010/354.pdf 3.2 Frobenius Operator
@@ -207,6 +207,7 @@ constexpr Fq12 endomorphism(const Fq12& f) noexcept
 
 
 /// Computes `P0 + P1` in Jacobian coordinates.
+/// P0 and P1 must not be the point at infinity, and must not be equal or negations of each other.
 constexpr ecc::JacPoint<Fq2> add(
     const ecc::JacPoint<Fq2>& P0, const ecc::JacPoint<Fq2>& P1) noexcept
 {
@@ -393,7 +394,7 @@ constexpr ecc::JacPoint<Fq2> lin_func_and_dbl(
     const auto U2 = x1 * z0_squared;
     const auto S2 = y1 * z0_cubed;
     const auto H = U2 - x0;  // x1 * z0^2 - x0 * z1^2
-    const auto R = S2 - y0;  // y1 * z0^3 - y0 * z1 ^3
+    const auto R = S2 - y0;  // y1 * z0^3 - y0 * z1^3
 
     const auto H_squared = H * H;
     const auto H_cubed = H * H_squared;
@@ -402,11 +403,11 @@ constexpr ecc::JacPoint<Fq2> lin_func_and_dbl(
     const auto V = x0 * H_squared;
 
     const auto X3 = R_squared - H_cubed - (V + V);
-    const auto Y3 = R * (x0 * H_squared - X3) - y0 * H_cubed;
+    const auto Y3 = R * (V - X3) - y0 * H_cubed;
     const auto Z3 = H * z0;
 
-    t[0] = (z0 * z0_squared * x0 - U2 * z0_cubed);
-    t[1] = (S2 * z0_squared - y0 * z0_squared);
+    t[0] = -H * z0_cubed;   // = x0·z0³ − U2·z0³
+    t[1] = R * z0_squared;  // = S2·z0² − y0·z0²
     t[2] = y0 * U2 - x0 * S2;
 
     return ecc::JacPoint<Fq2>{X3, Y3, Z3};
@@ -431,8 +432,8 @@ constexpr void lin_func(
     const auto U2 = x1 * z0_squared;
     const auto S2 = y1 * z0_cubed;
 
-    t[0] = (z0 * z0_squared * x0 - U2 * z0_cubed);
-    t[1] = (S2 * z0_squared - y0 * z0_squared);
+    t[0] = (x0 - U2) * z0_cubed;    // = x0·z0³ − U2·z0³
+    t[1] = (S2 - y0) * z0_squared;  // = S2·z0² − y0·z0²
     t[2] = y0 * U2 - x0 * S2;
 }
 

@@ -7,8 +7,80 @@
 #include <intx/intx.hpp>
 #include <test/state/precompiles_internal.hpp>
 #include <test/utils/utils.hpp>
+#ifdef EVMONE_PRECOMPILES_GMP
+#include <test/state/precompiles_gmp.hpp>
+#endif
 
-TEST(expmod, test_vectors)
+namespace
+{
+using evmone::state::ExecutionResult;
+
+/// Builds a big-endian value of given size with MSB, optional LSB, and fill byte.
+evmc::bytes make_val(size_t size, uint8_t msb, uint8_t lsb = 0, uint8_t fill = 0)
+{
+    assert(size >= 2);
+    evmc::bytes v(size, fill);
+    v.front() = msb;
+    v.back() = lsb;
+    return v;
+}
+
+/// Checks that the result is zero everywhere except the last byte which should equal expected.
+void expect_last_byte(const std::span<const uint8_t> result, uint8_t expected)
+{
+    EXPECT_EQ(result.back(), expected);
+    const auto head = result.first(result.size() - 1);
+    EXPECT_TRUE(std::ranges::all_of(head, [](uint8_t b) { return b == 0; }));
+}
+
+
+/// Function pointer type for expmod execute implementations.
+using ExpmodExecuteFn = ExecutionResult (*)(const uint8_t*, size_t, uint8_t*, size_t) noexcept;
+
+struct ExpmodImpl
+{
+    const char* name;
+    ExpmodExecuteFn fn;
+};
+
+/// Parameterized test fixture for expmod implementations.
+class expmod : public testing::TestWithParam<ExpmodImpl>
+{
+protected:
+    /// Builds modexp precompile input, executes via the parameterized implementation, and returns
+    /// the result.
+    static evmc::bytes run(const evmc::bytes& base, const evmc::bytes& exp, const evmc::bytes& mod)
+    {
+        evmc::bytes input(3 * 32, 0);
+        using namespace intx;
+        be::unsafe::store(&input[0], uint256{base.size()});
+        be::unsafe::store(&input[32], uint256{exp.size()});
+        be::unsafe::store(&input[64], uint256{mod.size()});
+        input += base;
+        input += exp;
+        input += mod;
+
+        evmc::bytes result(mod.size(), 0xfe);  // Sentinel fill to detect partial writes.
+        const auto [status, output_size] =
+            GetParam().fn(input.data(), input.size(), result.data(), result.size());
+        EXPECT_EQ(status, EVMC_SUCCESS);
+        EXPECT_EQ(output_size, mod.size());
+        return result;
+    }
+};
+
+const ExpmodImpl EXPMOD_IMPLS[] = {
+    {"evmone", &evmone::state::expmod_execute_evmone},
+#ifdef EVMONE_PRECOMPILES_GMP
+    {"gmp", &evmone::state::expmod_execute_gmp},
+#endif
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    impls, expmod, testing::ValuesIn(EXPMOD_IMPLS), [](const auto& x) { return x.param.name; });
+}  // namespace
+
+TEST_P(expmod, inputs)
 {
     struct TestCase
     {
@@ -87,35 +159,11 @@ TEST(expmod, test_vectors)
         // Full-width base triggers normalization headroom path in rem().
         {"80000000000000000000000000000000", "01", "80000000000000000000000000000001",
             "80000000000000000000000000000000"},
-        {"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-         "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-         "00002",
-            "01",
-            "80000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000001",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000002"},
         {
             "03",
             "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e",
             "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
             "0000000000000000000000000000000000000000000000000000000000000001",
-        },
-        {
-            "02",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000000000000000000000000000000000000000000000003",
-            "0006",
-            "0002",
         },
         {
             "20000000000000000000000000000000000000000000000000000000000000000000000000000010200000"
@@ -189,6 +237,18 @@ TEST(expmod, test_vectors)
             "02020202020202020202020202020202",
             "01010101010101010101010101010101",
         },
+        // base wider than mod (9 bytes vs 1 byte), odd mod.
+        {"000000000000000009", "01", "07", "02"},
+        // base >> mod (32 bytes vs 1 byte), odd mod.
+        {"0000000000000000000000000000000000000000000000000000000000000002", "01", "07", "02"},
+        // mod >> base (32 bytes vs 1 byte), odd mod.
+        {"02", "01", "8000000000000000000000000000000000000000000000000000000000000007",
+            "0000000000000000000000000000000000000000000000000000000000000002"},
+        // mod >> base (32 bytes vs 1 byte), even mod.
+        {"02", "01", "8000000000000000000000000000000000000000000000000000000000000006",
+            "0000000000000000000000000000000000000000000000000000000000000002"},
+        // base >> mod (32 bytes vs 1 byte), even mod.
+        {"0000000000000000000000000000000000000000000000000000000000000002", "01", "06", "02"},
         // Test cases for AMM.
         {"03", "02", "09", "00"},
         {"03", "02", "0000000000000000000000000000000000000000000000000000000000000009",
@@ -198,75 +258,6 @@ TEST(expmod, test_vectors)
             "000000000000000000000000000000000000000009",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
             "000000000000000000000000000000000000000000"},
-        {"03", "02",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000000000000000000000000000000000000000000000009",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000"},
-        {"03", "02",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000000009",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000000000"},
-        {"03", "02",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000009",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000000"},
         {"02", "02",
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -276,140 +267,77 @@ TEST(expmod, test_vectors)
             "000000000000000000000000000000000000000000000000000000000000000000000000000000000004"},
         {"fffffffffffffffffffffffffffffffe", "02", "ffffffffffffffffffffffffffffffff",
             "00000000000000000000000000000001"},
-        {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "fffffffffffffffffffffffffffffffffffffffffe",
-            "02",
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffff",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000001"},
-        {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe",
-            "02",
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000000000000000000000000000000000000000000000001"},
-        {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe",
-            "02",
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000000001"},
-        {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-         "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe",
-            "02",
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000000000001"},
+        // Small base with multi-word power-of-two modulus (pow2 path: base shorter than mod).
+        {"03", "07", "00000000000000000100000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000088b"},
+        // Small base with multi-word even modulus (even path: trimmed mod shorter than w).
+        // 3^3 mod 12, where 12 is encoded as 16 bytes.
+        {"03", "03", "0000000000000000000000000000000c", "00000000000000000000000000000003"},
+        // Even modulus with leading zeros: 3^3 mod 12, where 12 is encoded as 32 bytes.
+        // CRT product size (odd_size + pow2_size = 2) < declared_mod_size (4 words).
+        {"03", "03", "000000000000000000000000000000000000000000000000000000000000000c",
+            "0000000000000000000000000000000000000000000000000000000000000003"},
+        // Small base with even modulus having large pow2 factor
+        // (even/pow2 path: base shorter than num_pow2_words).
+        // 3^5 mod (5 * 2^128) = 243.
+        {"03", "05", "000000000000000500000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000f3"},
+        // Even modulus with 1-word odd part and multi-word pow2 factor.
+        // Exercises carry/borrow propagation in add/sub with shorter operand.
+        // 2^64 mod (3 * 2^128).
+        {"02", "40", "0300000000000000000000000000000000", "0000000000000000010000000000000000"},
+        // 2^128 mod (3 * 2^128): carry propagates through all high words in add.
+        {"02", "80", "0300000000000000000000000000000000", "0100000000000000000000000000000000"},
+        // 2^129 mod (7 * 2^128): carry propagates and is absorbed in nonzero word.
+        {"02", "0081", "0700000000000000000000000000000000", "0200000000000000000000000000000000"},
     };
 
     for (const auto& [base_hex, exp_hex, mod_hex, expected_result_hex] : test_cases)
     {
-        const auto base = *evmc::from_hex(base_hex);
-        const auto exp = *evmc::from_hex(exp_hex);
-        const auto mod = *evmc::from_hex(mod_hex);
-        const auto expected_result = *evmc::from_hex(expected_result_hex);
-
-        evmc::bytes input(3 * 32, 0);
-        using namespace intx;
-        be::unsafe::store(&input[0], uint256{base.size()});
-        be::unsafe::store(&input[32], uint256{exp.size()});
-        be::unsafe::store(&input[64], uint256{mod.size()});
-        input += base;
-        input += exp;
-        input += mod;
-
-        evmc::bytes result(mod.size(), 0xfe);
-        const auto [status, output_size] =
-            evmone::state::expmod_execute(input.data(), input.size(), result.data(), result.size());
-        EXPECT_EQ(status, EVMC_SUCCESS);
-        EXPECT_EQ(output_size, expected_result.size());
+        const auto result =
+            run(*evmc::from_hex(base_hex), *evmc::from_hex(exp_hex), *evmc::from_hex(mod_hex));
         EXPECT_EQ(hex(result), expected_result_hex);
     }
+}
+
+TEST_P(expmod, large_inputs)
+{
+    // Tests with base/mod of 1024 and 1025 bytes, covering all modulus types.
+
+    // 1024-byte inputs (EIP-7823 limit).
+    expect_last_byte(run({0x02}, {0x01}, make_val(1024, 0x80, 1)), 2);  // odd
+    expect_last_byte(run({0x02}, {0x01}, make_val(1024, 0x01)), 2);     // power-of-two
+    expect_last_byte(run({0x02}, {0x01}, make_val(1024, 0x80, 2)), 2);  // even (1-bit tz)
+
+    // 1025-byte inputs (exceeds EIP-7823, exercises heap fallback for native impl).
+    expect_last_byte(run({0x02}, {0x01}, make_val(1025, 0x80, 1)), 2);  // odd
+    expect_last_byte(run({0x02}, {0x01}, make_val(1025, 0x01)), 2);     // power-of-two
+    expect_last_byte(run({0x02}, {0x01}, make_val(1025, 0x80, 2)), 2);  // even (1-bit tz)
+
+    // Large base AND even modulus (both 1025 bytes, CRT path with large base).
+    // base < mod, so base^1 mod M = base.
+    EXPECT_EQ(run(make_val(1025, 0x40, 0x03), {0x01}, make_val(1025, 0x80, 2)),
+        make_val(1025, 0x40, 0x03));
+
+    // Even modulus with tiny odd part and large pow2 factor.
+    // mod = 3 * 256^1023 (1024 bytes). inv_scratch dominates op_scratch.
+    // 2^1 mod M = 2.
+    expect_last_byte(run({0x02}, {0x01}, make_val(1024, 0x03)), 2);
+
+    // Dense values: (2^N - 2)^2 mod (2^N - 1) = 1. Tests AMM reduction at various sizes.
+    for (const auto n : {size_t{64}, size_t{128}, size_t{256}, size_t{512}, size_t{1024}})
+        expect_last_byte(
+            run(make_val(n, 0xff, 0xfe, 0xff), {0x02}, make_val(n, 0xff, 0xff, 0xff)), 1);
+
+    // AMM test: 3^2 mod 9 = 0, at various sizes.
+    for (const auto n : {size_t{128}, size_t{256}, size_t{1024}})
+        expect_last_byte(run({0x03}, {0x02}, make_val(n, 0x00, 0x09)), 0);
+
+    // Full-width base triggers normalization headroom path in rem(). 136-byte values.
+    expect_last_byte(run(make_val(136, 0x00, 0x02), {0x01}, make_val(136, 0x80, 0x01)), 2);
+
+    // Large exponent (256 bytes): 2^(0x00...03) mod 6 = 8 mod 6 = 2.
+    expect_last_byte(run({0x02}, make_val(256, 0x00, 0x03), {0x06}), 2);
 }
 
 TEST(expmod, analysis_oog)
