@@ -188,7 +188,28 @@ void t8n(const T8NArgs& args)
             }
         }
 
-        if (!args.pre_state_only && rev >= EVMC_PRAGUE)
+        // PoS forks have no mining reward; fill always passes `--state.reward=0`
+        // for Paris+ because `fork.get_reward()` returns 0. Translate that to
+        // nullopt to mirror evmone-blockchaintest's `mining_reward(rev)` — passing
+        // `optional{0}` would otherwise let `state::finalize` touch the coinbase
+        // with a +0 delta and leak it into the BAL (EIP-7928 spec: coinbase must
+        // not appear in an empty block's BAL).
+        const auto reward_for_finalize = (rev >= EVMC_PARIS && args.block_reward.value_or(0) == 0) ?
+                                             std::optional<uint64_t>{} :
+                                             args.block_reward;
+
+        auto res = apply_block(state, vm, block, block_hashes, txs, rev, blob_gas_limit,
+            {.block_reward = reward_for_finalize,
+                .skip_system_calls = args.pre_state_only,
+                .open_trace = args.open_trace});
+
+        // Build the receipts/rejected JSON lists from the partitioned result. `rejected`
+        // is in input order, so walk it alongside the input transactions; the rest map to
+        // `receipts` in block order.
+        std::vector<state::Log> txs_logs;
+        auto rejected_it = res.rejected.begin();
+        size_t receipt_index = 0;
+        for (size_t i = 0; i < txs.size(); ++i)
         {
             if (rejected_it != res.rejected.end() && rejected_it->index == i)
             {
@@ -229,7 +250,20 @@ void t8n(const T8NArgs& args)
         post_state = std::move(res.block_state);
 
         j_result["logsHash"] = hex0x(logs_hash(txs_logs));
-        j_result["stateRoot"] = hex0x(state::mpt_hash(state));
+        j_result["stateRoot"] = hex0x(state::mpt_hash(post_state));
+
+        if (!args.pre_state_only && rev >= EVMC_AMSTERDAM)
+        {
+            // EIP-7928: emit RLP-encoded BlockAccessList plus its hash. The test
+            // framework recomputes the hash from `blockAccessList` and cross-checks
+            // it against `blockAccessListHash` (copied into the fixture header).
+            j_result["blockAccessList"] = hex0x(res.block_access_list.rlp_encode());
+            j_result["blockAccessListHash"] = hex0x(res.block_access_list.hash());
+            // EIP-7928 consensus rule: `bal_items <= block_gas_limit / 2000`. Signal
+            // the block as invalid for fill so it can match the expected exception.
+            if (res.block_access_list.exceeds_gas_limit(static_cast<uint64_t>(block.gas_limit)))
+                j_result["blockException"] = "block access list exceeds gas limit";
+        }
     }
 
     j_result["logsBloom"] = hex0x(compute_bloom_filter(receipts));
