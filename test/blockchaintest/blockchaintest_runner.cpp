@@ -292,7 +292,8 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
         std::unordered_map<hash256, BlockData> block_data{{{c.genesis_block_header.hash,
             {&c.genesis_block_header, false, c.pre_state, c.genesis_block_header.difficulty}}}};
         const auto* canonical_state = &c.pre_state;
-        hash256 canonical_tip_hash = c.genesis_block_header.hash;
+        hash256 canonical_state_root;  // Skip pre-state root hash computation (maybe not needed).
+        auto canonical_tip_hash = c.genesis_block_header.hash;
         intx::uint256 max_total_difficulty = c.genesis_block_header.difficulty;
 
         for (size_t i = 0; i < c.test_blocks.size(); ++i)
@@ -337,9 +338,13 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
                         .total_difficulty = parent_data_it->second.total_difficulty +
                                             test_block.block_info.difficulty,
                     }});
+
+                const auto state_root = state::mpt_hash(inserted_it->second.post_state);
+
                 if (inserted_it->second.total_difficulty >= max_total_difficulty)
                 {
                     canonical_state = &inserted_it->second.post_state;
+                    canonical_state_root = state_root;
                     canonical_tip_hash = test_block.expected_block_header.hash;
                     max_total_difficulty = inserted_it->second.total_difficulty;
                 }
@@ -349,8 +354,7 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
                 EXPECT_TRUE(res.blob_gas_left == 0)
                     << "Transactions used more or less blob gas than expected in block header";
 
-                EXPECT_EQ(state::mpt_hash(inserted_it->second.post_state),
-                    test_block.expected_block_header.state_root);
+                EXPECT_EQ(state_root, test_block.expected_block_header.state_root);
 
                 if (rev >= EVMC_SHANGHAI)
                 {
@@ -419,7 +423,11 @@ void run_blockchain_tests(std::span<const BlockchainTest> tests, evmc::VM& vm)
             std::holds_alternative<TestState>(c.expectation.post_state) ?
                 state::mpt_hash(std::get<TestState>(c.expectation.post_state)) :
                 std::get<hash256>(c.expectation.post_state);
-        EXPECT_EQ(state::mpt_hash(*canonical_state), expected_post_hash)
+
+        // Get the final state hash. In case none blocks have been applied, compute genesis one.
+        const auto canonical_post_hash =
+            canonical_state_root ? canonical_state_root : state::mpt_hash(c.pre_state);
+        EXPECT_EQ(canonical_post_hash, expected_post_hash)
             << "Result state:\n"
             << print_state(*canonical_state)
             << (std::holds_alternative<TestState>(c.expectation.post_state) ?
