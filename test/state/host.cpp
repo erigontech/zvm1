@@ -160,7 +160,7 @@ bool Host::selfdestruct(const address& addr, const address& beneficiary) noexcep
     // Mark the destruction if not done already.
     if (!acc.destructed)
     {
-        m_state.journal_destruct(addr);
+        m_state.journal_account_flags(addr, acc);
         acc.destructed = true;
         return true;
     }
@@ -372,7 +372,7 @@ evmc_access_status Host::access_account(const address& addr) noexcept
     if (acc.access_status == EVMC_ACCESS_WARM || is_precompile(m_rev, addr))
         return EVMC_ACCESS_WARM;
 
-    m_state.journal_access_account(addr);
+    m_state.journal_account_flags(addr, acc);
     acc.access_status = EVMC_ACCESS_WARM;
     return EVMC_ACCESS_COLD;
 }
