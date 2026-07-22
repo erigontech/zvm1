@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "state_transition.hpp"
+#include <evmone/constants.hpp>
 #include <test/utils/bytecode.hpp>
 
 using namespace evmc::literals;
@@ -267,4 +268,52 @@ TEST_F(state_transition, invalid_access_list_amsterdam_gas_limit_below_floor)
     tx.access_list = {{To, {}}};
     tx.gas_limit = 28679;
     expect.tx_error = INTRINSIC_GAS_TOO_LOW;
+}
+
+TEST_F(state_transition, tx_at_sender_nonce_max_minus_1_call)
+{
+    // Regression: a top-level CALL tx must execute normally when the sender nonce is MAX_NONCE - 1
+    // (2^64-2). Only nonce == MAX_NONCE (2^64-1) is invalid per EIP-2681.
+    tx.to = To;
+    pre[Sender].nonce = MAX_NONCE - 1;
+    tx.nonce = MAX_NONCE - 1;
+
+    expect.status = EVMC_SUCCESS;
+    expect.post.at(Sender).nonce = MAX_NONCE;
+}
+
+TEST_F(state_transition, tx_at_sender_nonce_max_minus_1_create)
+{
+    // Regression: a top-level CREATE tx must execute normally when the sender nonce is
+    // MAX_NONCE - 1 (2^64-2). Only nonce == MAX_NONCE (2^64-1) is invalid per EIP-2681.
+    pre[Sender].nonce = MAX_NONCE - 1;
+    tx.nonce = MAX_NONCE - 1;
+
+    expect.status = EVMC_SUCCESS;
+    expect.post.at(Sender).nonce = MAX_NONCE;
+    expect.post[compute_create_address(Sender, MAX_NONCE - 1)] = {.nonce = 1, .code = bytes{}};
+}
+
+TEST_F(state_transition, tx_emits_log)
+{
+    // Smoke test for the `expect.logs` mechanism: assert a log with data and a topic from LOG1.
+    static constexpr auto TOPIC = 0xaa_bytes32;
+    tx.to = To;
+    // Store 0xaabbccdd at mem[28..31], then LOG1(offset=28, size=4, TOPIC) over those bytes.
+    pre[To] = {.code = mstore(0, 0xaabbccdd) + push(TOPIC) + push(4) + push(28) + OP_LOG1};
+
+    expect.post[To] = {};  // the contract survives (has code).
+    expect.logs = {Log{To, bytes{0xaa, 0xbb, 0xcc, 0xdd}, {TOPIC}}};
+}
+
+TEST_F(state_transition, eip7708_transfer_log_tx_value)
+{
+    // Top level transaction with value emits log (EIP-7708).
+    rev = EVMC_AMSTERDAM;
+    tx.to = To;
+    tx.value = 0x12345;
+    pre[Sender].balance += 0x12345;
+
+    expect.post[To].balance = 0x12345;
+    expect.logs = {transfer_log(Sender, To, 0x12345)};
 }
