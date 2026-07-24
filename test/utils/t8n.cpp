@@ -72,6 +72,7 @@ void t8n(const T8NArgs& args)
         block = from_json_with_rev(j, rev, blob_params);
         block_hashes = from_json<TestBlockHashes>(j);
     }
+    block.chain_id = args.chain_id;
 
     JSON j_result;
 

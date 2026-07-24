@@ -358,7 +358,7 @@ evmc_tx_context Host::get_tx_context() const noexcept
         m_block.timestamp,
         m_block.gas_limit,
         m_block.prev_randao,
-        bytes32{m_tx.chain_id},
+        uint256be{m_block.chain_id},
         uint256be{m_block.base_fee},
         intx::be::store<uint256be>(m_block.blob_base_fee.value_or(0)),
         m_tx.blob_hashes.data(),
