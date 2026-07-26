@@ -380,8 +380,8 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
 
 
 std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> hash,
-    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
-    bool parity) noexcept
+    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
+    RecoveryMode mode) noexcept
 {
     // Follows "Elliptic Curve Digital Signature Algorithm - Public key recovery"
     // https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm#Public_key_recovery
@@ -391,7 +391,9 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     if (!opt_r.has_value() || *opt_r == 0) [[unlikely]]
         return std::nullopt;
 
-    const auto opt_s = Curve::Fr::from_bytes(s_bytes);
+    const auto opt_s = mode == RecoveryMode::strict ?
+                           Curve::Fr::from_bytes<Curve::Fr::Range::half>(s_bytes) :
+                           Curve::Fr::from_bytes<Curve::Fr::Range::full>(s_bytes);
     if (!opt_s.has_value() || *opt_s == 0) [[unlikely]]
         return std::nullopt;
 
@@ -428,8 +430,8 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
 }
 
 std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
-    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
-    bool parity) noexcept
+    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
+    RecoveryMode mode) noexcept
 {
 #if defined(SP1TURBO) || defined(SP1)
     // Validate r and s.
@@ -483,6 +485,8 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     return to_address(serialized);
 #else
     const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity);
+    // TODO(C++23): use std::optional::and_then.
+    const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity, mode);
     if (!pubkey.has_value())
         return std::nullopt;
 
