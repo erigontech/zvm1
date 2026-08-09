@@ -131,21 +131,13 @@ void t8n(const T8NArgs& args)
                 auto tx = from_json<state::Transaction>(j_txs[i]);
                 tx.chain_id = args.chain_id;
 
-                const auto computed_tx_hash = keccak256(rlp::encode(tx));
-                const auto computed_tx_hash_str = hex0x(computed_tx_hash);
-
-                if (j_txs[i].contains("hash"))
+                if (const auto loaded_tx_hash = load_optional<hash256>(j_tx, "hash"))
                 {
-                    const auto loaded_tx_hash_opt =
-                        evmc::from_hex<bytes32>(j_txs[i]["hash"].get<std::string>());
-
-                    if (!loaded_tx_hash_opt)
-                        throw std::logic_error("transaction hash hex is malformed: " +
-                                               j_txs[i]["hash"].get<std::string>());
-                    if (*loaded_tx_hash_opt != computed_tx_hash)
+                    const auto computed_tx_hash = keccak256(rlp::encode(tx));
+                    if (*loaded_tx_hash != computed_tx_hash)
                         throw std::logic_error("transaction hash mismatched: computed " +
-                                               computed_tx_hash_str + ", expected " +
-                                               hex0x(*loaded_tx_hash_opt));
+                                               hex0x(computed_tx_hash) + ", expected " +
+                                               hex0x(*loaded_tx_hash));
                 }
 
                 std::optional<StreamRedirect> trace_guard;
