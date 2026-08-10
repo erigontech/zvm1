@@ -190,9 +190,15 @@ void t8n(const T8NArgs& args)
 
         if (!args.pre_state_only && rev >= EVMC_PRAGUE)
         {
-            auto deposits_result = collect_deposit_requests(receipts);
-            if (deposits_result.has_value())
-                requests.emplace_back(std::move(*deposits_result));
+            if (rejected_it != res.rejected.end() && rejected_it->index == i)
+            {
+                JSON j_rejected_tx;
+                j_rejected_tx["hash"] = hex0x(rejected_it->hash);
+                j_rejected_tx["index"] = i;
+                j_rejected_tx["error"] = rejected_it->error.message();
+                j_result["rejected"].push_back(j_rejected_tx);
+                ++rejected_it;
+            }
             else
                 // Report invalid block in the JSON result when deposit collection fails.
                 j_result["blockException"] = "invalid deposit event layout";
