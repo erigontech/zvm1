@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "blockchaintest.hpp"
+#include "error_matching.hpp"
 #include "statetest.hpp"
 #include "utils.hpp"
 
@@ -148,7 +149,7 @@ BlockchainTest load_blockchain_test_case(const std::string& name, const json::js
                     "tests with invalidly rlp-encoded blocks are not supported");
 
             auto test_block = load_test_block(el.at("rlp_decoded"), bt.network, bt.blob_schedule);
-            test_block.expected_exception = map_legacy_block_exception(it->get<std::string>());
+            test_block.expected_exception = map_legacy_exception(it->get<std::string>());
             test_block.rlp = from_json<bytes>(el.at("rlp"));
             bt.test_blocks.emplace_back(test_block);
         }
