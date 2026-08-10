@@ -131,16 +131,6 @@ public:
 };
 
 /// The affine (two coordinates) point on an Elliptic Curve over a prime field.
-template <typename ValueT>
-struct Point
-{
-    ValueT x = {};
-    ValueT y = {};
-
-    friend constexpr Point operator-(const Point& p) noexcept { return {p.x, -p.y}; }
-};
-
-/// The affine (two coordinates) point on an Elliptic Curve over a prime field.
 template <typename Curve>
 struct AffinePoint
 {
@@ -211,38 +201,6 @@ struct ProjPoint
 
     friend constexpr ProjPoint operator-(const ProjPoint& p) noexcept { return {p.x, -p.y, p.z}; }
 };
-
-// Jacobian (three) coordinates point implementation.
-template <typename ValueT>
-struct JacPoint
-{
-    ValueT x = 1;
-    ValueT y = 1;
-    ValueT z = 0;
-
-    // Compares two Jacobian coordinates points
-    friend constexpr bool operator==(const JacPoint& a, const JacPoint& b) noexcept
-    {
-        const auto bz2 = b.z * b.z;
-        const auto az2 = a.z * a.z;
-
-        const auto bz3 = bz2 * b.z;
-        const auto az3 = az2 * a.z;
-
-        return a.x * bz2 == b.x * az2 && a.y * bz3 == b.y * az3;
-    }
-
-    friend constexpr JacPoint operator-(const JacPoint& p) noexcept { return {p.x, -p.y, p.z}; }
-
-    // Creates Jacobian coordinates point from affine point
-    static constexpr JacPoint from(const ecc::Point<ValueT>& ap) noexcept
-    {
-        return {ap.x, ap.y, ValueT::one()};
-    }
-};
-
-template <typename IntT>
-using InvFn = IntT (*)(const ModArith<IntT>&, const IntT& x) noexcept;
 
 /// Converts a projected point to an affine point.
 template <typename Curve>
