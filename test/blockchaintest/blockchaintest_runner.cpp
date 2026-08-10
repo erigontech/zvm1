@@ -129,7 +129,7 @@ bool validate_block(evmc_revision rev, state::BlobParams blob_params, const Test
 
     // Fail if parent header was not found.
     if (parent_header == nullptr)
-        return false;
+        return make_error_code(UNKNOWN_PARENT);
 
     if (test_block.block_info.number != parent_header->block_number + 1)
         return false;
