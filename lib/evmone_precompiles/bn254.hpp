@@ -57,10 +57,28 @@ struct Curve
 
 using AffinePoint = ecc::AffinePoint<Curve>;
 
-using Point = ecc::Point<uint256>;
-/// Note that real part of G2 value goes first and imaginary part is the second. i.e (a + b*i)
-/// The pairing check precompile EVM ABI presumes that imaginary part goes first.
-using ExtPoint = ecc::Point<std::pair<uint256, uint256>>;
+/// Fq² extension field config: base field extended by the irreducible `u² + 1`.
+/// Stays in this namespace so ADL finds multiply()/inverse() (defined in pairing/bn254/fields.hpp).
+struct Fq2Config
+{
+    using BaseFieldT = Fq;
+    using ValueT = Fq;
+    static constexpr auto DEGREE = 2;
+};
+/// Fq² element with coefficients in (real, imaginary) order.
+using Fq2 = ecc::ExtFieldElem<Fq2Config>;
+
+/// The BN254 twisted curve E₂: y² = x³ + b/ξ over Fq². G2 lives here.
+struct E2
+{
+    using Fp = Fq2;
+    static constexpr auto A = 0;
+    /// b/ξ, i.e. Curve::B divided by the Fq⁶ non-residue ξ.
+    static constexpr Fp B{0x2b149d40ceb8aaae81be18991be06ac3b5b4c5e559dbefa33267e6dc24a138e5_u256,
+        0x9713b03af0fed4cd2cafadeed8fdf4a74fa084e52d1852e4a2bd0685c315d2_u256};
+};
+
+using ExtPoint = ecc::AffinePoint<E2>;
 
 /// Validates that point is from the bn254 curve group
 ///
