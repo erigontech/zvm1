@@ -290,6 +290,59 @@ TEST_P(expmod, inputs)
         {"02", "80", "0300000000000000000000000000000000", "0100000000000000000000000000000000"},
         // 2^129 mod (7 * 2^128): carry propagates and is absorbed in nonzero word.
         {"02", "0081", "0700000000000000000000000000000000", "0200000000000000000000000000000000"},
+
+        // Fixed-window exponentiation in modexp_odd. One case per window width w, and
+        // per width of the leading partial window ((exp_bits - 1) % w + 1), which is what
+        // aligns the remaining windows. The exponents are picked so that the windows
+        // consumed cover 0 (multiply skipped), 1 and 2^w - 1 (first and last precomputed
+        // power). Modulus is the secp256k1 field prime: odd, 4 words, so these also cover
+        // the mul_amm<4> specialization.
+        // exp_bits=16, w=1: plain binary square-and-multiply, no table.
+        {"03", "8005", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "79c4559d064ab3615f6da729a1f67265b88ee2eaba22838109bea30fb7bee31b"},
+        // exp_bits=17, w=2, leading window 1 bit.
+        {"03", "01001b", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "a890a61d8d745fae67a345fb031b048c0cf8952b43622263de0fdc4391a6c6a9"},
+        // exp_bits=18, w=2, leading window 2 bits.
+        {"03", "0200c9", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "600614416289329cf72ef906cdfc1dea20339051ec80ed3ff692eb14ed33be81"},
+        // exp_bits=48, w=2: last exponent size before w becomes 3.
+        {"03", "80013b71b865", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "fd66fdbe1f0c43e6640c121c366b9061c7f13964a572828c8e3968a50dba847f"},
+        // exp_bits=49, w=3, leading window 1 bit.
+        {"03", "0100d2c92fc182", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "651aace134976d8456fcc35686a57cf12670b2e596dabecd0ddae9984ced96c4"},
+        // exp_bits=50, w=3, leading window 2 bits.
+        {"03", "0200a6a7ef231d", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "f722a91e1faa3b57f0a19af8d4506b395a0a342e9ee2cbe65cd7a63155d38537"},
+        // exp_bits=51, w=3, leading window 3 bits.
+        {"03", "04013929f7999c", "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "06f41e370c4ef45a2bc5e1ade1504fbe35e5a42a8f8c2b17ad16a6c657900d48"},
+        // exp_bits=144, w=3: last exponent size before w becomes 4.
+        {"03", "8004cb3ff13151bb9f84a488a5d62e79a680",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "97265df41405de7f9b35c1037c349ef367cffd34ed6a86cb933fe14f84bb12d1"},
+        // exp_bits=145, w=4, leading window 1 bit.
+        {"03", "010014b0a1922289f0b19f56c6c373b0e5cd4a",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "3587c0d41ce1eb59ec2fa686877d8166aa9740f2410f9271592e5f283e3bd738"},
+        // exp_bits=146, w=4, leading window 2 bits.
+        {"03", "02008d61508c16734bdbe4a9578f4c8185d260",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "f65d573e0ba5bdc7cc0e31072eb946ffe5138d0cd4bc936cc1a714d17cdaf954"},
+        // exp_bits=147, w=4, leading window 3 bits.
+        {"03", "040160dce60c2531e93ae750b53938d5b04faf",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "0648a7caabfd3d4b972c034830faf933179ed038e1e6a6c4c3ad26f330fe1397"},
+        // exp_bits=148, w=4, leading window 4 bits.
+        {"03", "0802ae8d294c48793907af3e71b536ed84fa84",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "40c2770e749bcbf7949855252da0258cc5ae80658427a4af8ba3489a81182ee9"},
+        // Same, with a 5-word modulus: the windowed loop above only ever runs through the
+        // mul_amm<4> specialization, this covers the generic instantiation.
+        {"03", "08f83d563ebc382e09e4b8245edebc817af708",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+            "8016137e4c542dd66f4ab5f668fc0ac76d43353a675f3d4616a56f23757e463ca1093164385ef006"},
     };
 
     for (const auto& [base_hex, exp_hex, mod_hex, expected_result_hex] : test_cases)

@@ -284,8 +284,8 @@ public:
 
     [[nodiscard]] size_t bit_width() const noexcept { return bit_width_; }
 
-    /// Returns the bit value of the exponent at the given index, counting from the most significant
-    /// bit (e[0] is the top bit).
+    /// Returns the bit value of the exponent at the given index, counting from the least
+    /// significant bit (e[0] is the bottom bit, e[bit_width() - 1] is the top bit, always set).
     bool operator[](size_t index) const noexcept
     {
         // TODO: Replace this with a custom iterator type.
@@ -372,8 +372,33 @@ template <>
     mul_amm_256(r, x, y, mod, mod_inv);
 }
 
+/// Maximum window width used by the windowed method in modexp_odd.
+constexpr unsigned MAX_WINDOW_WIDTH = 4;
+
+/// Number of precomputed values for the max width windowed method.
+constexpr size_t MAX_PRECOMPUTED = (size_t{1} << MAX_WINDOW_WIDTH) - 1;
+
+/// Selects the fixed-window width from the exponent bit length.
+///
+/// TODO: Switch to a sliding window: the table then holds only odd powers. Measured ~3-7%.
+/// TODO: Tune for the densest exponent instead of the average, because gas is charged on
+///   exponent bit length and ignores Hamming weight. The width then collapses to
+///   min(MAX_WINDOW_WIDTH, (bit_width(exp_bits) + 1) / 2). Measured +10.7% worst case.
+constexpr unsigned window_width(size_t exp_bits) noexcept
+{
+    // Break-even points for a random exponent, where the 2^w extra table multiplies stop
+    // being repaid: 2^w / ((1-2^-w)/w - (1-2^-(w+1))/(w+1)) = 16, 48, 140 (rounded to 144).
+    if (exp_bits <= 16)
+        return 1;
+    if (exp_bits <= 48)
+        return 2;
+    if (exp_bits <= 144)
+        return 3;
+    return MAX_WINDOW_WIDTH;
+}
+
 /// Computes result[] = base[]^exp % mod[] for odd mod[] (mod[0] % 2 != 0).
-/// Scratch space required: 4n + 3*base.size() + 2 words, where n = mod.size().
+/// Scratch space required: (MAX_PRECOMPUTED + 3)*mod.size() + 3*base.size() + 2 words.
 void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Exponent exp,
     std::span<const uint64_t> mod, std::span<uint64_t> scratch) noexcept
 {
@@ -384,17 +409,24 @@ void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Expo
 
     const auto n = mod.size();
     const auto mod_inv = -evmmax::modinv(mod[0]);
+    const auto exp_bits = exp.bit_width();
 
-    // Layout: u[n+base.size()] | base_mont[n] | t/rem_scratch[max(n, 2*(n+base.size())+2)]
-    // t and rem_scratch share the same region (exclusive lifetimes).
-    assert(scratch.size() >= 4 * n + 3 * base.size() + 2);
+    const auto w = window_width(exp_bits);
+    const auto table_size = (size_t{1} << w) - 1;
 
-    // Compute base_mont = (base * R) % mod, where R = 2^(n*64).
-    // The numerator u = base << (n*64): base in the upper words, lower n words are zero.
+    // Layout: u[n + base.size()] | table[MAX_PRECOMPUTED*n]
+    //       | rem_scratch[2*n + 2*base.size() + 2].
+    // u and rem_scratch are dead after the to-Montgomery conversion; u's first n words are
+    // then reused as the exponentiation double-buffer.
+    assert(scratch.size() >= (MAX_PRECOMPUTED + 3) * n + 3 * base.size() + 2);
     const auto u = scratch.subspan(0, n + base.size());
-    const auto base_mont = scratch.subspan(n + base.size(), n);
-    const auto rem_scratch = scratch.subspan(2 * n + base.size(), 2 * n + 2 * base.size() + 2);
+    const auto table = scratch.subspan(n + base.size(), MAX_PRECOMPUTED * n);
+    const auto base_mont = table.first(n);
+    const auto rem_scratch =
+        scratch.subspan(n + base.size() + MAX_PRECOMPUTED * n, 2 * n + 2 * base.size() + 2);
 
+    // Compute base_mont = table[0] = (base * R) % mod, where R = 2^(n*64).
+    // The numerator u = base << (n*64): base in the upper words, lower n words are zero.
     std::ranges::fill(u.first(n), uint64_t{0});  // Lower n words of u must be zero.
     std::ranges::copy(base, u.subspan(n).begin());
     rem(base_mont, u, mod, rem_scratch);
@@ -403,28 +435,58 @@ void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Expo
     const auto exp_loop = [&]<size_t N>() {
         auto r_cur = std::span<uint64_t, N>{result};
         auto r_tmp = std::span<uint64_t, N>{u.first(n)};
-        const auto bm = std::span<const uint64_t, N>{base_mont};
         const auto m = std::span<const uint64_t, N>{mod};
 
-        std::ranges::copy(bm, r_cur.begin());
-        for (auto i = exp.bit_width() - 1; i != 0; --i)
+        // base_mont^j, for j in 1..table_size.
+        const auto precomputed = [table, n](size_t j) noexcept {
+            return std::span<uint64_t, N>{table.subspan((j - 1) * n, n)};
+        };
+
+        // precomputed(1) = base_mont is already set.
+        for (size_t j = 2; j <= table_size; ++j)
+            mul_amm<N>(precomputed(j), precomputed(j - 1), precomputed(1), m, mod_inv);
+
+        // Reads the `width` exponent bits starting at index `lo`.
+        // TODO: A window spans at most two adjacent bytes, so it could be read with one
+        //   two-byte load, a shift and a mask. Est. 1-3%, and only for a 4-word modulus
+        //   with a very long exponent; measure before doing it.
+        const auto window = [&](size_t lo, size_t width) noexcept {
+            size_t v = 0;
+            for (size_t b = 0; b < width; ++b)
+                v |= size_t{exp[lo + b]} << b;
+            return v;
+        };
+
+        // Windows tile from the bottom, so the ragged one is processed first, at the top.
+        // The top bit is always set, so that first window is nonzero.
+        // TODO: Tiling from the top instead would save w - top_width squarings when
+        //   exp_bits % w != 0 (up to 4%), at the cost of a special-cased final iteration.
+        const size_t top_width = (exp_bits - 1) % w + 1;
+        std::ranges::copy(precomputed(window(exp_bits - top_width, top_width)), r_cur.begin());
+
+        for (size_t pos = exp_bits - top_width; pos != 0;)
         {
-            mul_amm<N>(r_tmp, r_cur, r_cur, m, mod_inv);  // Square.
-            if (exp[i - 1])
-                mul_amm<N>(r_cur, r_tmp, bm, m, mod_inv);  // Multiply.
-            else
+            pos -= w;
+            for (unsigned s = 0; s != w; ++s)  // square w times
+            {
+                mul_amm<N>(r_tmp, r_cur, r_cur, m, mod_inv);
                 std::swap(r_cur, r_tmp);
+            }
+            if (const size_t v = window(pos, w); v != 0)  // multiply by base_mont^v
+            {
+                mul_amm<N>(r_tmp, r_cur, precomputed(v), m, mod_inv);
+                std::swap(r_cur, r_tmp);
+            }
         }
 
-        // Convert from Montgomery form: multiply by 1.
+        // Convert from Montgomery form: multiply by 1. Reuses precomputed(1) storage.
         std::ranges::fill(base_mont, uint64_t{0});
         base_mont[0] = 1;
         mul_amm<N>(r_tmp, r_cur, std::span<const uint64_t, N>{base_mont}, m, mod_inv);
-        std::swap(r_cur, r_tmp);
 
         // If the result ended up in scratch, copy to result.
-        if (r_cur.data() != result.data())
-            std::ranges::copy(r_cur, result.begin());
+        if (r_tmp.data() != result.data())
+            std::ranges::copy(r_tmp, result.begin());
     };
 
     if (n == 4)
@@ -589,10 +651,11 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
 
     // Bump allocator for all working memory (values + scratch).
     // Stack buffer covers inputs up to the EIP-7823 limit (1024 bytes).
-    // Capacity: values[b+2m] + op scratch[4m+3b+2] + CRT[m+2] = 4b+7m+4 words.
+    // Capacity: values[b+2m] + op scratch[(MAX_PRECOMPUTED+3)m+3b+2] + CRT[m+2]
+    //           = 4b + (MAX_PRECOMPUTED+6)m + 4 words.
     // The worst case is an even modulus with 1 trailing zero bit (odd_size=m, pow2_size=1).
     static constexpr size_t MAX_SIZE = 1024 / sizeof(uint64_t);  // EIP-7823
-    static constexpr size_t STACK_CAPACITY = 4 * MAX_SIZE + 7 * MAX_SIZE + 4;
+    static constexpr size_t STACK_CAPACITY = 4 * MAX_SIZE + (6 + MAX_PRECOMPUTED) * MAX_SIZE + 4;
     alignas(uint64_t) std::byte stack_buf[STACK_CAPACITY * sizeof(uint64_t)];
     std::pmr::monotonic_buffer_resource pool{stack_buf, sizeof(stack_buf)};
     std::pmr::polymorphic_allocator<uint64_t> alloc{&pool};
@@ -636,7 +699,8 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
         const auto need_crt = !pow2_is_trivial && !odd_is_trivial;
 
         // Allocate operation scratch (dead after each call, reused sequentially).
-        const size_t odd_scratch = !odd_is_trivial ? 4 * odd_size + 3 * base.size() + 2 : 0;
+        const size_t odd_scratch =
+            !odd_is_trivial ? (MAX_PRECOMPUTED + 3) * odd_size + 3 * base.size() + 2 : 0;
         const size_t pow2_scratch = !pow2_is_trivial ? pow2_size : 0;
         const size_t inv_scratch = need_crt ? 2 * pow2_size : 0;
         const size_t op_scratch_size = std::max({odd_scratch, pow2_scratch, inv_scratch});
