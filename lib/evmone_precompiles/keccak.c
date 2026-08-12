@@ -35,6 +35,21 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
 #define ALWAYS_INLINE
 #endif
 
+/**
+ * Whether to clear the state with explicit stores rather than leave the spelling to the compiler.
+ *
+ * `uint64_t state[25] = {0}` is a 200-byte clear. On RISC-V the compiler has no cheap inline
+ * expansion for it and emits a call to memset -- one call per hash. That holds for both rv64, where
+ * 25 stores replace it, and rv32, where 50 do and the call is the more expensive of the two.
+ * Where the initializer is expanded inline already, as on x86-64, there is nothing to gain and the
+ * plain form is kept; RISC-V is what this was measured on, so RISC-V is what is named here.
+ */
+#if defined(__riscv)
+#define KECCAK_INLINE_STATE_CLEAR 1
+#else
+#define KECCAK_INLINE_STATE_CLEAR 0
+#endif
+
 #if !__has_builtin(__builtin_memcpy) && !defined(__GNUC__)
 #include <string.h>
 #define __builtin_memcpy memcpy
@@ -58,6 +73,22 @@ static inline ALWAYS_INLINE uint64_t load_le(const uint8_t* data)
     __builtin_memcpy(&word, data, sizeof(word));
     return to_le64(word);
 }
+
+#if KECCAK_INLINE_STATE_CLEAR
+/// Clears the state with 25 stores.
+///
+/// The unrolling is load bearing, not a micro-optimization of the loop itself: left as a loop this
+/// is a 200-byte clear again, and the call comes back. Unrolled there is no loop left to recognize,
+/// with GCC and clang alike and at every optimization level. The call it replaces is newlib's
+/// memset doing about 80 instructions for this clear, on every hash.
+static inline ALWAYS_INLINE void clear_state(uint64_t state[25])
+{
+    size_t i;
+#pragma GCC unroll 25
+    for (i = 0; i < 25; ++i)
+        state[i] = 0;
+}
+#endif
 
 /// Rotates the bits of x left by the count value specified by s.
 /// The s must be in range <0, 64> exclusively, otherwise the result is undefined.
@@ -346,7 +377,12 @@ static inline ALWAYS_INLINE void keccak(
     uint64_t last_word = 0;
     uint8_t* last_word_iter = (uint8_t*)&last_word;
 
+#if KECCAK_INLINE_STATE_CLEAR
+    uint64_t state[25];
+    clear_state(state);
+#else
     uint64_t state[25] = {0};
+#endif
 
     while (size >= block_size)
     {
