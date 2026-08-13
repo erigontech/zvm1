@@ -32,6 +32,11 @@ public:
     /// alive and unmodified; an implementation that has no such storage must keep the bytes
     /// alive itself. Callers that need ownership copy at the point of use; most only inspect.
     virtual bytes_view get_account_code(const address& addr) const noexcept = 0;
+
+    /// get_account_code() with CODE_PADDING trailing zero bytes, so the interpreter can execute
+    /// out of the buffer; see baseline::analyze_no_copy(). Returns empty if the implementation
+    /// cannot promise the padding, in which case callers fall back to get_account_code().
+    virtual bytes_view get_account_code_view(const address& /*addr*/) const noexcept { return {}; }
     virtual bytes32 get_storage(const address& addr, const bytes32& key) const noexcept = 0;
 };
 

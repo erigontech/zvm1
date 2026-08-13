@@ -138,7 +138,7 @@ void CodeCache::put(const evmc::bytes32& code_hash, std::shared_ptr<baseline::Co
 
 std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revision rev,
     const evmc_message& msg, const evmc::bytes32& code_hash,
-    const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept
+    const std::function<std::pair<evmc::bytes_view, bool>(evmc::address)>& get_code) noexcept
 {
     if (execute != static_cast<decltype(execute)>(baseline::execute))  // Only Baseline is supported
         return {};
@@ -146,8 +146,10 @@ std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revis
     auto p = m_code_cache.get(code_hash);
     if (p == nullptr)
     {
-        const auto code = get_code(msg.code_address);
-        p = std::make_shared<baseline::CodeAnalysis>(baseline::analyze(code));
+        const auto [code, borrowed] = get_code(msg.code_address);
+        // Borrowed code outlives this cache entry and is padded, so it needs no copy.
+        p = std::make_shared<baseline::CodeAnalysis>(
+            borrowed ? baseline::analyze_no_copy(code) : baseline::analyze(code));
         m_code_cache.put(code_hash, p);
     }
 
