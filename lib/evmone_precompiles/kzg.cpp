@@ -56,6 +56,8 @@ blst_p1_affine add_or_double(const blst_p1_affine& p, const blst_p1& q) noexcept
 
 bool pairings_verify(const blst_p1_affine& a1, const blst_p1_affine& b1) noexcept
 {
+    // Neither argument may be [0]₁: blst_miller_loop_lines() has no shortcut for it
+    // (blst_aggregated_in_g1() does) and would run a full Miller loop for nothing.
     // Uses precomputed Miller loop lines for the G2 generator [1]₂.
     blst_fp12 left;
     blst_miller_loop_lines(&left, g2_gen_lines(), &a1);
@@ -106,6 +108,12 @@ bool kzg_verify_proof(const std::byte versioned_hash[VERSIONED_HASH_SIZE], const
     //     e(C + [z]π - [y]₁, [1]₂) =? e(π, [s]₂)
     // which eliminates the G2 multiplication and uses the 2-point MSM for G1.
 
+    // The all-zero blob commits to [0]₁ with y = 0 and opening proof π = [0]₁, and rollups
+    // pad unused blob slots with it, so this input reaches mainnet regularly. Both pairings
+    // are then e([0]₁, ·) = 1 and the equation reduces to y = 0.
+    if (blst_p1_affine_is_inf(&*C) && blst_p1_affine_is_inf(&*Pi)) [[unlikely]]
+        return std::ranges::all_of(yy->b, [](uint8_t b) noexcept { return b == 0; });
+
     // Compute [z]π + [y](-[1]₁).
     const blst_p1_affine* const points[]{&*Pi, &G1_GENERATOR_NEGATIVE};
     const byte* const scalars[]{zz->b, yy->b};
@@ -115,6 +123,13 @@ bool kzg_verify_proof(const std::byte versioned_hash[VERSIONED_HASH_SIZE], const
 
     // Compute C + ([z]π - [y]₁). The addends may be the same / opposite points.
     const auto lsh_g1 = add_or_double(*C, z_pi_minus_y_g1);
+
+    // Keep [0]₁ out of the pairing: e([0]₁, Q) = 1 for any Q, so the equation holds
+    // exactly when both sides are [0]₁.
+    const bool lhs_inf = blst_p1_affine_is_inf(&lsh_g1);
+    const bool pi_inf = blst_p1_affine_is_inf(&*Pi);
+    if (lhs_inf || pi_inf) [[unlikely]]
+        return lhs_inf && pi_inf;
 
     // e(C + [z]π - [y]₁, [1]₂) =? e(π, [s]₂)
     return pairings_verify(lsh_g1, *Pi);

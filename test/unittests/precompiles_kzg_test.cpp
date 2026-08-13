@@ -45,6 +45,18 @@ TEST(kzg, verify_proof_zero)
     EXPECT_TRUE(r);
 }
 
+TEST(kzg, verify_proof_zero_nonzero_y)
+{
+    // f(x) = 0 committed as C = π = O, but claiming f(z) = 1.
+    std::byte z[32]{};
+    z[13] = std::byte{17};
+    std::byte y[32]{};
+    y[31] = std::byte{1};
+    const auto hash = versioned_hash(POINT_AT_INFINITY);
+    const auto r = kzg_verify_proof(hash.data(), z, y, POINT_AT_INFINITY, POINT_AT_INFINITY);
+    EXPECT_FALSE(r);
+}
+
 TEST(kzg, verify_g2_gen_lines)
 {
     blst_fp6 expected[68];
