@@ -61,15 +61,23 @@ private:
 
     /// Padded code for faster legacy code execution.
     /// If not nullptr m_code must point to it.
-    std::unique_ptr<uint8_t[]> m_padded_code;
+    /// Owns whatever this analysis allocated: the padded code copy for the owning
+    /// constructor, or just the jumpdest bitset when the code is borrowed.
+    std::unique_ptr<uint8_t[]> m_storage;
 
     BitsetSpan m_jumpdest_bitset{nullptr};
 
 public:
+    /// Constructor for legacy code left in the caller's buffer, which must outlive the
+    /// analysis and carry the padding analyze_legacy() would have added.
+    CodeAnalysis(bytes_view code, std::unique_ptr<uint8_t[]> storage, BitsetSpan map)
+      : m_code{code}, m_storage{std::move(storage)}, m_jumpdest_bitset{map}
+    {}
+
     /// Constructor for legacy code.
     CodeAnalysis(std::unique_ptr<uint8_t[]> padded_code, size_t code_size, BitsetSpan map)
       : m_code{padded_code.get(), code_size},
-        m_padded_code{std::move(padded_code)},
+        m_storage{std::move(padded_code)},
         m_jumpdest_bitset{map}
     {}
 
@@ -85,12 +93,20 @@ public:
     }
 };
 
+/// The code padding the interpreter relies on: 32 bytes for the data of a PUSH32 truncated by
+/// the code end, plus one more for a STOP terminating the code. Buffers executed in place must
+/// carry this many trailing zero bytes; analyze() adds it to its own copy.
+constexpr size_t CODE_PADDING = 32 + 1;
+
 /// Analyze the EVM code in preparation for execution.
 ///
 /// This builds the map of valid JUMPDESTs.
 ///
 /// @param code         The reference to the EVM code to be analyzed.
 EVMC_EXPORT CodeAnalysis analyze(bytes_view code);
+
+/// analyze() that does not copy the code. See the borrowing CodeAnalysis constructor.
+EVMC_EXPORT CodeAnalysis analyze_no_copy(bytes_view code);
 
 /// Executes in Baseline interpreter using EVMC-compatible parameters.
 evmc_result execute(evmc_vm* vm, const evmc_host_interface* host, evmc_host_context* ctx,

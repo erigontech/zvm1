@@ -127,6 +127,10 @@ public:
 
     bytes_view get_code(const address& addr);
 
+    /// get_code() for the interpreter: the bool tells whether the returned view is borrowed
+    /// from the StateView, i.e. outlives this State and carries the analysis padding.
+    std::pair<bytes_view, bool> get_code_for_execution(const address& addr);
+
     StorageValue& get_storage(const address& addr, const bytes32& key);
 
     StateDiff build_diff(evmc_revision rev) const;

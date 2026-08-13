@@ -561,6 +561,20 @@ bytes_view State::get_code(const address& addr)
     return m_initial.get_account_code(addr);
 }
 
+std::pair<bytes_view, bool> State::get_code_for_execution(const address& addr)
+{
+    auto* a = find(addr);
+    if (a == nullptr)
+        return {{}, false};
+    if (a->code_hash == Account::EMPTY_CODE_HASH)
+        return {{}, false};
+    if (!a->code.empty())  // Modified in this transaction: owned by the Account, not padded.
+        return {a->code, false};
+    if (const auto borrowed = m_initial.get_account_code_view(addr); !borrowed.empty())
+        return {borrowed, true};
+    return {m_initial.get_account_code(addr), false};
+}
+
 Account& State::touch(const address& addr)
 {
     auto& acc = get_or_insert(addr, {.erase_if_empty = true});

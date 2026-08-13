@@ -79,14 +79,9 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
 
 CodeAnalysis analyze_legacy(bytes_view code)
 {
-    // We need at most 33 bytes of code padding: 32 for possible missing all data bytes of
-    // the PUSH32 at the code end; and one more byte for STOP to guarantee there is a terminating
-    // instruction at the code end.
-    static constexpr auto PADDING = 32 + 1;
-
     static constexpr auto BITSET_ALIGNMENT = alignof(BitsetSpan::word_type);
 
-    const auto padded_code_size = code.size() + PADDING;
+    const auto padded_code_size = code.size() + CODE_PADDING;
     const auto aligned_code_size =
         (padded_code_size + (BITSET_ALIGNMENT - 1)) / BITSET_ALIGNMENT * BITSET_ALIGNMENT;
     const auto bitset_words = (code.size() + (BitsetSpan::WORD_BITS)) / BitsetSpan::WORD_BITS;
@@ -110,5 +105,21 @@ CodeAnalysis analyze_legacy(bytes_view code)
 CodeAnalysis analyze(bytes_view code)
 {
     return analyze_legacy(code);
+}
+
+CodeAnalysis analyze_no_copy(bytes_view code)
+{
+    // Executes out of the caller's buffer; only the jumpdest bitset is allocated.
+    // @p code must outlive the analysis and carry the same padding analyze_legacy() adds.
+    const auto bitset_words = (code.size() + BitsetSpan::WORD_BITS) / BitsetSpan::WORD_BITS;
+    const auto total_size = bitset_words * sizeof(BitsetSpan::word_type);
+
+    auto storage = std::make_unique<uint8_t[]>(total_size);  // Zero-initialized bitset.
+
+    const auto bitset_storage = new (storage.get()) BitsetSpan::word_type[bitset_words];
+    const BitsetSpan jumpdest_bitset{bitset_storage};
+    analyze_jumpdests(jumpdest_bitset, code);
+
+    return {code, std::move(storage), jumpdest_bitset};
 }
 }  // namespace evmone::baseline

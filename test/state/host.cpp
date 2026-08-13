@@ -268,6 +268,15 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     }
 
     const bytes_view initcode{msg.input_data, msg.input_size};
+    // Initcode is analyzed with a copy (analyze()), because unlike account code it carries no
+    // CODE_PADDING: it is a slice of the caller's EVM memory, and the bytes after it are either
+    // live memory the caller wrote or stale bytes from an earlier frame (Memory::clear() only
+    // resets the size).
+    // TODO: the copy is avoidable. The caller's memory is ours and the child frame gets its own
+    //   Memory, so nothing can observe or mutate those bytes while the initcode runs: save the 33
+    //   bytes after the initcode, zero them, execute borrowed, then restore. Does not apply when
+    //   the initcode comes from transaction data rather than memory (a top-level create), which
+    //   would need the same padding guarantee on the tx input buffer.
     auto result = m_vm.execute(*this, m_rev, create_msg, initcode.data(), initcode.size());
     if (result.status_code != EVMC_SUCCESS)
     {
@@ -458,7 +467,7 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
 
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
-        [this](const address& addr) { return m_state.get_code(addr); });
+        [this](const address& addr) { return m_state.get_code_for_execution(addr); });
     if (opt_result.has_value())
         return std::move(*opt_result);
 
