@@ -113,7 +113,25 @@ add_test(
 )
 set_tests_properties(
     ${PREFIX}/tx_invalid_nonce PROPERTIES
-    PASS_REGULAR_EXPRESSION "unexpected invalid transaction: nonce too high"
+    PASS_REGULAR_EXPRESSION "unexpected invalid transaction: TransactionException.NONCE_MISMATCH_TOO_HIGH"
+)
+
+add_test(
+    NAME ${PREFIX}/tx_invalid_signature
+    COMMAND evmone-statetest ${TESTS_TX}/invalid_signature.json
+)
+set_tests_properties(
+    ${PREFIX}/tx_invalid_signature PROPERTIES
+    PASS_REGULAR_EXPRESSION "unexpected invalid transaction: TransactionException.INVALID_SIGNATURE_VRS"
+)
+
+add_test(
+    NAME ${PREFIX}/tx_invalid_encoding
+    COMMAND evmone-statetest ${TESTS_TX}/invalid_encoding.json
+)
+set_tests_properties(
+    ${PREFIX}/tx_invalid_encoding PROPERTIES
+    PASS_REGULAR_EXPRESSION "unexpected invalid transaction: invalid transaction encoding"
 )
 
 add_test(

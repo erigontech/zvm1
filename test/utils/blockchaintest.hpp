@@ -42,16 +42,16 @@ struct BlockHeader
     std::optional<uint64_t> blob_gas_used;
     std::optional<uint64_t> excess_blob_gas;
     hash256 requests_hash;
-    uint64_t slot_number = 0;
+    std::optional<uint64_t> slot_number;  ///< EIP-7843 — absent before Amsterdam.
 };
 
 struct TestBlock
 {
     state::BlockInfo block_info;
     std::vector<state::Transaction> transactions;
-    size_t rlp_size = 0;
+    bytes rlp;  ///< The block's complete serialization.
     bool withdrawals_parse_success = true;
-    bool valid = true;
+    std::string expected_exception;  ///< Empty for valid blocks.
 
     BlockHeader expected_block_header;
 };

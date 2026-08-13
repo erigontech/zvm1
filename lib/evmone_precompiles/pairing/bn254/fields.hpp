@@ -10,19 +10,9 @@
 namespace evmmax::bn254
 {
 using namespace intx;
-using Fq = Curve::Fp;
 
 // Extension fields implemented based on https://hackmd.io/@jpw/bn254#Field-extension-towers
-
-/// Specifies Fq^2 extension field for bn254 curve. Base field extended with irreducible `u^2 + 1`
-/// polynomial over the base field. `u` is the Fq^2 element.
-struct Fq2Config
-{
-    using BaseFieldT = Fq;
-    using ValueT = Fq;
-    static constexpr auto DEGREE = 2;
-};
-using Fq2 = ecc::ExtFieldElem<Fq2Config>;
+// Fq, Fq2Config, Fq2, and E2 live in bn254.hpp to be reachable from the precompile boundary.
 
 /// Specifies Fq^6 extension field for bn254 curve. Fq^2 field extended with irreducible
 /// `v^3 - (9 + u)` polynomial over the Fq^2 field. `v` is the Fq^6 field element.
@@ -32,10 +22,6 @@ struct Fq6Config
     using ValueT = Fq2;
     static constexpr uint8_t DEGREE = 3;
     static constexpr auto ksi = Fq2({Fq(9_u256), Fq(1_u256)});
-    static constexpr auto _3_ksi_inv = Fq2({
-        Fq(0x2b149d40ceb8aaae81be18991be06ac3b5b4c5e559dbefa33267e6dc24a138e5_u256),
-        Fq(0x9713b03af0fed4cd2cafadeed8fdf4a74fa084e52d1852e4a2bd0685c315d2_u256),
-    });
 };
 using Fq6 = ecc::ExtFieldElem<Fq6Config>;
 
@@ -52,7 +38,7 @@ struct Fq12Config
 using Fq12 = ecc::ExtFieldElem<Fq12Config>;
 
 /// Multiplies two Fq^2 field elements
-constexpr Fq2 multiply(const Fq2& a, const Fq2& b)
+constexpr Fq2 multiply(const Fq2& a, const Fq2& b) noexcept
 {
     const auto& [a0, a1] = a.coeffs;
     const auto& [b0, b1] = b.coeffs;
@@ -60,7 +46,7 @@ constexpr Fq2 multiply(const Fq2& a, const Fq2& b)
 }
 
 /// Squares an Fq^2 field element.
-constexpr Fq2 sqr(const Fq2& a)
+constexpr Fq2 sqr(const Fq2& a) noexcept
 {
     const auto& [a0, a1] = a.coeffs;
 
@@ -70,7 +56,7 @@ constexpr Fq2 sqr(const Fq2& a)
 }
 
 /// Multiplies two Fq^6 field elements
-constexpr Fq6 multiply(const Fq6& a, const Fq6& b)
+constexpr Fq6 multiply(const Fq6& a, const Fq6& b) noexcept
 {
     const auto& [a0, a1, a2] = a.coeffs;
     const auto& [b0, b1, b2] = b.coeffs;
@@ -89,7 +75,7 @@ constexpr Fq6 multiply(const Fq6& a, const Fq6& b)
 }
 
 /// Multiplies two Fq^12 field elements
-constexpr Fq12 multiply(const Fq12& a, const Fq12& b)
+constexpr Fq12 multiply(const Fq12& a, const Fq12& b) noexcept
 {
     const auto& [a0, a1] = a.coeffs;
     const auto& [b0, b1] = b.coeffs;
@@ -106,7 +92,7 @@ constexpr Fq12 multiply(const Fq12& a, const Fq12& b)
 }
 
 /// Inverses the Fq^2 field element
-inline Fq2 inverse(const Fq2& f)
+inline Fq2 inverse(const Fq2& f) noexcept
 {
     const auto& [a0, a1] = f.coeffs;
 
@@ -123,7 +109,7 @@ inline Fq2 inverse(const Fq2& f)
 }
 
 /// Inverses the Fq^6 field element
-inline Fq6 inverse(const Fq6& f)
+inline Fq6 inverse(const Fq6& f) noexcept
 {
     const auto& [a0, a1, a2] = f.coeffs;
 
@@ -148,7 +134,7 @@ inline Fq6 inverse(const Fq6& f)
 }
 
 /// Inverses the Fq^12 field element
-inline Fq12 inverse(const Fq12& f)
+inline Fq12 inverse(const Fq12& f) noexcept
 {
     const auto& [a0, a1] = f.coeffs;
 

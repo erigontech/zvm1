@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <test/utils/error_matching.hpp>
 #include <test/utils/mpt_hash.hpp>
 #include <test/utils/rlp.hpp>
+#include <test/utils/rlp_encode.hpp>
 #include <test/utils/statetest.hpp>
 
 namespace evmone::test
@@ -24,12 +26,40 @@ void run_state_test(const StateTransitionTest& test, evmc::VM& vm, bool trace_su
             //     continue;
 
             const auto& expected = cases[case_index];
-            const auto tx = test.multi_tx.get(expected.indexes);
             auto state = test.pre_state;
             const auto blob_params = get_blob_params(rev, test.blob_schedule);
 
-            const auto res = transition(state, block, test.block_hashes, tx, rev, vm,
-                block.gas_limit, static_cast<int64_t>(state::max_blob_gas_per_block(blob_params)));
+            std::optional<state::Transaction> tx;
+            std::error_code error;
+            if (expected.txbytes.has_value())
+            {
+                tx = state::decode_transaction(*expected.txbytes);
+                if (!tx.has_value())
+                {
+                    error = make_error_code(state::INVALID_ENCODING);
+                }
+                else
+                {
+                    // Decoding is the inverse of encoding: what decoded must encode back exactly.
+                    EXPECT_EQ(rlp::encode(*tx), *expected.txbytes);
+
+                    // Recover the signer, as a node does, instead of taking it from JSON.
+                    const auto sender = state::recover_sender(*tx, *expected.txbytes);
+                    if (sender.has_value())
+                        tx->sender = *sender;
+                    else
+                        error = make_error_code(state::INVALID_SIGNATURE);
+                }
+            }
+            else
+            {
+                tx = test.multi_tx.get(expected.indexes);
+            }
+
+            const auto res =
+                error ? error :
+                        transition(state, block, test.block_hashes, *tx, rev, vm, block.gas_limit,
+                            static_cast<int64_t>(state::max_blob_gas_per_block(blob_params)));
 
             if (holds_alternative<state::TransactionReceipt>(res))
             {
@@ -55,10 +85,18 @@ void run_state_test(const StateTransitionTest& test, evmc::VM& vm, bool trace_su
                 std::clog << R"("stateRoot":"0x)" << hex(state_root) << "\"}\n";
             }
 
-            if (expected.exception)
+            if (!expected.exception.empty())
             {
                 ASSERT_FALSE(holds_alternative<state::TransactionReceipt>(res))
                     << "unexpected valid transaction";
+
+                // The transaction must be rejected for the reason the fixture states, not merely
+                // rejected: a wrong reason is a wrong implementation of the rule being tested.
+                const auto& reason = get<std::error_code>(res);
+                EXPECT_TRUE(is_expected_tx_exception(reason, expected.exception))
+                    << "transaction rejected as \"" << reason.message() << "\", expected "
+                    << expected.exception;
+
                 EXPECT_EQ(logs_hash(std::vector<state::Log>()), expected.logs_hash);
             }
             else

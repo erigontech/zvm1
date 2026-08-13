@@ -24,52 +24,6 @@ std::string_view to_test_fork_name(evmc_revision rev) noexcept
 }
 }  // namespace
 
-[[nodiscard]] std::string get_invalid_tx_message(state::ErrorCode errc) noexcept
-{
-    using namespace state;
-    switch (errc)
-    {
-    case SUCCESS:
-        return "";
-    case INTRINSIC_GAS_TOO_LOW:
-        return "TR_IntrinsicGas";
-    case TX_TYPE_NOT_SUPPORTED:
-        return "TR_TypeNotSupported";
-    case INSUFFICIENT_FUNDS:
-        return "TR_NoFunds";
-    case NONCE_HAS_MAX_VALUE:
-        return "TR_NonceHasMaxValue:";
-    case NONCE_TOO_HIGH:
-        return "TR_NonceTooHigh";
-    case NONCE_TOO_LOW:
-        return "TR_NonceTooLow";
-    case TIP_GT_FEE_CAP:
-        return "TR_TipGtFeeCap";
-    case FEE_CAP_LESS_THAN_BLOCKS:
-        return "TR_FeeCapLessThanBlocks";
-    case GAS_LIMIT_REACHED:
-        return "TR_GasLimitReached";
-    case SENDER_NOT_EOA:
-        return "SenderNotEOA";
-    case INIT_CODE_SIZE_LIMIT_EXCEEDED:
-        return "TR_InitCodeLimitExceeded";
-    case CREATE_BLOB_TX:
-        return "TR_BLOBCREATE";
-    case EMPTY_BLOB_HASHES_LIST:
-        return "TR_EMPTYBLOB";
-    case INVALID_BLOB_HASH_VERSION:
-        return "TR_BLOBVERSION_INVALID";
-    case BLOB_GAS_LIMIT_EXCEEDED:
-        return "TR_BLOBLIST_OVERSIZE";
-    case UNKNOWN_ERROR:
-        return "Unknown error";
-    default:
-        // assert(false);
-        return "Wrong error code";
-    }
-}
-
-
 json::json to_json(const TestState& state)
 {
     json::json j = json::json::object();
@@ -118,7 +72,9 @@ json::json to_state_test(std::string_view test_name, const state::BlockInfo& blo
         jtx["to"] = hex0x(*tx.to);
     jtx["sender"] = hex0x(tx.sender);
     jtx["secretKey"] = hex0x(SenderSecretKey);
+    jtx["chainId"] = hex0x(tx.chain_id);
     jtx["nonce"] = hex0x(tx.nonce);
+    jtx["v"] = hex0x(tx.v);
     if (tx.type >= Transaction::Type::eip1559)
     {
         jtx["maxFeePerGas"] = hex0x(tx.max_gas_price);
@@ -165,17 +121,15 @@ json::json to_state_test(std::string_view test_name, const state::BlockInfo& blo
     if (!tx.authorization_list.empty())
     {
         auto& ja = jtx["authorizationList"];
-        for (const auto& [chain_id, addr, nonce, signer, r, s, y_parity] : tx.authorization_list)
+        for (const auto& auth : tx.authorization_list)
         {
             json::json je;
-            je["chainId"] = hex0x(chain_id);
-            je["address"] = hex0x(addr);
-            je["nonce"] = hex0x(nonce);
-            je["v"] = hex0x(y_parity);
-            je["r"] = hex0x(r);
-            je["s"] = hex0x(s);
-            if (signer.has_value())
-                je["signer"] = hex0x(*signer);
+            je["chainId"] = hex0x(auth.chain_id);
+            je["address"] = hex0x(auth.addr);
+            je["nonce"] = hex0x(auth.nonce);
+            je["v"] = hex0x(auth.y_parity);
+            je["r"] = hex0x(auth.r);
+            je["s"] = hex0x(auth.s);
             ja.emplace_back(std::move(je));
         }
     }
@@ -187,8 +141,8 @@ json::json to_state_test(std::string_view test_name, const state::BlockInfo& blo
 
     if (holds_alternative<std::error_code>(res))
     {
-        jpost["expectException"] = get_invalid_tx_message(
-            static_cast<state::ErrorCode>(std::get<std::error_code>(res).value()));
+        // The error message is the execution-spec-tests exception name.
+        jpost["expectException"] = std::get<std::error_code>(res).message();
         jpost["logs"] = hex0x(logs_hash(std::vector<state::Log>()));
     }
     else

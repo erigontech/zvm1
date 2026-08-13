@@ -284,8 +284,8 @@ public:
 
     [[nodiscard]] size_t bit_width() const noexcept { return bit_width_; }
 
-    /// Returns the bit value of the exponent at the given index, counting from the most significant
-    /// bit (e[0] is the top bit).
+    /// Returns the bit value of the exponent at the given index, counting from the least
+    /// significant bit (e[0] is the bottom bit, e[bit_width() - 1] is the top bit, always set).
     bool operator[](size_t index) const noexcept
     {
         // TODO: Replace this with a custom iterator type.
@@ -295,6 +295,19 @@ public:
         const auto bit_index = index % 8;
         const auto bit = (byte >> bit_index) & 1;
         return bit != 0;
+    }
+
+    /// Returns bits [lo, hi] as an integer, the bit at hi being the most significant.
+    /// The range must span at most 8 bits, so it covers at most two adjacent bytes.
+    [[nodiscard]] size_t window(size_t lo, size_t hi) const noexcept
+    {
+        assert(lo <= hi && hi - lo < 8);
+        const auto exp_size = (bit_width_ + 7) / 8;
+        const auto byte_index = exp_size - 1 - lo / 8;
+        auto bytes = size_t{data_[byte_index]};
+        if (byte_index != 0)  // Prepend the next more significant byte if there is one.
+            bytes |= size_t{data_[byte_index - 1]} << 8;
+        return (bytes >> (lo % 8)) & ((size_t{1} << (hi + 1 - lo)) - 1);
     }
 };
 
@@ -372,8 +385,32 @@ template <>
     mul_amm_256(r, x, y, mod, mod_inv);
 }
 
+/// Maximum window width used by the windowed method in modexp_odd.
+constexpr unsigned MAX_WINDOW_WIDTH = 5;
+static_assert(MAX_WINDOW_WIDTH <= 8, "Exponent::window() covers at most two adjacent bytes");
+
+/// Number of precomputed base odd powers for the max width windowed method.
+constexpr size_t MAX_PRECOMPUTED = size_t{1} << (MAX_WINDOW_WIDTH - 1);
+
+/// Selects the sliding-window width from the exponent bit length.
+constexpr unsigned window_width(size_t exp_bits) noexcept
+{
+    // Break-even points for a random exponent, where the table's extra multiply stops being
+    // repaid: 2^(w-1) / (1/(w+1) - 1/(w+2)) = 6, 24, 80, 240. Each narrower width is kept
+    // one bit longer, which measures better on the sparse small exponents seen in practice.
+    if (exp_bits <= 7)
+        return 1;
+    if (exp_bits <= 25)
+        return 2;
+    if (exp_bits <= 81)
+        return 3;
+    if (exp_bits <= 241)
+        return 4;
+    return MAX_WINDOW_WIDTH;
+}
+
 /// Computes result[] = base[]^exp % mod[] for odd mod[] (mod[0] % 2 != 0).
-/// Scratch space required: 4n + 3*base.size() + 2 words, where n = mod.size().
+/// Scratch space required: (MAX_PRECOMPUTED + 3)*mod.size() + 3*base.size() + 2 words.
 void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Exponent exp,
     std::span<const uint64_t> mod, std::span<uint64_t> scratch) noexcept
 {
@@ -384,17 +421,24 @@ void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Expo
 
     const auto n = mod.size();
     const auto mod_inv = -evmmax::modinv(mod[0]);
+    const auto exp_bits = exp.bit_width();
 
-    // Layout: u[n+base.size()] | base_mont[n] | t/rem_scratch[max(n, 2*(n+base.size())+2)]
-    // t and rem_scratch share the same region (exclusive lifetimes).
-    assert(scratch.size() >= 4 * n + 3 * base.size() + 2);
+    const auto w = window_width(exp_bits);
+    const auto table_size = size_t{1} << (w - 1);
 
-    // Compute base_mont = (base * R) % mod, where R = 2^(n*64).
-    // The numerator u = base << (n*64): base in the upper words, lower n words are zero.
+    // Layout: u[n + base.size()] | table[MAX_PRECOMPUTED*n]
+    //       | rem_scratch[2*n + 2*base.size() + 2].
+    // u and rem_scratch are dead after the to-Montgomery conversion; u's first n words are
+    // then reused as the exponentiation double-buffer.
+    assert(scratch.size() >= (MAX_PRECOMPUTED + 3) * n + 3 * base.size() + 2);
     const auto u = scratch.subspan(0, n + base.size());
-    const auto base_mont = scratch.subspan(n + base.size(), n);
-    const auto rem_scratch = scratch.subspan(2 * n + base.size(), 2 * n + 2 * base.size() + 2);
+    const auto table = scratch.subspan(n + base.size(), MAX_PRECOMPUTED * n);
+    const auto base_mont = table.first(n);
+    const auto rem_scratch =
+        scratch.subspan(n + base.size() + MAX_PRECOMPUTED * n, 2 * n + 2 * base.size() + 2);
 
+    // Compute base_mont = table[0] = (base * R) % mod, where R = 2^(n*64).
+    // The numerator u = base << (n*64): base in the upper words, lower n words are zero.
     std::ranges::fill(u.first(n), uint64_t{0});  // Lower n words of u must be zero.
     std::ranges::copy(base, u.subspan(n).begin());
     rem(base_mont, u, mod, rem_scratch);
@@ -403,28 +447,62 @@ void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Expo
     const auto exp_loop = [&]<size_t N>() {
         auto r_cur = std::span<uint64_t, N>{result};
         auto r_tmp = std::span<uint64_t, N>{u.first(n)};
-        const auto bm = std::span<const uint64_t, N>{base_mont};
         const auto m = std::span<const uint64_t, N>{mod};
 
-        std::ranges::copy(bm, r_cur.begin());
-        for (auto i = exp.bit_width() - 1; i != 0; --i)
+        // base_mont^v, for odd v.
+        const auto precomputed = [table, n](size_t v) noexcept {
+            return std::span<uint64_t, N>{table.subspan((v / 2) * n, n)};
+        };
+
+        // Fill the precomputed table (precomputed(1) is already set).
+        if (table_size > 1)
         {
-            mul_amm<N>(r_tmp, r_cur, r_cur, m, mod_inv);  // Square.
-            if (exp[i - 1])
-                mul_amm<N>(r_cur, r_tmp, bm, m, mod_inv);  // Multiply.
-            else
-                std::swap(r_cur, r_tmp);
+            mul_amm<N>(r_tmp, precomputed(1), precomputed(1), m, mod_inv);  // r_tmp = base_mont^2.
+            for (size_t v = 3; v < 2 * table_size; v += 2)
+                mul_amm<N>(precomputed(v), precomputed(v - 2), r_tmp, m, mod_inv);
         }
 
-        // Convert from Montgomery form: multiply by 1.
+        // The widest window of at most w bits ending at bit `hi`, which must be set. Trailing
+        // zero bits are trimmed off, so the value is odd and only odd table entries are
+        // needed. Returns the value and the index of its lowest bit.
+        const auto window = [exp, w](size_t hi) noexcept {
+            const auto lo = hi + 1 >= w ? hi + 1 - w : size_t{0};
+            const auto v = exp.window(lo, hi);
+            const auto tz = static_cast<size_t>(std::countr_zero(v));  // v != 0: exp[hi] is set.
+            return std::pair{v >> tz, lo + tz};
+        };
+
+        // The top bit is always set, so the first window ends there and is loaded directly.
+        auto [v_top, pos] = window(exp_bits - 1);
+        std::ranges::copy(precomputed(v_top), r_cur.begin());
+
+        while (pos != 0)
+        {
+            --pos;
+            mul_amm<N>(r_tmp, r_cur, r_cur, m, mod_inv);  // Square for this bit.
+            std::swap(r_cur, r_tmp);
+            if (!exp[pos])
+                continue;
+
+            const auto [v, lo] = window(pos);
+            for (auto b = lo; b != pos; ++b)  // One more square for each remaining window bit.
+            {
+                mul_amm<N>(r_tmp, r_cur, r_cur, m, mod_inv);
+                std::swap(r_cur, r_tmp);
+            }
+            mul_amm<N>(r_tmp, r_cur, precomputed(v), m, mod_inv);
+            std::swap(r_cur, r_tmp);
+            pos = lo;
+        }
+
+        // Convert from Montgomery form: multiply by 1. Reuses precomputed(1) storage.
         std::ranges::fill(base_mont, uint64_t{0});
         base_mont[0] = 1;
         mul_amm<N>(r_tmp, r_cur, std::span<const uint64_t, N>{base_mont}, m, mod_inv);
-        std::swap(r_cur, r_tmp);
 
         // If the result ended up in scratch, copy to result.
-        if (r_cur.data() != result.data())
-            std::ranges::copy(r_cur, result.begin());
+        if (r_tmp.data() != result.data())
+            std::ranges::copy(r_tmp, result.begin());
     };
 
     if (n == 4)
@@ -589,10 +667,11 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
 
     // Bump allocator for all working memory (values + scratch).
     // Stack buffer covers inputs up to the EIP-7823 limit (1024 bytes).
-    // Capacity: values[b+2m] + op scratch[4m+3b+2] + CRT[m+2] = 4b+7m+4 words.
+    // Capacity: values[b+2m] + op scratch[(MAX_PRECOMPUTED+3)m+3b+2] + CRT[m+2]
+    //           = 4b + (MAX_PRECOMPUTED+6)m + 4 words.
     // The worst case is an even modulus with 1 trailing zero bit (odd_size=m, pow2_size=1).
     static constexpr size_t MAX_SIZE = 1024 / sizeof(uint64_t);  // EIP-7823
-    static constexpr size_t STACK_CAPACITY = 4 * MAX_SIZE + 7 * MAX_SIZE + 4;
+    static constexpr size_t STACK_CAPACITY = 4 * MAX_SIZE + (6 + MAX_PRECOMPUTED) * MAX_SIZE + 4;
     alignas(uint64_t) std::byte stack_buf[STACK_CAPACITY * sizeof(uint64_t)];
     std::pmr::monotonic_buffer_resource pool{stack_buf, sizeof(stack_buf)};
     std::pmr::polymorphic_allocator<uint64_t> alloc{&pool};
@@ -636,7 +715,8 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
         const auto need_crt = !pow2_is_trivial && !odd_is_trivial;
 
         // Allocate operation scratch (dead after each call, reused sequentially).
-        const size_t odd_scratch = !odd_is_trivial ? 4 * odd_size + 3 * base.size() + 2 : 0;
+        const size_t odd_scratch =
+            !odd_is_trivial ? (MAX_PRECOMPUTED + 3) * odd_size + 3 * base.size() + 2 : 0;
         const size_t pow2_scratch = !pow2_is_trivial ? pow2_size : 0;
         const size_t inv_scratch = need_crt ? 2 * pow2_size : 0;
         const size_t op_scratch_size = std::max({odd_scratch, pow2_scratch, inv_scratch});

@@ -9,6 +9,7 @@
 #include <test/state/errors.hpp>
 #include <test/state/transaction.hpp>
 #include <test/utils/test_state.hpp>
+#include <optional>
 
 namespace json = nlohmann;
 
@@ -50,7 +51,14 @@ struct StateTransitionTest
             TestMultiTransaction::Indexes indexes;
             hash256 state_hash;
             hash256 logs_hash = EmptyListHash;
-            bool exception = false;
+
+            /// The exception the transaction is expected to be rejected with, empty if it is
+            /// expected to be valid. Lists `|`-separated alternatives, see
+            /// is_expected_tx_exception() in error_matching.hpp.
+            std::string exception;
+
+            /// The full encoded transaction for this case. Not always available.
+            std::optional<bytes> txbytes;
         };
 
         evmc_revision rev;
@@ -112,6 +120,27 @@ state::BlobParams from_json<state::BlobParams>(const json::json& j);
 template <>
 BlobSchedule from_json<BlobSchedule>(const json::json& j);
 
+/// Loads the value of the JSON object's @p key, std::nullopt if the object has no such key.
+template <typename T>
+std::optional<T> load_optional(const json::json& j, std::string_view key)
+{
+    if (const auto it = j.find(key); it != j.end())
+        return from_json<T>(*it);
+    return std::nullopt;
+}
+
+/// Loads the value of the JSON object's @p key, @p default_value if the object has no such key.
+/// The default is spelled at the call site, {} for the zero value.
+///
+/// TODO: Inline as load_optional().value_or({}) once the minimum standard library declares
+///   value_or()'s parameter with a defaulted template argument. Deduced, as it is in C++20,
+///   it does not accept a braced initializer.
+template <typename T>
+T load_or(const json::json& j, std::string_view key, T default_value)
+{
+    return load_optional<T>(j, key).value_or(std::move(default_value));
+}
+
 /// Exports the State (accounts) to JSON format (aka pre/post/alloc state).
 json::json to_json(const TestState& state);
 
@@ -119,10 +148,6 @@ json::json to_json(const TestState& state);
 json::json to_state_test(std::string_view test_name, const state::BlockInfo& block,
     state::Transaction& tx, const TestState& pre, evmc_revision rev,
     const std::variant<state::TransactionReceipt, std::error_code>& res, const TestState& post);
-
-/// Returns the standardized error message for the transaction validation error.
-[[nodiscard]] std::string get_invalid_tx_message(state::ErrorCode errc) noexcept;
-
 
 std::vector<StateTransitionTest> load_state_tests(std::istream& input);
 
@@ -148,7 +173,7 @@ inline std::string hex0x(const intx::uint256& v)
 }
 
 /// Encodes bytes as hex with 0x prefix.
-inline std::string hex0x(const bytes_view& v)
+inline std::string hex0x(bytes_view v)
 {
     return "0x" + evmc::hex(v);
 }

@@ -5,10 +5,10 @@
 #include "state.hpp"
 #include "../utils/stdx/utility.hpp"
 #include "host.hpp"
+#include "precompiles.hpp"
 #include "state_view.hpp"
 #include <evmone/constants.hpp>
 #include <evmone/delegation.hpp>
-#include <evmone_precompiles/secp256k1.hpp>
 #include <algorithm>
 #include <ranges>
 
@@ -18,8 +18,6 @@ namespace evmone::state
 {
 namespace
 {
-/// Secp256k1's N/2 is the upper bound of the signature's s value.
-constexpr auto SECP256K1N_OVER_2 = evmmax::secp256k1::Curve::ORDER / 2;
 /// EIP-7702: The cost of authorization that sets delegation to an account that didn't exist before.
 constexpr auto AUTHORIZATION_EMPTY_ACCOUNT_COST = 25000;
 /// EIP-7702: The cost of authorization that sets delegation to an account that already exists.
@@ -124,33 +122,25 @@ int64_t process_authorization_list(
             continue;
 
         // 2. Verify the nonce is less than 2**64 - 1.
-        if (auth.nonce == Account::NonceMax)
+        if (auth.nonce == MAX_NONCE)
             continue;
 
-        // 3. Verify if the signer has been successfully recovered from the signature.
+        // 3. Verify if the authority has been successfully recovered from the signature.
         //    authority = ecrecover(...)
-        // y_parity must be 0 or 1 for EIP-7702/2930 signatures.
-        if (auth.v > 1)
-            continue;
-        // TODO: We actually only do "partial" verification by assuming the signature is valid
-        //   when the test has the signer specified.
-        if (!auth.signer.has_value())
-            continue;
-
-        // s value must be less than or equal to secp256k1n/2, as specified in EIP-2.
-        if (auth.s > SECP256K1N_OVER_2)
+        const auto authority_addr = recover_authority(auth);
+        if (!authority_addr.has_value())
             continue;
 
         // Get or create the authority account.
         // It is still empty at this point until nonce bump following successful authorization.
-        auto& authority = state.get_or_insert(*auth.signer, {.erase_if_empty = true});
+        auto& authority = state.get_or_insert(*authority_addr, {.erase_if_empty = true});
 
         // 4. Add authority to accessed_addresses (as defined in EIP-2929.)
         authority.access_status = EVMC_ACCESS_WARM;
 
         // 5. Verify the code of authority is either empty or already delegated.
         if (authority.code_hash != Account::EMPTY_CODE_HASH &&
-            !is_code_delegated(state.get_code(*auth.signer)))
+            !is_code_delegated(state.get_code(*authority_addr)))
             continue;
 
         // 6. Verify the nonce of authority is equal to nonce.
@@ -185,13 +175,16 @@ int64_t process_authorization_list(
         // 8. Set the code of authority to be 0xef0100 || address. This is a delegation designation.
         else
         {
-            auto new_code = bytes(DELEGATION_MAGIC) + bytes(auth.addr);
-            if (authority.code != new_code)
+            uint8_t designation_buf[std::size(DELEGATION_MAGIC) + sizeof(auth.addr)];
+            const auto it = std::ranges::copy(DELEGATION_MAGIC, std::begin(designation_buf)).out;
+            std::ranges::copy(auth.addr.bytes, it);
+            const bytes_view designation{designation_buf, std::size(designation_buf)};
+            if (authority.code != designation)
             {
                 // We are doing this only if the code is different to make the state diff precise.
                 authority.code_changed = true;
-                authority.code = std::move(new_code);
-                authority.code_hash = keccak256(authority.code);
+                authority.code = designation;
+                authority.code_hash = keccak256(designation);
             }
         }
 
@@ -203,7 +196,7 @@ int64_t process_authorization_list(
 
 evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) noexcept
 {
-    const auto recipient = tx.to.has_value() ? *tx.to : evmc::address{};
+    const auto recipient = tx.to.has_value() ? *tx.to : compute_create_address(tx.sender, tx.nonce);
 
     return {
         .kind = tx.to.has_value() ? EVMC_CALL : EVMC_CREATE,
@@ -215,7 +208,6 @@ evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) n
         .input_data = tx.data.data(),
         .input_size = tx.data.size(),
         .value = intx::be::store<evmc::uint256be>(tx.value),
-        .create2_salt = {},
         .code_address = recipient,
         .code = nullptr,
         .code_size = 0,
@@ -226,13 +218,23 @@ evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) n
 StateDiff State::build_diff(evmc_revision rev) const
 {
     StateDiff diff;
+    diff.modified_accounts.reserve(m_modified.size());
     for (const auto& [addr, m] : m_modified)
     {
+        if (m.nonexistent)
+            continue;
         if (m.destructed)
         {
-            // TODO: This must be done even for just_created
-            //   because destructed may pre-date just_created. Add test to evmone (EEST has it).
-            diff.deleted_accounts.emplace_back(addr);
+            if (rev >= EVMC_AMSTERDAM && m.balance != 0)
+            {
+                // Preserve the balance of the self-destructed account, no burn (EIP-8246).
+                diff.modified_accounts.emplace_back(StateDiff::Entry{addr, 0, m.balance});
+            }
+            else
+            {
+                // Delete account. This must be done also for pre-funded just_created account.
+                diff.deleted_accounts.emplace_back(addr);
+            }
             continue;
         }
         if (m.erase_if_empty && rev >= EVMC_SPURIOUS_DRAGON && m.is_empty())
@@ -265,17 +267,22 @@ StateDiff State::build_diff(evmc_revision rev) const
 
 Account& State::insert(const address& addr, Account account)
 {
-    const auto r = m_modified.insert({addr, std::move(account)});
-    // assert(r.second);
-    return r.first->second;
+    // assert(!account.nonexistent);  // No need to insert nonexistent accounts.
+    const auto [it, inserted] = m_modified.try_emplace(addr, std::move(account));
+    if (!inserted)
+    {
+        // assert(it->second.nonexistent);  // Overwrite only nonexistent accounts.
+        it->second = std::move(account);
+    }
+    return it->second;
 }
 
 Account* State::find(const address& addr) noexcept
 {
-    // TODO: Avoid double lookup (find+insert) and not cached initial state lookup for non-existent
-    //   accounts. If we want to cache non-existent account we need a proper flag for it.
+    // TODO: Avoid the double lookup (find+insert). Nonexistent accounts are still re-queried from
+    //   the initial state on every call; they could be cached as nonexistent nodes.
     if (const auto it = m_modified.find(addr); it != m_modified.end())
-        return &it->second;
+        return it->second.nonexistent ? nullptr : &it->second;
     if (const auto cacc = m_initial.get_account(addr); cacc)
         return &insert(addr, {.nonce = cacc->nonce,
                                  .balance = cacc->balance,
@@ -315,8 +322,8 @@ Account& State::touch(const address& addr)
     auto& acc = get_or_insert(addr, {.erase_if_empty = true});
     if (!acc.erase_if_empty && acc.is_empty())
     {
+        journal_account_flags(addr, acc);
         acc.erase_if_empty = true;
-        m_journal.emplace_back(JournalTouched{addr});
     }
     return acc;
 }
@@ -339,16 +346,14 @@ void State::journal_balance_change(const address& addr, const intx::uint256& pre
     m_journal.emplace_back(JournalBalanceChange{{addr}, prev_balance});
 }
 
-void State::journal_storage_change(
-    const address& addr, const bytes32& key, const StorageValue& value)
+void State::journal_storage_change(StorageValue& slot)
 {
-    m_journal.emplace_back(JournalStorageChange{{addr}, key, value.current, value.access_status});
+    m_journal.emplace_back(JournalStorageChange{&slot, slot.current, slot.access_status});
 }
 
-void State::journal_transient_storage_change(
-    const address& addr, const bytes32& key, const bytes32& value)
+void State::journal_transient_storage_change(bytes32& slot)
 {
-    m_journal.emplace_back(JournalTransientStorageChange{{addr}, key, value});
+    m_journal.emplace_back(JournalTransientStorageChange{&slot, slot});
 }
 
 void State::journal_bump_nonce(const address& addr)
@@ -356,19 +361,21 @@ void State::journal_bump_nonce(const address& addr)
     m_journal.emplace_back(JournalNonceBump{addr});
 }
 
-void State::journal_create(const address& addr, bool existed)
+void State::journal_create(const address& addr)
 {
-    m_journal.emplace_back(JournalCreate{{addr}, existed});
+    m_journal.emplace_back(JournalCreate{{addr}});
 }
 
-void State::journal_destruct(const address& addr)
+void State::journal_new_account(const address& addr)
 {
-    m_journal.emplace_back(JournalDestruct{addr});
+    // Revert restores the account to "nonexistent". The other flags are irrelevant/default.
+    m_journal.emplace_back(JournalAccountFlags{{addr}, EVMC_ACCESS_COLD, true, false, false});
 }
 
-void State::journal_access_account(const address& addr)
+void State::journal_account_flags(const address& addr, const Account& acc)
 {
-    m_journal.emplace_back(JournalAccessAccount{addr});
+    m_journal.emplace_back(JournalAccountFlags{
+        {addr}, acc.access_status, acc.nonexistent, acc.destructed, acc.erase_if_empty});
 }
 
 void State::rollback(size_t checkpoint)
@@ -382,47 +389,33 @@ void State::rollback(size_t checkpoint)
                 {
                     get(e.addr).nonce -= 1;
                 }
-                else if constexpr (std::is_same_v<T, JournalTouched>)
+                else if constexpr (std::is_same_v<T, JournalAccountFlags>)
                 {
-                    get(e.addr).erase_if_empty = false;
-                }
-                else if constexpr (std::is_same_v<T, JournalDestruct>)
-                {
-                    get(e.addr).destructed = false;
-                }
-                else if constexpr (std::is_same_v<T, JournalAccessAccount>)
-                {
-                    get(e.addr).access_status = EVMC_ACCESS_COLD;
+                    auto& a = get(e.addr);
+                    a.access_status = e.access_status;
+                    a.nonexistent = e.nonexistent;
+                    a.destructed = e.destructed;
+                    a.erase_if_empty = e.erase_if_empty;
+                    // TODO: On restoring nonexistent (un-created create) the node keeps its
+                    //   code/storage/transient buffers until tx end; could clear them here.
                 }
                 else if constexpr (std::is_same_v<T, JournalCreate>)
                 {
-                    if (e.existed)
-                    {
-                        // This account is not always "touched". TODO: Why?
-                        auto& a = get(e.addr);
-                        a.nonce = 0;
-                        a.code_hash = Account::EMPTY_CODE_HASH;
-                        a.code.clear();
-                    }
-                    else
-                    {
-                        // TODO: Before Spurious Dragon we don't clear empty accounts ("erasable")
-                        //       so we need to delete them here explicitly.
-                        //       This should be changed by tuning "erasable" flag
-                        //       and clear in all revisions.
-                        m_modified.erase(e.addr);
-                    }
+                    // Revert a create over a pre-existing account.
+                    // TODO: Why this account is not always "touched"?
+                    auto& a = get(e.addr);
+                    a.nonce = 0;
+                    a.code_hash = Account::EMPTY_CODE_HASH;
+                    a.code.clear();
                 }
                 else if constexpr (std::is_same_v<T, JournalStorageChange>)
                 {
-                    auto& s = get(e.addr).storage.find(e.key)->second;
-                    s.current = e.prev_value;
-                    s.access_status = e.prev_access_status;
+                    e.slot->current = e.prev_value;
+                    e.slot->access_status = e.prev_access_status;
                 }
                 else if constexpr (std::is_same_v<T, JournalTransientStorageChange>)
                 {
-                    auto& s = get(e.addr).transient_storage.find(e.key)->second;
-                    s = e.prev_value;
+                    *e.slot = e.prev_value;
                 }
                 else if constexpr (std::is_same_v<T, JournalBalanceChange>)
                 {
@@ -445,11 +438,14 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     const StateView& state_view, const BlockInfo& block, const Transaction& tx, evmc_revision rev,
     int64_t block_gas_left, int64_t blob_gas_left) noexcept
 {
+    if (tx.chain_id_protected() && tx.chain_id != block.chain_id)
+        return make_error_code(INVALID_CHAIN_ID);
+
     switch (tx.type)  // Validate "special" transaction types.
     {
     case Transaction::Type::blob:
         if (rev < EVMC_CANCUN)
-            return make_error_code(TX_TYPE_NOT_SUPPORTED);
+            return make_error_code(TYPE_NOT_SUPPORTED);
         if (!tx.to.has_value())
             return make_error_code(CREATE_BLOB_TX);
         if (tx.blob_hashes.empty())
@@ -459,7 +455,7 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
 
         // assert(block.blob_base_fee.has_value());
         if (tx.max_blob_gas_price < *block.blob_base_fee)
-            return make_error_code(BLOB_FEE_CAP_LESS_THAN_BLOCKS);
+            return make_error_code(INSUFFICIENT_MAX_FEE_PER_BLOB_GAS);
 
         if (std::ranges::any_of(tx.blob_hashes, [](const auto& h) { return h.bytes[0] != 0x01; }))
             return make_error_code(INVALID_BLOB_HASH_VERSION);
@@ -469,7 +465,7 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
 
     case Transaction::Type::set_code:
         if (rev < EVMC_PRAGUE)
-            return make_error_code(TX_TYPE_NOT_SUPPORTED);
+            return make_error_code(TYPE_NOT_SUPPORTED);
         if (!tx.to.has_value())
             return make_error_code(CREATE_SET_CODE_TX);
         if (tx.authorization_list.empty())
@@ -485,15 +481,15 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     case Transaction::Type::blob:
     case Transaction::Type::eip1559:
         if (rev < EVMC_LONDON)
-            return make_error_code(TX_TYPE_NOT_SUPPORTED);
+            return make_error_code(TYPE_NOT_SUPPORTED);
 
         if (tx.max_priority_gas_price > tx.max_gas_price)
-            return make_error_code(TIP_GT_FEE_CAP);  // Priority gas price is too high.
+            return make_error_code(PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS);
         [[fallthrough]];
 
     case Transaction::Type::access_list:
         if (rev < EVMC_BERLIN)
-            return make_error_code(TX_TYPE_NOT_SUPPORTED);
+            return make_error_code(TYPE_NOT_SUPPORTED);
         [[fallthrough]];
 
     case Transaction::Type::legacy:;
@@ -502,13 +498,13 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     // assert(tx.max_priority_gas_price <= tx.max_gas_price);
 
     if (rev >= EVMC_OSAKA && tx.gas_limit > MAX_TX_GAS_LIMIT)
-        return make_error_code(MAX_GAS_LIMIT_EXCEEDED);
+        return make_error_code(GAS_LIMIT_EXCEEDS_MAXIMUM);
 
     if (tx.gas_limit > block_gas_left)
-        return make_error_code(GAS_LIMIT_REACHED);
+        return make_error_code(GAS_ALLOWANCE_EXCEEDED);
 
     if (tx.max_gas_price < block.base_fee)
-        return make_error_code(FEE_CAP_LESS_THAN_BLOCKS);
+        return make_error_code(INSUFFICIENT_MAX_FEE_PER_GAS);
 
     // We need some information about the sender so lookup the account in the state.
     // TODO: During transaction execution this account will be also needed, so we may pass it along.
@@ -519,8 +515,8 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
         !is_code_delegated(state_view.get_account_code(tx.sender)))
         return make_error_code(SENDER_NOT_EOA);  // Origin must not be a contract (EIP-3607).
 
-    if (sender_acc.nonce == Account::NonceMax)  // Nonce value limit (EIP-2681).
-        return make_error_code(NONCE_HAS_MAX_VALUE);
+    if (sender_acc.nonce == MAX_NONCE)  // Nonce value limit (EIP-2681).
+        return make_error_code(NONCE_IS_MAX);
 
     if (sender_acc.nonce < tx.nonce)
         return make_error_code(NONCE_TOO_HIGH);
@@ -528,9 +524,11 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     if (sender_acc.nonce > tx.nonce)
         return make_error_code(NONCE_TOO_LOW);
 
-    // initcode size is limited by EIP-3860.
-    if (rev >= EVMC_SHANGHAI && !tx.to.has_value() && tx.data.size() > MAX_INITCODE_SIZE)
-        return make_error_code(INIT_CODE_SIZE_LIMIT_EXCEEDED);
+    // Initcode size is limited by EIP-3860, raised for Amsterdam by EIP-7954.
+    const size_t max_initcode_size =
+        rev >= EVMC_AMSTERDAM ? MAX_INITCODE_SIZE_AMSTERDAM : MAX_INITCODE_SIZE;
+    if (rev >= EVMC_SHANGHAI && !tx.to.has_value() && tx.data.size() > max_initcode_size)
+        return make_error_code(INITCODE_SIZE_EXCEEDED);
 
     // Compute and check if sender has enough balance for the theoretical maximum transaction cost.
     // Note this is different from tx_max_cost computed with effective gas price later.
@@ -545,7 +543,7 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
         max_total_fee += total_blob_gas * tx.max_blob_gas_price;
     }
     if (sender_acc.balance < max_total_fee)
-        return make_error_code(INSUFFICIENT_FUNDS);
+        return make_error_code(INSUFFICIENT_ACCOUNT_FUNDS);
 
     const auto [intrinsic_cost, min_cost] = compute_tx_intrinsic_cost(rev, tx);
     if (tx.gas_limit < std::max(intrinsic_cost, min_cost))
@@ -588,8 +586,8 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
 {
     State state{state_view};
     auto& sender_acc = state.get_or_insert(tx.sender);
-    assert(sender_acc.nonce < Account::NonceMax);  // Required for valid tx.
-    ++sender_acc.nonce;                            // Bump sender nonce.
+    assert(sender_acc.nonce < MAX_NONCE);  // Required for valid tx.
+    ++sender_acc.nonce;                    // Bump sender nonce.
 
     const auto delegation_refund =
         process_authorization_list(state, tx.chain_id, tx.authorization_list);
@@ -619,12 +617,15 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
 
     Host host{rev, vm, state, block, block_hashes, tx};
 
-    sender_acc.access_status = EVMC_ACCESS_WARM;  // Tx sender is always warm.
-    if (tx.to.has_value())
-        host.access_account(*tx.to);
+    auto message = build_message(tx, tx_props.execution_gas_limit);
+
+    sender_acc.access_status = EVMC_ACCESS_WARM;  // Sender is always warm.
+    host.access_account(message.recipient);  // Recipient (incl. create address) is always warm.
     for (const auto& [a, storage_keys] : tx.access_list)
     {
         host.access_account(a);
+        if (is_precompile(rev, a))  // Precompile storage is never accessed.
+            continue;
         for (const auto& key : storage_keys)
             state.get_storage(a, key).access_status = EVMC_ACCESS_WARM;
     }
@@ -634,7 +635,6 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     if (rev >= EVMC_SHANGHAI)
         host.access_account(block.coinbase);
 
-    auto message = build_message(tx, tx_props.execution_gas_limit);
     if (tx.to.has_value())
     {
         if (const auto delegate = get_delegate_address(host, *tx.to))

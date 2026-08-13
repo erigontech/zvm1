@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <concepts>
+#include <type_traits>
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
@@ -21,8 +23,8 @@ namespace evmmax::ecc
 template <typename ConfigT>
 struct ExtFieldElem
 {
-    using ValueT = typename ConfigT::ValueT;
-    using Base = typename ConfigT::BaseFieldT;
+    using ValueT = ConfigT::ValueT;
+    using Base = ConfigT::BaseFieldT;
     static constexpr auto DEGREE = ConfigT::DEGREE;
     using CoeffArrT = std::array<ValueT, DEGREE>;
 
@@ -34,6 +36,14 @@ struct ExtFieldElem
     /// Create an element from an array of coefficients.
     /// TODO: This constructor may be optimized to avoid copying the array.
     explicit constexpr ExtFieldElem(const CoeffArrT& cs) noexcept : coeffs{cs} {}
+
+    /// Create an element from literal coefficient values, converted to the underlying
+    /// representation at compile-time. Allows defining constants as e.g. Fq2{1, 2}.
+    template <typename... Ts>
+        requires(sizeof...(Ts) == DEGREE && (std::constructible_from<ValueT, Ts> && ...) &&
+                 (!std::same_as<std::remove_cvref_t<Ts>, ValueT> && ...))
+    consteval ExtFieldElem(const Ts&... cs) noexcept : coeffs{ValueT{cs}...}
+    {}
 
     /// Returns the conjugate of a degree-2 extension field element: (a, b) → (a, -b).
     constexpr ExtFieldElem conjugate() const noexcept
@@ -48,8 +58,6 @@ struct ExtFieldElem
         res.coeffs[0] = ValueT::one();
         return res;
     }
-
-    static constexpr ExtFieldElem zero() noexcept { return ExtFieldElem{}; }
 
     constexpr ExtFieldElem inv() const noexcept { return inverse(*this); }
 

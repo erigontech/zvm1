@@ -53,11 +53,21 @@ public:
 
     constexpr uint_type value() const noexcept { return Fp.from_mont(value_); }
 
+    /// The valid range for from_bytes().
+    enum class Range : bool
+    {
+        full,  ///< Valid in [0, ORDER).
+        half,  ///< Valid in [0, ORDER/2].
+    };
+
+    template <Range R = Range::full>
     static constexpr std::optional<FieldElement> from_bytes(
         std::span<const uint8_t, sizeof(uint_type)> b) noexcept
     {
+        constexpr auto LIMIT = R == Range::full ? ORDER : ORDER / 2 + 1;
+
         const auto x = intx::be::load<uint_type>(b);
-        if (x >= ORDER) [[unlikely]]
+        if (x >= LIMIT) [[unlikely]]
             return std::nullopt;
         return FieldElement{x};
     }
@@ -121,16 +131,6 @@ public:
 };
 
 /// The affine (two coordinates) point on an Elliptic Curve over a prime field.
-template <typename ValueT>
-struct Point
-{
-    ValueT x = {};
-    ValueT y = {};
-
-    friend constexpr Point operator-(const Point& p) noexcept { return {p.x, -p.y}; }
-};
-
-/// The affine (two coordinates) point on an Elliptic Curve over a prime field.
 template <typename Curve>
 struct AffinePoint
 {
@@ -142,8 +142,11 @@ struct AffinePoint
     AffinePoint() = default;
     constexpr AffinePoint(const FE& x_, const FE& y_) noexcept : x{x_}, y{y_} {}
 
-    /// Create the point from literal values.
-    consteval AffinePoint(const Curve::uint_type& x_value, const Curve::uint_type& y_value) noexcept
+    /// Create the point from literal values. Only available when Curve defines uint_type.
+    template <typename C = Curve>
+        requires requires { typename C::uint_type; }
+    consteval AffinePoint(
+        const typename C::uint_type& x_value, const typename C::uint_type& y_value) noexcept
       : x{x_value}, y{y_value}
     {}
 
@@ -153,6 +156,8 @@ struct AffinePoint
     {
         return p == AffinePoint{};
     }
+
+    friend constexpr AffinePoint operator-(const AffinePoint& p) noexcept { return {p.x, -p.y}; }
 
     static constexpr std::optional<AffinePoint> from_bytes(
         std::span<const uint8_t, sizeof(FE) * 2> b) noexcept
@@ -173,18 +178,19 @@ struct AffinePoint
 
 /// Elliptic curve point in Jacobian coordinates (X, Y, Z)
 /// representing the affine point (X/Z², Y/Z³).
-/// TODO: Merge with JacPoint.
 template <typename Curve>
 struct ProjPoint
 {
     using FE = Curve::Fp;
     FE x;
-    FE y{1};  // TODO: Make sure this is compile-time constant.
+    FE y = FE::one();
     FE z;
 
     ProjPoint() = default;
     constexpr ProjPoint(const FE& x_, const FE& y_, const FE& z_) noexcept : x{x_}, y{y_}, z{z_} {}
-    constexpr explicit ProjPoint(const AffinePoint<Curve>& p) noexcept : x{p.x}, y{p.y}, z{FE{1}} {}
+    constexpr explicit ProjPoint(const AffinePoint<Curve>& p) noexcept
+      : x{p.x}, y{p.y}, z{FE::one()}
+    {}
 
     friend constexpr bool operator==(const ProjPoint& p, zero_t) noexcept { return p.z == 0; }
 
@@ -202,41 +208,9 @@ struct ProjPoint
     friend constexpr ProjPoint operator-(const ProjPoint& p) noexcept { return {p.x, -p.y, p.z}; }
 };
 
-// Jacobian (three) coordinates point implementation.
-template <typename ValueT>
-struct JacPoint
-{
-    ValueT x = 1;
-    ValueT y = 1;
-    ValueT z = 0;
-
-    // Compares two Jacobian coordinates points
-    friend constexpr bool operator==(const JacPoint& a, const JacPoint& b) noexcept
-    {
-        const auto bz2 = b.z * b.z;
-        const auto az2 = a.z * a.z;
-
-        const auto bz3 = bz2 * b.z;
-        const auto az3 = az2 * a.z;
-
-        return a.x * bz2 == b.x * az2 && a.y * bz3 == b.y * az3;
-    }
-
-    friend constexpr JacPoint operator-(const JacPoint& p) noexcept { return {p.x, -p.y, p.z}; }
-
-    // Creates Jacobian coordinates point from affine point
-    static constexpr JacPoint from(const ecc::Point<ValueT>& ap) noexcept
-    {
-        return {ap.x, ap.y, ValueT::one()};
-    }
-};
-
-template <typename IntT>
-using InvFn = IntT (*)(const ModArith<IntT>&, const IntT& x) noexcept;
-
 /// Converts a projected point to an affine point.
 template <typename Curve>
-inline AffinePoint<Curve> to_affine(const ProjPoint<Curve>& p) noexcept
+AffinePoint<Curve> to_affine(const ProjPoint<Curve>& p) noexcept
 {
     // This works correctly for the point at infinity (z == 0) because then z_inv == 0.
     const auto z_inv = 1 / p.z;
@@ -398,7 +372,7 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
 }
 
 template <typename Curve>
-ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
+constexpr ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 {
     const auto& [x1, y1, z1] = p;
 

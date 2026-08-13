@@ -258,6 +258,38 @@ TEST_F(state_transition, create_revert)
     expect.post[CREATED].exists = false;
 }
 
+TEST_F(state_transition, create2_prefunded_revert_storage_no_leak)
+{
+    // Prefunded CREATE2 (create-over-existing path): the init writes storage, the create is
+    // reverted, then a second CREATE2 at the same address must read slot 0 back as zero.
+    // TODO: migrate to EEST -- extend test_create2_succeeds_after_reverted_create2 to read storage.
+    static constexpr auto Creator = 0xcc_address;
+    static constexpr auto Reverter = 0xbb_address;
+
+    // Init: copy slot 0 to slot 1 (leak detector), write slot 0, deploy 1-byte runtime.
+    const auto initcode = sstore(1, sload(0)) + sstore(0, 0x99) + ret(0, 1);
+    const auto creator_code =
+        mstore(0, push(initcode)) + create2().input(32 - initcode.size(), initcode.size());
+
+    tx.to = To;
+    // First attempt reverts (via the reverter sub-call), the second deploys directly.
+    pre[To] = {.code = call(Reverter).gas(0xffffff) + call(Creator).gas(0xffffff)};
+    pre[Reverter] = {.code = call(Creator).gas(0xffffff) + revert(0, 0)};
+    pre[Creator] = {.code = creator_code};
+
+    const auto created = compute_create2_address(Creator, {}, initcode);
+    pre[created] = {.balance = 1};  // prefunded -> create-over-existing path
+
+    expect.post[To].exists = true;
+    expect.post[Reverter].exists = true;
+    expect.post[Creator].exists = true;
+    expect.post[created].balance = 1;                           // prefunded balance preserved
+    expect.post[created].nonce = 1;                             // post-SD created contract
+    expect.post[created].code = bytes{0x00};                    // second CREATE2 deployed
+    expect.post[created].storage[0x00_bytes32] = 0x99_bytes32;  // second attempt's own write
+    expect.post[created].storage[0x01_bytes32] = 0x00_bytes32;  // slot 0 read back fresh: no leak
+}
+
 TEST_F(state_transition, create_revert_sd)
 {
     rev = EVMC_SPURIOUS_DRAGON;
@@ -361,4 +393,64 @@ TEST_F(state_transition, created_code_hash)
     const auto created = compute_create_address(To, pre[To].nonce);
     expect.post[created].code = runtime_code;
     expect.post[To].storage[0x00_bytes32] = keccak256(runtime_code);
+}
+
+TEST_F(state_transition, create2_rollback_preserves_access_list_slot_warmth)
+{
+    // Rolling back the first CREATE2 must not cool the slots its address had warmed via the tx
+    // access list, so the SSTORE in the second attempt still pays the warm price.
+    rev = EVMC_CANCUN;
+
+    // Initcode reverts on zero CALLVALUE, otherwise stores and deploys nothing.
+    const auto revert_path = revert(0, 0);
+    const auto dest = 4 + revert_path.size();  // CALLVALUE + PUSH1 dest + JUMPI
+    const auto initcode = bytecode{OP_CALLVALUE} + push(dest) + OP_JUMPI + revert_path +
+                          OP_JUMPDEST + sstore(1, 1) + ret(0, 0);
+
+    const auto off = 32 - initcode.size();
+    tx.to = To;
+    pre[To] = {.nonce = 1,
+        .balance = 1,
+        .code = mstore(0, push(initcode)) + create2().input(off, initcode.size()) + OP_POP +
+                create2().value(1).input(off, initcode.size()) + OP_POP};
+
+    const auto created = compute_create2_address(To, {}, initcode);
+    tx.access_list = {{created, {0x01_bytes32}}};
+
+    expect.post[To].nonce = pre[To].nonce + 2;
+    expect.post[To].balance = 0;  // the endowment left the creator
+    expect.post[created].nonce = 1;
+    expect.post[created].balance = 1;
+    expect.post[created].storage[0x01_bytes32] = 0x01_bytes32;
+    expect.gas_used = 109405;  // Cooling the slot would add the 2100 cold surcharge.
+}
+
+TEST_F(state_transition, eip7954_create_tx_at_max_code_size)
+{
+    // Amsterdam raises the deployed code size limit from 0x6000 to 0x10000 (EIP-7954).
+    // A create transaction deploying code of exactly the new limit succeeds.
+    rev = EVMC_AMSTERDAM;
+    static constexpr auto code_size = 0x10000;  // MAX_CODE_SIZE_AMSTERDAM.
+    tx.gas_limit = 16'000'000;                  // Covers the ~13.1M code-deposit gas (200/byte).
+    block.gas_limit = tx.gas_limit;
+    pre[Sender].balance = tx.gas_limit * tx.max_gas_price;
+    tx.data = ret(0, code_size);  // Init code returns `code_size` zero bytes as the deployed code.
+
+    const auto create_address = compute_create_address(Sender, pre[Sender].nonce);
+    expect.post[create_address].code = bytes(code_size, 0x00);
+}
+
+TEST_F(state_transition, eip7954_create_tx_above_max_code_size)
+{
+    // Code one byte above the new 0x10000 limit is still rejected on Amsterdam (EIP-7954).
+    rev = EVMC_AMSTERDAM;
+    static constexpr auto code_size = 0x10000 + 1;
+    tx.gas_limit = 16'000'000;  // Enough to deposit the code, so only the limit can reject it.
+    block.gas_limit = tx.gas_limit;
+    pre[Sender].balance = tx.gas_limit * tx.max_gas_price;
+    tx.data = ret(0, code_size);  // Init code returns code one byte over the limit.
+
+    const auto create_address = compute_create_address(Sender, pre[Sender].nonce);
+    expect.status = EVMC_FAILURE;
+    expect.post[create_address].exists = false;
 }

@@ -12,6 +12,8 @@ target_include_directories(evmone-state PUBLIC ${PROJECT_SOURCE_DIR})
 target_sources(
     evmone-state PRIVATE
     account.hpp
+    authorization.hpp
+    authorization.cpp
     blob_params.hpp
     block.hpp
     block.cpp
@@ -28,6 +30,9 @@ target_sources(
     precompiles_internal.hpp
     requests.hpp
     requests.cpp
+    rlp_common.hpp
+    rlp_decode.hpp
+    rlp_decode.cpp
     state.hpp
     state.cpp
     state_diff.hpp
@@ -35,6 +40,7 @@ target_sources(
     system_contracts.hpp
     system_contracts.cpp
     transaction.hpp
+    transaction.cpp
 )
 
 option(EVMONE_PRECOMPILES_LIBSECP256K1 "Enable precompiles implementations using libsecp256k1 library" OFF)

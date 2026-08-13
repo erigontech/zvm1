@@ -7,7 +7,7 @@ add_library(evmone::testutils ALIAS evmone.testutils)
 target_link_libraries(
     evmone.testutils
     PUBLIC evmone::state evmc::evmc_cpp nlohmann_json::nlohmann_json
-    PRIVATE evmone evmc::mocked_host
+    PRIVATE evmc::mocked_host
 )
 
 target_sources(
@@ -16,9 +16,13 @@ target_sources(
     stdx/utility.hpp
     blob_schedule.hpp
     blob_schedule.cpp
+    block_transition.hpp
+    block_transition.cpp
     blockchaintest.hpp
     blockchaintest_loader.cpp
     bytecode.hpp
+    error_matching.hpp
+    error_matching.cpp
     mpt.hpp
     mpt.cpp
     mpt_hash.hpp

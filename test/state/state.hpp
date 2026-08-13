@@ -29,19 +29,24 @@ class State
         intx::uint256 prev_balance;
     };
 
-    struct JournalTouched : JournalBase
-    {};
-
-    struct JournalStorageChange : JournalBase
+    struct JournalAccountFlags : JournalBase
     {
-        bytes32 key;
+        evmc_access_status access_status;
+        bool nonexistent;
+        bool destructed;
+        bool erase_if_empty;
+    };
+
+    struct JournalStorageChange
+    {
+        StorageValue* slot = nullptr;  ///< Storage slot in a node-based container (stable refs).
         bytes32 prev_value;
         evmc_access_status prev_access_status;
     };
 
-    struct JournalTransientStorageChange : JournalBase
+    struct JournalTransientStorageChange
     {
-        bytes32 key;
+        bytes32* slot = nullptr;  ///< T-storage slot in a node-based container (stable refs).
         bytes32 prev_value;
     };
 
@@ -49,19 +54,10 @@ class State
     {};
 
     struct JournalCreate : JournalBase
-    {
-        bool existed;
-    };
-
-    struct JournalDestruct : JournalBase
     {};
 
-    struct JournalAccessAccount : JournalBase
-    {};
-
-    using JournalEntry =
-        std::variant<JournalBalanceChange, JournalTouched, JournalStorageChange, JournalNonceBump,
-            JournalCreate, JournalTransientStorageChange, JournalDestruct, JournalAccessAccount>;
+    using JournalEntry = std::variant<JournalBalanceChange, JournalAccountFlags,
+        JournalStorageChange, JournalNonceBump, JournalCreate, JournalTransientStorageChange>;
 
     /// The read-only view of the initial (cold) state.
     const StateView& m_initial;
@@ -113,18 +109,19 @@ public:
 
     void journal_balance_change(const address& addr, const intx::uint256& prev_balance);
 
-    void journal_storage_change(const address& addr, const bytes32& key, const StorageValue& value);
+    void journal_storage_change(StorageValue& slot);
 
-    void journal_transient_storage_change(
-        const address& addr, const bytes32& key, const bytes32& value);
+    void journal_transient_storage_change(bytes32& slot);
 
     void journal_bump_nonce(const address& addr);
 
-    void journal_create(const address& addr, bool existed);
+    /// Journals a create over a pre-existing account; revert resets its nonce and code.
+    void journal_create(const address& addr);
 
-    void journal_destruct(const address& addr);
+    /// Journals a new-account creation; revert un-creates it (restores "does not exist").
+    void journal_new_account(const address& addr);
 
-    void journal_access_account(const address& addr);
+    void journal_account_flags(const address& addr, const Account& acc);
 
     /// @}
 };

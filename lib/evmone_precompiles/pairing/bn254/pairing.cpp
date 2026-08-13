@@ -5,16 +5,15 @@
 #include "../../bn254.hpp"
 #include "fields.hpp"
 #include "utils.hpp"
-#include <vector>
 
 namespace evmmax::bn254
 {
 namespace
 {
 /// Multiplies `fr` (Fq12) values by sparse `v` (Fq12) value of the form
-/// [[t[0] * y, 0, 0],[t[1] * x, t[0], 0]] where `v` coefficients are from Fq2
+/// [[t[0] * y, 0, 0],[t[1] * x, t[2], 0]] where `v` coefficients are from Fq2
 constexpr void multiply_by_lin_func_value(
-    Fq12& fr, std::array<Fq2, 3> t, const Fq& x, const Fq& y) noexcept
+    Fq12& fr, const std::array<Fq2, 3>& t, const Fq& x, const Fq& y) noexcept
 {
     const Fq12 f = fr;
     const auto& ksi = Fq6Config::ksi;
@@ -45,10 +44,10 @@ inline constexpr auto ATE_LOOP_COUNT_NAF = 0x1120804220120081204008212022011_u12
 inline constexpr int LOG_ATE_LOOP_COUNT = 63;
 
 /// Miller loop according to https://eprint.iacr.org/2010/354.pdf Algorithm 1.
-Fq12 miller_loop(const ecc::Point<Fq2>& Q, const ecc::Point<Fq>& P) noexcept
+Fq12 miller_loop(const ecc::AffinePoint<E2>& Q, const ecc::AffinePoint<Curve>& P) noexcept
 {
-    auto T = ecc::JacPoint<Fq2>::from(Q);
-    auto nQ = -Q;
+    auto T = ecc::ProjPoint{Q};
+    const auto nQ = -Q;
     auto f = Fq12::one();
     std::array<Fq2, 3> t;
     auto naf = ATE_LOOP_COUNT_NAF;
@@ -128,7 +127,7 @@ Fq12 final_exp(const Fq12& v) noexcept
 }
 }  // namespace
 
-std::optional<bool> pairing_check(std::span<const std::pair<Point, ExtPoint>> pairs) noexcept
+std::optional<bool> pairing_check(std::span<const std::pair<AffinePoint, ExtPoint>> pairs) noexcept
 {
     if (pairs.empty())
         return true;
@@ -137,33 +136,19 @@ std::optional<bool> pairing_check(std::span<const std::pair<Point, ExtPoint>> pa
 
     for (const auto& [p, q] : pairs)
     {
-        if (!is_field_element(p.x) || !is_field_element(p.y) || !is_field_element(q.x.first) ||
-            !is_field_element(q.x.second) || !is_field_element(q.y.first) ||
-            !is_field_element(q.y.second))
-        {
-            return std::nullopt;
-        }
-
-        // Converts points' coefficients in Montgomery form.
-        const auto P_aff = ecc::Point<Fq>{Fq(p.x), Fq(p.y)};
-        const auto Q_aff = ecc::Point<Fq2>{
-            Fq2({Fq(q.x.first), Fq(q.x.second)}), Fq2({Fq(q.y.first), Fq(q.y.second)})};
-
-        const bool g1_is_inf = is_infinity(P_aff);
-        const bool g2_is_inf = g2_is_infinity(Q_aff);
-
-        // Verify that P in on curve. For this group it also means that P is in G1.
-        if (!g1_is_inf && !is_on_curve(P_aff))
+        if (!validate(p))
             return std::nullopt;
 
-        // Verify that Q in on curve and in proper subgroup. This subgroup is much smaller than
-        // group containing all the points from twisted curve over Fq2 field.
-        if (!g2_is_inf && (!is_on_twisted_curve(Q_aff) || !g2_subgroup_check(Q_aff)))
+        const bool g2_is_inf = q == 0;
+
+        // Verify that Q is on the curve and in the proper subgroup. This subgroup is much smaller
+        // than the group containing all the points from the twisted curve over Fq2 field.
+        if (!g2_is_inf && (!is_on_twisted_curve(q) || !g2_subgroup_check(q)))
             return std::nullopt;
 
-        // If any of the points is infinity it means that miller_loop returns 1. so we can skip it.
-        if (!g1_is_inf && !g2_is_inf)
-            f = f * miller_loop(Q_aff, P_aff);
+        // If either point is infinity, miller_loop returns 1, so skip it.
+        if (p != 0 && !g2_is_inf)
+            f = f * miller_loop(q, p);
     }
 
     // final exp is calculated on accumulated value

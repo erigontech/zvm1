@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "state_transition.hpp"
+#include <test/state/system_contracts.hpp>
 #include <test/utils/mpt_hash.hpp>
 #include <test/utils/statetest.hpp>
+#include <test/utils/utils.hpp>
 #include <filesystem>
 #include <fstream>
 
@@ -88,6 +90,17 @@ void state_transition::TearDown()
         {
             EXPECT_EQ(receipt.gas_refund, *expect.gas_refund);
         }
+        if (expect.logs.has_value())
+        {
+            ASSERT_EQ(receipt.logs.size(), expect.logs->size()) << "unexpected number of logs";
+            for (size_t i = 0; i < expect.logs->size(); ++i)
+            {
+                EXPECT_EQ(receipt.logs[i].addr, (*expect.logs)[i].addr) << "log " << i << " addr";
+                EXPECT_EQ(receipt.logs[i].data, (*expect.logs)[i].data) << "log " << i << " data";
+                EXPECT_EQ(receipt.logs[i].topics, (*expect.logs)[i].topics)
+                    << "log " << i << " topics";
+            }
+        }
         // Update default expectations - valid transaction means coinbase exists unless explicitly
         // requested otherwise
         if (!expect.post.contains(Coinbase))
@@ -160,5 +173,15 @@ void state_transition::export_state_test(
 {
     const auto j = to_state_test(export_test_name, block, tx, pre, rev, res, post);
     std::ofstream{export_file_path} << std::setw(2) << j;
+}
+
+Log state_transition::transfer_log(
+    const address& sender, const address& recipient, const intx::uint256& amount)
+{
+    static constexpr std::string_view EVENT = "Transfer(address,address,uint256)";
+    static const auto topic =
+        keccak256({reinterpret_cast<const uint8_t*>(EVENT.data()), EVENT.size()});
+    return {SYSTEM_ADDRESS, bytes{intx::be::store<uint256be>(amount)},
+        {topic, to_bytes32(sender), to_bytes32(recipient)}};
 }
 }  // namespace evmone::test

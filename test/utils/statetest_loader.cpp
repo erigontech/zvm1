@@ -2,6 +2,7 @@
 // Copyright 2022 The evmone Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "error_matching.hpp"
 #include "statetest.hpp"
 #include "stdx/utility.hpp"
 #include "utils.hpp"
@@ -13,17 +14,6 @@ namespace evmone::test
 {
 namespace json = nlohmann;
 using evmc::from_hex;
-
-namespace
-{
-template <typename T>
-T load_if_exists(const json::json& j, std::string_view key)
-{
-    if (const auto it = j.find(key); it != j.end())
-        return from_json<T>(*it);
-    return {};
-}
-}  // namespace
 
 template <>
 uint8_t from_json<uint8_t>(const json::json& j)
@@ -155,11 +145,9 @@ state::AuthorizationList from_json<state::AuthorizationList>(const json::json& j
         authorization.chain_id = from_json<uint256>(a.at("chainId"));
         authorization.addr = from_json<address>(a.at("address"));
         authorization.nonce = from_json<uint64_t>(a.at("nonce"));
-        if (a.contains("signer"))
-            authorization.signer = from_json<address>(a["signer"]);
         authorization.r = from_json<uint256>(a.at("r"));
         authorization.s = from_json<uint256>(a.at("s"));
-        authorization.v = from_json<uint256>(a.at("v"));
+        authorization.y_parity = from_json<uint8_t>(a.at("v"));
         o.emplace_back(authorization);
     }
     return o;
@@ -237,39 +225,24 @@ state::Withdrawal from_json<state::Withdrawal>(const json::json& j)
 state::BlockInfo from_json_with_rev(
     const json::json& j, evmc_revision rev, state::BlobParams blob_params)
 {
-    evmc::bytes32 prev_randao;
-    int64_t current_difficulty = 0;
-    int64_t parent_difficulty = 0;
-    const auto prev_randao_it = j.find("currentRandom");
-    const auto current_difficulty_it = j.find("currentDifficulty");
-    const auto parent_difficulty_it = j.find("parentDifficulty");
-
-    if (current_difficulty_it != j.end())
-        current_difficulty = from_json<int64_t>(*current_difficulty_it);
-    if (parent_difficulty_it != j.end())
-        parent_difficulty = from_json<int64_t>(*parent_difficulty_it);
-
-    // When it's not defined init it with difficulty value.
-    if (prev_randao_it != j.end())
-        prev_randao = from_json<bytes32>(*prev_randao_it);
-    else if (current_difficulty_it != j.end())
-        prev_randao = from_json<bytes32>(*current_difficulty_it);
-    else if (parent_difficulty_it != j.end())
-        prev_randao = from_json<bytes32>(*parent_difficulty_it);
-
-    hash256 parent_uncle_hash;
-    const auto parent_uncle_hash_it = j.find("parentUncleHash");
-    if (parent_uncle_hash_it != j.end())
-        parent_uncle_hash = from_json<hash256>(*parent_uncle_hash_it);
+    // When prev_randao is not defined init it with the difficulty value.
+    bytes32 prev_randao;
+    for (const auto key : {"currentRandom", "currentDifficulty", "parentDifficulty"})
+    {
+        if (const auto v = load_optional<bytes32>(j, key))
+        {
+            prev_randao = *v;
+            break;
+        }
+    }
 
     uint64_t base_fee = 0;
-    if (j.contains("currentBaseFee"))
-        base_fee = from_json<uint64_t>(j.at("currentBaseFee"));
-    else if (j.contains("parentBaseFee"))
+    if (const auto current_base_fee = load_optional<uint64_t>(j, "currentBaseFee"))
+        base_fee = *current_base_fee;
+    else if (const auto parent_base_fee = load_optional<uint64_t>(j, "parentBaseFee"))
     {
         base_fee = calculate_current_base_fee_eip1559(from_json<uint64_t>(j.at("parentGasUsed")),
-            from_json<uint64_t>(j.at("parentGasLimit")),
-            from_json<uint64_t>(j.at("parentBaseFee")));
+            from_json<uint64_t>(j.at("parentGasLimit")), *parent_base_fee);
     }
 
     std::vector<state::Withdrawal> withdrawals;
@@ -289,43 +262,35 @@ state::BlockInfo from_json_with_rev(
         }
     }
 
-    int64_t parent_timestamp = 0;
-    auto parent_timestamp_it = j.find("parentTimestamp");
-    if (parent_timestamp_it != j.end())
-        parent_timestamp = from_json<int64_t>(*parent_timestamp_it);
-
     uint64_t excess_blob_gas = 0;
-    if (const auto it = j.find("parentExcessBlobGas"); it != j.end())
+    if (const auto parent_excess_blob_gas = load_optional<uint64_t>(j, "parentExcessBlobGas"))
     {
-        const auto parent_excess_blob_gas = from_json<uint64_t>(*it);
         const auto parent_blob_gas_used = from_json<uint64_t>(j.at("parentBlobGasUsed"));
         const auto parent_base_fee = from_json<uint64_t>(j.at("parentBaseFee"));
         const auto parent_blob_base_fee =
-            state::compute_blob_gas_price(blob_params, parent_excess_blob_gas);
+            state::compute_blob_gas_price(blob_params, *parent_excess_blob_gas);
         excess_blob_gas = state::calc_excess_blob_gas(rev, blob_params, parent_blob_gas_used,
-            parent_excess_blob_gas, parent_base_fee, parent_blob_base_fee);
+            *parent_excess_blob_gas, parent_base_fee, parent_blob_base_fee);
     }
-    else if (const auto it2 = j.find("currentExcessBlobGas"); it2 != j.end())
-    {
-        excess_blob_gas = from_json<uint64_t>(*it2);
-    }
+    else
+        excess_blob_gas = load_or<uint64_t>(j, "currentExcessBlobGas", 0);
 
     return state::BlockInfo{
         .number = from_json<int64_t>(j.at("currentNumber")),
         .timestamp = from_json<int64_t>(j.at("currentTimestamp")),
-        .parent_timestamp = parent_timestamp,
+        .parent_timestamp = load_or<int64_t>(j, "parentTimestamp", 0),
         .gas_limit = from_json<int64_t>(j.at("currentGasLimit")),
         .coinbase = from_json<evmc::address>(j.at("currentCoinbase")),
-        .difficulty = current_difficulty,
-        .parent_difficulty = parent_difficulty,
-        .parent_ommers_hash = parent_uncle_hash,
+        .difficulty = load_or<int64_t>(j, "currentDifficulty", 0),
+        .parent_difficulty = load_or<int64_t>(j, "parentDifficulty", 0),
+        .parent_ommers_hash = load_or<hash256>(j, "parentUncleHash", {}),
         .prev_randao = prev_randao,
-        .parent_beacon_block_root = load_if_exists<hash256>(j, "parentBeaconBlockRoot"),
+        .parent_beacon_block_root = load_or<hash256>(j, "parentBeaconBlockRoot", {}),
         .base_fee = base_fee,
-        .blob_gas_used = load_if_exists<uint64_t>(j, "blobGasUsed"),
+        .blob_gas_used = load_optional<uint64_t>(j, "blobGasUsed"),
         .excess_blob_gas = excess_blob_gas,
         .blob_base_fee = state::compute_blob_gas_price(blob_params, excess_blob_gas),
-        .slot_number = load_if_exists<uint64_t>(j, "slotNumber"),
+        .slot_number = load_optional<uint64_t>(j, "slotNumber"),
         .ommers = std::move(ommers),
         .withdrawals = std::move(withdrawals),
     };
@@ -371,13 +336,9 @@ TestState from_json<TestState>(const json::json& j)
 static void from_json_tx_common(const json::json& j, state::Transaction& o)
 {
     // `sender` is not provided for transactions in invalid blocks.
-    o.sender = load_if_exists<evmc::address>(j, "sender");
+    o.sender = load_or<address>(j, "sender", {});
     o.nonce = from_json<uint64_t>(j.at("nonce"));
-
-    if (const auto chain_id_it = j.find("chainId"); chain_id_it != j.end())
-        o.chain_id = from_json<uint8_t>(*chain_id_it);
-    else
-        o.chain_id = 1;
+    o.chain_id = load_or<uint64_t>(j, "chainId", 1);
 
     if (const auto to_it = j.find("to"); to_it != j.end())
     {
@@ -453,10 +414,9 @@ state::Transaction from_json<state::Transaction>(const json::json& j)
                                         ", expected: " + std::to_string(inferred_type));
     }
 
-    o.nonce = from_json<uint64_t>(j.at("nonce"));
     o.r = from_json<intx::uint256>(j.at("r"));
     o.s = from_json<intx::uint256>(j.at("s"));
-    o.v = from_json<uint8_t>(j.at("v"));
+    o.v = from_json<uint64_t>(j.at("v"));
 
     return o;
 }
@@ -481,6 +441,8 @@ static void from_json(const json::json& j, TestMultiTransaction& o)
 
     for (const auto& j_value : j.at("value"))
         o.values.emplace_back(from_json<intx::uint256>(j_value));
+
+    o.v = load_or<uint64_t>(j, "v", 0);
 }
 
 static void from_json(const json::json& j, TestMultiTransaction::Indexes& o)
@@ -495,7 +457,9 @@ static void from_json(const json::json& j, StateTransitionTest::Case::Expectatio
     o.indexes = j.at("indexes").get<TestMultiTransaction::Indexes>();
     o.state_hash = from_json<hash256>(j.at("hash"));
     o.logs_hash = from_json<hash256>(j.at("logs"));
-    o.exception = j.contains("expectException");
+    if (const auto it = j.find("expectException"); it != j.end())
+        o.exception = map_legacy_exception(it->get<std::string>());
+    o.txbytes = load_optional<bytes>(j, "txbytes");
 }
 
 static void from_json(const json::json& j_t, StateTransitionTest& o)
@@ -520,18 +484,22 @@ static void from_json(const json::json& j_t, StateTransitionTest& o)
         // LCOV_EXCL_STOP
     }
 
+    uint64_t chain_id = 1;
     if (const auto config_it = j_t.find("config"); config_it != j_t.end())
     {
-        if (const auto bs_it = config_it->find("blobSchedule"); bs_it != config_it->end())
-            o.blob_schedule = from_json<BlobSchedule>(*bs_it);
+        o.blob_schedule = load_or<BlobSchedule>(*config_it, "blobSchedule", {});
+        chain_id = load_or<uint64_t>(*config_it, "chainid", chain_id);
     }
 
     for (const auto& [rev_name, expectations] : j_t.at("post").items())
     {
-        const auto blob_params = get_blob_params(to_rev(rev_name), o.blob_schedule);
-        o.cases.emplace_back(to_rev(rev_name),
+        const auto rev = to_rev(rev_name);
+        const auto blob_params = get_blob_params(rev, o.blob_schedule);
+        auto block = from_json_with_rev(j_t.at("env"), rev, blob_params);
+        block.chain_id = chain_id;
+        o.cases.emplace_back(rev,
             expectations.get<std::vector<StateTransitionTest::Case::Expectation>>(),
-            from_json_with_rev(j_t.at("env"), to_rev(rev_name), blob_params));
+            std::move(block));
     }
 }
 

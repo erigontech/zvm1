@@ -275,6 +275,10 @@ const TestCase TEST_CASES[]{
     // s >= Order
     {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c 73b1693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75f fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
         {}},
+    // r is in range but is not the x coordinate of any curve point: 5**3 + 7 is not a quadratic
+    // residue modulo the field prime, so no point has x == 5.
+    {"18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d1c 000000000000000000000000000000000000000000000000000000000000001c 0000000000000000000000000000000000000000000000000000000000000005 3134a4ba8fafe11b351a720538398a5635e235c0b3258dce19942000731079ec",
+        {}},
     // u1 == u2 && R == G
     {"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 000000000000000000000000000000000000000000000000000000000000001b 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 3a2db9fe7908dcc36d81824d2338fc3dd5ae2692e4c6790043d7868872b09cd1",
         "0000000000000000000000002e4db28b1f03ec8acfc2865e0c08308730e7ddf2"},
@@ -293,6 +297,12 @@ const TestCase TEST_CASES[]{
     // R == 2G, high s
     {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5 fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd036413b",
         "000000000000000000000000bbb10a3b5835400b63ca00372c16db781220fb0b"},
+    // R == 2G, s == ORDER/2: the highest s a strict (EIP-2) recovery accepts.
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5 7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0",
+        "00000000000000000000000090dd1d3d5a9814647c17016ce932360f61639baa"},
+    // R == 2G, s == ORDER/2 + 1: the lowest s a strict recovery rejects.
+    {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5 7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1",
+        "00000000000000000000000026944cf58be26228fdf1e153c37e2152a21a7a97"},
     // R == 3G, low s
     {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 000000000000000000000000000000000000000000000000000000000000001c f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9 0000000000000000000000000000000000000000000000000000000000000010",
         "000000000000000000000000620833dce54ca9329f13a22c3831b102f15df27c"},
@@ -309,7 +319,7 @@ const TestCase TEST_CASES[]{
 };
 }  // namespace
 
-TEST(evmmax, ecrecovery)
+TEST(evmmax, ecrecovery_malleable)
 {
     for (const auto& [input_hex, expected_output_hex] : TEST_CASES)
     {
@@ -327,6 +337,45 @@ TEST(evmmax, ecrecovery)
         const bool parity = v == 28;
 
         const auto result = ecrecover(hash, r_bytes, s_bytes, parity);
+
+        if (expected_output_hex.empty())
+        {
+            EXPECT_FALSE(result.has_value());
+        }
+        else
+        {
+            ASSERT_TRUE(result.has_value());
+            EXPECT_EQ(std::string(24, '0') + hex(*result), expected_output_hex);
+        }
+    }
+}
+
+TEST(evmmax, ecrecovery_strict)
+{
+    const auto order_half = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0"_hex;
+    ASSERT_EQ(order_half.size(), 32);
+
+    for (const auto& [input_hex, malleable_expected_output_hex] : TEST_CASES)
+    {
+        const auto input = from_spaced_hex(input_hex).value();
+        ASSERT_EQ(input.size(), 128);
+
+        const std::span<const uint8_t, 128> input_span{input};
+        const auto hash = input_span.subspan<0, 32>();
+        const auto v_bytes = input_span.subspan<32, 32>();
+        const auto r_bytes = input_span.subspan<64, 32>();
+        const auto s_bytes = input_span.subspan<96, 32>();
+
+        // Both are 32-byte big-endian values, so the byte-wise order is the numeric one.
+        const auto s_high = std::ranges::lexicographical_compare(order_half, s_bytes);
+        const auto expected_output_hex =
+            !s_high ? malleable_expected_output_hex : std::string_view{};
+
+        const auto v = be::unsafe::load<uint256>(v_bytes.data());
+        ASSERT_TRUE(v == 27 || v == 28);
+        const bool parity = v == 28;
+
+        const auto result = ecrecover(hash, r_bytes, s_bytes, parity, RecoveryMode::strict);
 
         if (expected_output_hex.empty())
         {
