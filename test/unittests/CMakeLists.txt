@@ -43,6 +43,7 @@ target_sources(
     exportable_fixture.cpp
     instructions_test.cpp
     jumpdest_analysis_test.cpp
+    keccak_test.cpp
     lru_cache_test.cpp
     precompiles_blake2b_test.cpp
     precompiles_bls_test.cpp
@@ -87,7 +88,18 @@ target_sources(
     tooling_t8n_test.cpp
     tracing_test.cpp
 )
-target_link_libraries(evmone-unittests PRIVATE evmone evmone::evmmax evmone::experimental evmone::precompiles evmone::state evmone::testutils blst::blst GTest::gtest GTest::gtest_main)
+# A second build of the keccak absorb with the strict-alignment path forced on, so keccak_test
+# covers the aligned-word reader on hosts whose target does not select it.
+add_library(evmone-keccak-strict OBJECT ${PROJECT_SOURCE_DIR}/lib/evmone_precompiles/keccak.c)
+target_compile_definitions(
+    evmone-keccak-strict PRIVATE
+    KECCAK_STRICT_ALIGNMENT=1
+    ethash_keccak256=ethash_keccak256_strict
+    ethash_keccak256_32=ethash_keccak256_32_strict
+)
+target_include_directories(evmone-keccak-strict PRIVATE ${PROJECT_SOURCE_DIR}/lib/evmone_precompiles)
+
+target_link_libraries(evmone-unittests PRIVATE evmone evmone::evmmax evmone::experimental evmone::precompiles evmone::state evmone::testutils blst::blst GTest::gtest GTest::gtest_main evmone-keccak-strict)
 target_include_directories(evmone-unittests PRIVATE ${evmone_private_include_dir})
 if(NOT CMAKE_CXX_CLANG_TIDY)
     target_precompile_headers(
