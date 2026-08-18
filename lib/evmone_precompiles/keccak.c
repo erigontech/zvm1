@@ -5,6 +5,8 @@
 
 #include "keccak.h"
 
+#include <stdint.h>
+
 #ifdef SP1TURBO
 void syscall_keccak_permute(uint64_t (*state)[25]);
 #elif defined(SP1)
@@ -56,20 +58,55 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
 #define __builtin_memcpy memcpy
 #endif
 
+// [[noinline]]
+#if defined(_MSC_VER)
+#define NO_INLINE __declspec(noinline)
+#elif __has_attribute(noinline)
+#define NO_INLINE __attribute__((noinline))
+#else
+#define NO_INLINE
+#endif
+
+// Excludes a function from AddressSanitizer instrumentation.
+#if defined(_MSC_VER)
+#define NO_SANITIZE_ADDRESS __declspec(no_sanitize_address)
+#elif __has_attribute(no_sanitize_address)
+#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#define NO_SANITIZE_ADDRESS
+#endif
+
+#define WORD_SIZE sizeof(uint64_t)
+#define WORD_BITS 64
+
+/**
+ * Whether the target needs aligned loads, so that reading the input as aligned words pays.
+ *
+ * Where an unaligned load is a single instruction, load_le_word() already compiles to it and
+ * assembling words out of aligned ones only adds work: measured up to +3.6% per hash on x86-64.
+ */
+#ifndef KECCAK_STRICT_ALIGNMENT  // Overridable so the tests can exercise both paths anywhere.
+#if defined(__riscv) || defined(__mips__) || defined(__sparc__) || defined(__hppa__)
+#define KECCAK_STRICT_ALIGNMENT 1
+#else
+#define KECCAK_STRICT_ALIGNMENT 0
+#endif
+#endif
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define to_le64(X) __builtin_bswap64(X)
 #else
 #define to_le64(X) X
 #endif
 
-/// Loads 64-bit integer from given memory location as little-endian number.
-static inline ALWAYS_INLINE uint64_t load_le(const uint8_t* data)
+/// Loads a 64-bit little-endian integer, a single load instruction on any target. Under
+/// KECCAK_STRICT_ALIGNMENT the caller must guarantee the alignment: declaring it is what keeps
+/// this one instruction there, since the copy would otherwise be lowered byte by byte.
+static inline ALWAYS_INLINE uint64_t load_le_word(const uint8_t* data)
 {
-    /* memcpy is the best way of expressing the intention. Every compiler will
-       optimize is to single load instruction if the target architecture
-       supports unaligned memory access (GCC and clang even in O0).
-       This is great trick because we are violating C/C++ memory alignment
-       restrictions with no performance penalty. */
+#if KECCAK_STRICT_ALIGNMENT && __has_builtin(__builtin_assume_aligned)
+    data = (const uint8_t*)__builtin_assume_aligned(data, WORD_SIZE);
+#endif
     uint64_t word;
     __builtin_memcpy(&word, data, sizeof(word));
     return to_le64(word);
@@ -90,6 +127,65 @@ static inline ALWAYS_INLINE void clear_state(uint64_t state[25])
         state[i] = 0;
 }
 #endif
+
+/// Reads the absorbed input as 64-bit little-endian words assembled from aligned loads, one load
+/// per word: a word of an unaligned input spans two, but one is carried over from the previous.
+/// The two ends of an unaligned input are read past, by under a word -- see absorb_input_unaligned.
+struct word_reader
+{
+    const uint8_t* data;  ///< The position of the next word of the input.
+    uint64_t carry;       ///< The already loaded leading bytes of the next word.
+    unsigned misalign;    ///< The misalignment of the input in bytes, 0 if it is aligned.
+};
+
+/// Starts reading the input of @p size bytes at @p data. @p misalign must be its misalignment,
+/// (uintptr_t)data % WORD_SIZE: every load in the reader is aligned only because of that.
+static inline ALWAYS_INLINE struct word_reader init_word_reader(
+    const uint8_t* data, size_t size, unsigned misalign)
+{
+    struct word_reader r = {data, 0, misalign};
+    if (misalign != 0 && size >= WORD_SIZE)
+    {
+        // The leading bytes of the first word are the trailing bytes of the aligned word before it.
+        // A shorter input has no whole word to read, so the carry would go unused -- and for an
+        // empty one this would be the single load not sharing its word with any input byte.
+        r.carry = load_le_word(data - misalign) >> (misalign * 8);
+    }
+    return r;
+}
+
+/// Returns the next 64-bit little-endian word of an unaligned input and advances the reader. A
+/// whole word must be left to read, and the misalignment must not be zero: the shift would be 64.
+static inline ALWAYS_INLINE uint64_t read_unaligned_word(struct word_reader* r)
+{
+    const unsigned shift = r->misalign * 8;
+    const uint64_t loaded = load_le_word(r->data + WORD_SIZE - r->misalign);
+    r->data += WORD_SIZE;
+
+    // The loaded word's leading bytes complete this word, its trailing ones the next.
+    const uint64_t word = r->carry | (loaded << (WORD_BITS - shift));
+    r->carry = loaded >> shift;
+    return word;
+}
+
+/// Absorbs the next @p words words of the input into the state's leading lanes. The alignment is
+/// tested here rather than per word to keep the body small enough for a whole block's absorb to
+/// stay fully unrolled; an earlier, larger one lost the unrolling and cost 3.1% of total cycles.
+static inline ALWAYS_INLINE void absorb_words(uint64_t* state, size_t words, struct word_reader* r)
+{
+    if (r->misalign == 0)
+    {
+        const uint8_t* const data = r->data;
+        for (size_t i = 0; i < words; ++i)
+            state[i] ^= load_le_word(data + i * WORD_SIZE);
+        r->data = data + words * WORD_SIZE;
+    }
+    else
+    {
+        for (size_t i = 0; i < words; ++i)
+            state[i] ^= read_unaligned_word(r);
+    }
+}
 
 /// Rotates the bits of x left by the count value specified by s.
 /// The s must be in range <0, 64> exclusively, otherwise the result is undefined.
@@ -366,12 +462,49 @@ __attribute__((constructor)) static void select_keccakf1600_implementation(void)
 #endif
 
 
+/// Absorbs the whole input, permuting after every complete block, and XORs in the padding byte.
+/// The last block's bit flip and the final permutation are left to the caller. Pass a nonzero
+/// @p misalign only through absorb_input_unaligned(), whose ASan exclusion covers its reads.
+static inline ALWAYS_INLINE void absorb_input(
+    uint64_t* state, size_t block_words, const uint8_t* data, size_t size, unsigned misalign)
+{
+    struct word_reader reader = init_word_reader(data, size, misalign);
+
+    while (size >= block_words * WORD_SIZE)
+    {
+        absorb_words(state, block_words, &reader);
+
+        keccakf1600_best(state);
+
+        size -= block_words * WORD_SIZE;
+    }
+
+    const size_t last_words = size / WORD_SIZE;  // Whole words of the last, incomplete block.
+    absorb_words(state, last_words, &reader);
+    size %= WORD_SIZE;
+
+    // Absorb last 0–7 bytes of input + the padding byte.
+    const uint8_t* const tail = reader.data;
+    uint64_t last_word = (uint64_t)0x01 << (size * 8);
+    for (size_t i = 0; i < size; ++i)
+        last_word |= (uint64_t)tail[i] << (i * 8);
+    state[last_words] ^= last_word;
+}
+
+/// Absorbs an unaligned input, out of line so the aligned case need not save the registers this
+/// wants, and so the reads past the input land here: they cannot fault (an aligned load stays in
+/// the page of the input byte it shares a word with) and are shifted out, but ASan objects.
+static NO_INLINE NO_SANITIZE_ADDRESS void absorb_input_unaligned(
+    uint64_t* state, size_t block_words, const uint8_t* data, size_t size, unsigned misalign)
+{
+    absorb_input(state, block_words, data, size, misalign);
+}
+
 static inline ALWAYS_INLINE void keccak(
     uint64_t* out, size_t bits, const uint8_t* data, size_t size)
 {
-    static const size_t word_size = sizeof(uint64_t);
     const size_t hash_size = bits / 8;
-    const size_t block_size = (1600 - bits * 2) / 8;
+    const size_t block_words = (1600 - bits * 2) / 8 / WORD_SIZE;
 
 #if KECCAK_INLINE_STATE_CLEAR
     uint64_t state[25];
@@ -380,40 +513,19 @@ static inline ALWAYS_INLINE void keccak(
     uint64_t state[25] = {0};
 #endif
 
-    while (size >= block_size)
-    {
-        for (size_t i = 0; i < (block_size / word_size); ++i)
-        {
-            state[i] ^= load_le(data);
-            data += word_size;
-        }
+    // Off the strict targets this is a constant 0, folding the word reader down to a plain load.
+    const unsigned misalign =
+        KECCAK_STRICT_ALIGNMENT ? (unsigned)((uintptr_t)data % WORD_SIZE) : 0;
+    if (misalign == 0)
+        absorb_input(state, block_words, data, size, 0);
+    else
+        absorb_input_unaligned(state, block_words, data, size, misalign);
 
-        keccakf1600_best(state);
-
-        size -= block_size;
-    }
-
-    uint64_t* state_iter = state;
-
-    while (size >= word_size)
-    {
-        *state_iter ^= load_le(data);
-        ++state_iter;
-        data += word_size;
-        size -= word_size;
-    }
-
-    // Absorb last 0–7 bytes of input + the padding byte.
-    uint64_t last_word = (uint64_t)0x01 << (size * 8);
-    for (size_t i = 0; i < size; ++i)
-        last_word |= (uint64_t)data[i] << (i * 8);
-    *state_iter ^= last_word;
-
-    state[(block_size / word_size) - 1] ^= 0x8000000000000000;  // Last block bit flip.
+    state[block_words - 1] ^= 0x8000000000000000;  // Last block bit flip.
 
     keccakf1600_best(state);
 
-    for (size_t i = 0; i < (hash_size / word_size); ++i)
+    for (size_t i = 0; i < (hash_size / WORD_SIZE); ++i)
         out[i] = to_le64(state[i]);
 }
 
