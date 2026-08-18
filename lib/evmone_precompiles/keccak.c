@@ -433,12 +433,14 @@ static void keccakf1600_generic(uint64_t state[25])
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
 #if defined(SP1TURBO) || defined(SP1)
-#define DEFAULT_keccakf1600 syscall_keccak_permute
+/// Not a pointer: GCC will not inline the syscall through one, leaving a call and a return
+/// around the four instructions of the ecall. Nothing selects another implementation here.
+#define keccakf1600_best syscall_keccak_permute
 #else
 #define DEFAULT_keccakf1600 keccakf1600_generic
-#endif
 
 static void (*keccakf1600_best)(uint64_t[25]) = DEFAULT_keccakf1600;
+#endif
 
 
 #if !defined(_MSC_VER) && defined(__x86_64__) && __has_attribute(target)
