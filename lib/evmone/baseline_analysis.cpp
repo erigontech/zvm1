@@ -4,6 +4,7 @@
 
 #include "baseline.hpp"
 #include "instructions.hpp"
+#include <limits>
 #include <memory>
 
 namespace evmone::baseline
@@ -19,16 +20,32 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
 {
     // To find if op is any PUSH opcode (OP_PUSH1 <= op <= OP_PUSH32)
     // it can be noticed that OP_PUSH32 is INT8_MAX (0x7f) therefore,
-    // static_cast<int8_t>(op) <= OP_PUSH32 is always true and can be skipped.
-    // static_assert(OP_PUSH32 == std::numeric_limits<int8_t>::max());
+    // op <= OP_PUSH32 is always true for a signed byte and can be skipped.
+    static_assert(OP_PUSH32 == std::numeric_limits<int8_t>::max());
 
-    for (size_t i = 0; i < code.size(); ++i)
+    // Walk signed bytes: the PUSH test's sign extension folds into the load and opcodes >= 0x80
+    // turn negative, so one `op < OP_JUMPDEST` check rejects all but PUSH and JUMPDEST.
+    //
+    // On rv64im with GCC this makes the common path 4 instructions instead of 9, and there an
+    // executed instruction is a proven cycle. clang needs one more: llvm/llvm-project#217273.
+    const auto* const base = reinterpret_cast<const int8_t*>(code.data());
+    const auto* const end = base + code.size();
+    for (const auto* p = base; p < end;)
     {
-        const auto op = code[i];
-        if (static_cast<int8_t>(op) >= OP_PUSH1)  // If any PUSH opcode (see explanation above).
-            i += op - size_t{OP_PUSH1 - 1};       // Skip PUSH data.
-        else if (INTX_UNLIKELY(op == OP_JUMPDEST))
-            map.set(i);
+        const auto op = *p;
+        if (op >= OP_JUMPDEST)  // Everything below is neither, including every opcode >= 0x80.
+        {
+            if (op >= OP_PUSH1)  // If any PUSH opcode (see explanation above).
+            {
+                // Widen before subtracting: left in int, clang narrows the advance back to
+                // i8 and masks it, which lengthens the loop. llvm/llvm-project#217314
+                p += std::ptrdiff_t{op} - OP_PUSH1 + 2;  // Skip the opcode and its PUSH data.
+                continue;
+            }
+            if (op == OP_JUMPDEST) [[unlikely]]
+                map.set(static_cast<size_t>(p - base));
+        }
+        ++p;
     }
 }
 
@@ -54,7 +71,9 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto bitset_storage =
         new (&storage[aligned_code_size]) BitsetSpan::word_type[bitset_words];
     const BitsetSpan jumpdest_bitset{bitset_storage};
-    analyze_jumpdests(jumpdest_bitset, code);
+    // Scan the padded copy: a truncated PUSH at the end advances past the last opcode by up to
+    // 32 bytes, which stays inside this allocation but not inside the caller's.
+    analyze_jumpdests(jumpdest_bitset, {storage.get(), code.size()});
 
     return {std::move(storage), code.size(), jumpdest_bitset};
 }
