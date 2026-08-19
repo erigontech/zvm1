@@ -29,13 +29,27 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
     //
     // On rv64im with GCC this makes the common path 4 instructions instead of 9, and there an
     // executed instruction is a proven cycle. clang needs one more: llvm/llvm-project#217273.
+    // Ordinary opcodes dominate, so they are stepped two at a time and share one bound check,
+    // taking them from 4 instructions per byte to 3. p[1] is in bounds because p < end - 1.
     const auto* const base = reinterpret_cast<const int8_t*>(code.data());
     const auto* const end = base + code.size();
-    for (const auto* p = base; p < end;)
+    const auto* p = base;
+    if (code.size() > 1)
     {
-        const auto op = *p;
-        if (op >= OP_JUMPDEST)  // Everything below is neither, including every opcode >= 0x80.
+        const auto* const end1 = end - 1;
+        while (p < end1)
         {
+            auto op = *p;
+            if (op < OP_JUMPDEST)
+            {
+                op = p[1];
+                if (op < OP_JUMPDEST)  // Both ordinary: one check, two bytes.
+                {
+                    p += 2;
+                    continue;
+                }
+                ++p;
+            }
             if (op >= OP_PUSH1)  // If any PUSH opcode (see explanation above).
             {
                 // Widen before subtracting: left in int, clang narrows the advance back to
@@ -45,7 +59,20 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
             }
             if (op == OP_JUMPDEST) [[unlikely]]
                 map.set(static_cast<size_t>(p - base));
+            ++p;
         }
+    }
+
+    while (p < end)  // The last byte, at most one iteration.
+    {
+        const auto op = *p;
+        if (op >= OP_PUSH1)
+        {
+            p += std::ptrdiff_t{op} - OP_PUSH1 + 2;
+            continue;
+        }
+        if (op == OP_JUMPDEST) [[unlikely]]
+            map.set(static_cast<size_t>(p - base));
         ++p;
     }
 }
