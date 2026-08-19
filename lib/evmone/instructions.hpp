@@ -188,8 +188,14 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     // Memory word counts are always non-negative and bounded by ~8MB/32 < 2^18.
     const auto new_words = static_cast<uint32_t>((new_size + (word_size - 1)) / word_size);
     const auto current_words = static_cast<uint32_t>(memory.size() >> 5);  // / 32
-    const auto new_cost = 3 * new_words + (new_words * new_words >> 9);    // / 512
-    const auto current_cost = 3 * current_words + (current_words * current_words >> 9);
+    // The square must be computed in 64 bits: word counts reach 2^18, so the
+    // square reaches 2^36 and wraps uint32 once memory crosses 2MB (65536
+    // words), which turns the cost delta negative-then-huge and OOGs the
+    // frame. On rv32im a 32x32->64 multiply is still a single mul/mulhu pair.
+    const auto new_cost =
+        3 * static_cast<uint64_t>(new_words) + (static_cast<uint64_t>(new_words) * new_words >> 9);  // / 512
+    const auto current_cost =
+        3 * static_cast<uint64_t>(current_words) + (static_cast<uint64_t>(current_words) * current_words >> 9);
     const auto cost = static_cast<int64_t>(new_cost - current_cost);
 
     if (deduct_gas(gas_left, cost)) [[likely]]

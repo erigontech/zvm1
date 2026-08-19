@@ -62,6 +62,19 @@ TEST_P(evm, memory_big_allocation)
         EXPECT_EQ(b, 0);
 }
 
+TEST_P(evm, memory_grow_cost_crossing_2mb)
+{
+    // Regression: the 32-bit square in grow_memory's cost formula wraps once
+    // memory crosses 65536 words (2 MiB), pricing the expansion at ~4.3e9 gas
+    // and spuriously OOG-ing the frame. 65535 words still fits in 32 bits.
+    constexpr auto size = 2 * 1024 * 1024 + 32;  // 65537 words
+    const auto code = ret(0, size);
+    execute(9'000'000, code);
+    EXPECT_STATUS(EVMC_SUCCESS);
+    ASSERT_EQ(result.output_size, size);
+    EXPECT_GT(gas_used, 8'500'000);  // 3w + w*w/512 for w=65537, plus pushes
+}
+
 TEST_P(evm, memory_grow_mstore8)
 {
     const auto code = calldataload(0) + push(0) + OP_JUMPDEST + mstore8(OP_DUP1, OP_DUP1) + add(1) +
