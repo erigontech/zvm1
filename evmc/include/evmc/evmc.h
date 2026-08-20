@@ -57,7 +57,7 @@ enum
 typedef struct evmc_bytes32
 {
     /** The 32 bytes. */
-    uint8_t bytes[32];
+    alignas(size_t) uint8_t bytes[32];
 } evmc_bytes32;
 
 /**
@@ -69,7 +69,7 @@ typedef struct evmc_bytes32 evmc_uint256be;
 typedef struct evmc_address
 {
     /** The 20 bytes of the hash. */
-    uint8_t bytes[20];
+    alignas(uint32_t) uint8_t bytes[20];
 } evmc_address;
 
 /** The kind of call-like instruction. */

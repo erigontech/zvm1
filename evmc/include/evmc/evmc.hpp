@@ -23,7 +23,7 @@ namespace evmc
 /// The big-endian 160-bit hash suitable for keeping an Ethereum address.
 ///
 /// This type wraps C ::evmc_address to make sure objects of this type are always initialized.
-struct alignas(uint32_t) address : evmc_address
+struct address : evmc_address
 {
     /// Default and converting constructor.
     ///
@@ -67,7 +67,7 @@ struct alignas(uint32_t) address : evmc_address
 /// The fixed size array of 32 bytes for storing 256-bit EVM values.
 ///
 /// This type wraps C ::evmc_bytes32 to make sure objects of this type are always initialized.
-struct alignas(size_t) bytes32 : evmc_bytes32
+struct bytes32 : evmc_bytes32
 {
     /// Default and converting constructor.
     ///
@@ -122,6 +122,20 @@ struct alignas(size_t) bytes32 : evmc_bytes32
 
 /// The alias for evmc::bytes32 to represent a big-endian 256-bit integer.
 using uint256be = bytes32;
+
+static_assert(alignof(address) == alignof(uint32_t) && sizeof(address) == 20);
+static_assert(alignof(bytes32) == alignof(size_t) && sizeof(bytes32) == 32);
+static_assert(offsetof(evmc_message, recipient) % alignof(address) == 0);
+static_assert(offsetof(evmc_message, sender) % alignof(address) == 0);
+static_assert(offsetof(evmc_message, code_address) % alignof(address) == 0);
+static_assert(offsetof(evmc_message, value) % alignof(bytes32) == 0);
+static_assert(offsetof(evmc_tx_context, tx_origin) % alignof(address) == 0);
+static_assert(offsetof(evmc_tx_context, block_coinbase) % alignof(address) == 0);
+static_assert(offsetof(evmc_tx_context, tx_gas_price) % alignof(bytes32) == 0);
+static_assert(offsetof(evmc_tx_context, block_prev_randao) % alignof(bytes32) == 0);
+static_assert(offsetof(evmc_tx_context, chain_id) % alignof(bytes32) == 0);
+static_assert(offsetof(evmc_tx_context, block_base_fee) % alignof(bytes32) == 0);
+static_assert(offsetof(evmc_tx_context, blob_base_fee) % alignof(bytes32) == 0);
 
 
 /// Loads 64 bits / 8 bytes of data from the given @p data array in big-endian order.
