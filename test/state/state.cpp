@@ -551,9 +551,13 @@ bytes_view State::get_code(const address& addr)
         return {};
     if (a->code_hash == Account::EMPTY_CODE_HASH)
         return {};
-    if (a->code.empty())
-        a->code = m_initial.get_account_code(addr);
-    return a->code;
+    // Non-empty only if this transaction wrote the code; every writer either leaves it
+    // non-empty or sets code_hash to EMPTY_CODE_HASH, which the check above catches.
+    if (!a->code.empty())
+        return a->code;
+    // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
+    // its 23-byte prefix, so copying the whole contract here would be pure waste.
+    return m_initial.get_account_code(addr);
 }
 
 Account& State::touch(const address& addr)
