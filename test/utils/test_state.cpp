@@ -18,7 +18,7 @@ std::optional<state::StateView::Account> TestState::get_account(const address& a
     return Account{acc.nonce, acc.balance, keccak256(acc.code), !acc.storage.empty()};
 }
 
-bytes TestState::get_account_code(const address& addr) const noexcept
+bytes_view TestState::get_account_code(const address& addr) const noexcept
 {
     const auto it = find(addr);
     if (it == end())

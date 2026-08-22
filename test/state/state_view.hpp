@@ -12,6 +12,7 @@ namespace evmone::state
 using evmc::address;
 using evmc::bytes;
 using evmc::bytes32;
+using evmc::bytes_view;
 using intx::uint256;
 
 class StateView
@@ -27,7 +28,10 @@ public:
 
     virtual ~StateView() = default;
     virtual std::optional<Account> get_account(const address& addr) const noexcept = 0;
-    virtual bytes get_account_code(const address& addr) const noexcept = 0;
+    /// The account code, borrowed. The returned view must stay valid while this StateView is
+    /// alive and unmodified; an implementation that has no such storage must keep the bytes
+    /// alive itself. Callers that need ownership copy at the point of use; most only inspect.
+    virtual bytes_view get_account_code(const address& addr) const noexcept = 0;
     virtual bytes32 get_storage(const address& addr, const bytes32& key) const noexcept = 0;
 };
 
