@@ -179,7 +179,9 @@ int64_t process_authorization_list(
             const auto it = std::ranges::copy(DELEGATION_MAGIC, std::begin(designation_buf)).out;
             std::ranges::copy(auth.addr.bytes, it);
             const bytes_view designation{designation_buf, std::size(designation_buf)};
-            if (authority.code != designation)
+            // Compare against the effective code: the account's own code member is only set
+            // when this transaction modified it, the rest is borrowed from the state view.
+            if (state.get_code(*authority_addr) != designation)
             {
                 // We are doing this only if the code is different to make the state diff precise.
                 authority.code_changed = true;
@@ -312,9 +314,13 @@ bytes_view State::get_code(const address& addr)
         return {};
     if (a->code_hash == Account::EMPTY_CODE_HASH)
         return {};
-    if (a->code.empty())
-        a->code = m_initial.get_account_code(addr);
-    return a->code;
+    // Non-empty only if this transaction wrote the code; every writer either leaves it
+    // non-empty or sets code_hash to EMPTY_CODE_HASH, which the check above catches.
+    if (!a->code.empty())
+        return a->code;
+    // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
+    // its 23-byte prefix, so copying the whole contract here would be pure waste.
+    return m_initial.get_account_code(addr);
 }
 
 Account& State::touch(const address& addr)
