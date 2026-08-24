@@ -210,7 +210,23 @@ void t8n(const T8NArgs& args)
                 j_result["blockException"] = "system contract empty or failed";
         }
 
-        finalize(state, rev, block.coinbase, args.block_reward, block.ommers, block.withdrawals);
+        if (res.requests_error)
+            // Report invalid block in the JSON result when request collection fails.
+            j_result["blockException"] = res.requests_error.message();
+        else
+            requests = std::move(res.requests);
+
+        receipts = std::move(res.receipts);
+        // EIP-8037/7778: header gasUsed = max(sum_regular, sum_state) for Amsterdam+
+        // (`res.gas_used` carries that block-level value). Pre-Amsterdam, preserve the
+        // legacy cumulative transaction gas (refunds excluded).
+        if (rev >= EVMC_AMSTERDAM)
+            gas_used = res.gas_used;
+        else if (!receipts.empty())
+            gas_used = receipts.back().cumulative_gas_used;
+        bloom = res.bloom;
+        blob_gas_left = res.blob_gas_left;
+        post_state = std::move(res.block_state);
 
         j_result["logsHash"] = hex0x(logs_hash(txs_logs));
         j_result["stateRoot"] = hex0x(state::mpt_hash(state));

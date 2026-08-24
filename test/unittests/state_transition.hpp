@@ -67,6 +67,14 @@ protected:
         /// (`gas_used + gas_refund` equals `max(pre-refund gas, EIP-7623 floor)`).
         std::optional<int64_t> gas_refund;
 
+        /// The expected logs emitted by the transaction. When set, the receipt's logs must match
+        /// exactly: count, address, data, topics, and order.
+        std::optional<std::vector<Log>> logs;
+
+        /// The expected EIP-8037 state-gas component of the receipt (`state_block_gas`),
+        /// e.g. a NEW_ACCOUNT_STATE_GAS charge that survives a light failure.
+        std::optional<int64_t> state_gas;
+
         /// The expected post-execution state.
         std::unordered_map<address, ExpectedAccount> post;
 

@@ -41,8 +41,17 @@ constexpr auto storage_cost_spec = []() noexcept {
     tbl[EVMC_CANCUN] = tbl[EVMC_LONDON];
     tbl[EVMC_PRAGUE] = tbl[EVMC_LONDON];
     tbl[EVMC_OSAKA] = tbl[EVMC_LONDON];
+    // EIP-8038: the SSTORE first-time-change cost becomes WARM_ACCESS + STORAGE_WRITE for both
+    // set (0 -> non-zero) and reset (non-zero -> other); the cold surcharge is applied separately.
+    // The 0 -> non-zero state-creation cost stays in state gas (EIP-8037). The clear refund grows
+    // to STORAGE_CLEAR_REFUND. Was set=2900/reset=2900/clear=4800 in bal-devnet-7.
     tbl[EVMC_AMSTERDAM] = tbl[EVMC_LONDON];
-    tbl[EVMC_EXPERIMENTAL] = tbl[EVMC_LONDON];
+    tbl[EVMC_AMSTERDAM].set = instr::warm_storage_read_cost + instr::storage_write_cost_amsterdam;
+    tbl[EVMC_AMSTERDAM].reset = tbl[EVMC_AMSTERDAM].set;
+    // STORAGE_CLEAR_REFUND = (STORAGE_WRITE + COLD_STORAGE_ACCESS) * (4800 / 5000) = 11616.
+    tbl[EVMC_AMSTERDAM].clear =
+        (instr::storage_write_cost_amsterdam + instr::cold_sload_cost) * 4800 / 5000;
+    tbl[EVMC_EXPERIMENTAL] = tbl[EVMC_AMSTERDAM];
     return tbl;
 }();
 
@@ -51,6 +60,9 @@ struct StorageStoreCost
 {
     int16_t gas_cost;
     int16_t gas_refund;
+    /// EIP-8037 state gas for the slot allocation: positive to charge, negative to refill,
+    /// zero before Amsterdam. Wider than int16_t because 64 * COST_PER_STATE_BYTE is 97'920.
+    int32_t state_gas = 0;
 };
 
 // The lookup table of SSTORE costs by the storage update status.
@@ -89,6 +101,14 @@ constexpr auto sstore_costs = []() noexcept {
             e[EVMC_STORAGE_MODIFIED_RESTORED] = {
                 c.warm_access, static_cast<int16_t>(c.reset - c.warm_access)};
         }
+
+        // EIP-8037: allocating a slot (0 -> non-zero) costs state gas; undoing it in the same
+        // transaction (0 -> Y -> 0) refills it.
+        if (rev >= EVMC_AMSTERDAM)
+        {
+            e[EVMC_STORAGE_ADDED].state_gas = STORAGE_SET_STATE_GAS;
+            e[EVMC_STORAGE_ADDED_DELETED].state_gas = -STORAGE_SET_STATE_GAS;
+        }
     }
 
     return tbl;
@@ -104,10 +124,8 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
         state.host.access_storage(state.msg->recipient, key) == EVMC_ACCESS_COLD)
     {
         // The warm storage access cost is already applied (from the cost table).
-        // Here we need to apply additional cold storage access cost.
-        constexpr auto additional_cold_sload_cost =
-            instr::cold_sload_cost - instr::warm_storage_read_cost;
-        if ((gas_left -= additional_cold_sload_cost) < 0)
+        // Here we need to apply additional cold storage access cost (EIP-8038-repriced).
+        if ((gas_left -= instr::additional_cold_storage_access_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -127,17 +145,39 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
 
+    // EIP-2929 adds the full cold SLOAD cost on top of the warm base; EIP-8038 (Amsterdam)
+    // unifies SSTORE access with SLOAD, so the additional cold cost is COLD_STORAGE_ACCESS - WARM.
+    const auto cold_access_cost = state.rev >= EVMC_AMSTERDAM ?
+                                      instr::additional_cold_storage_access_cost :
+                                      int64_t{instr::cold_sload_cost};
     const auto gas_cost_cold =
         (state.rev >= EVMC_BERLIN &&
             state.host.access_storage(state.msg->recipient, key) == EVMC_ACCESS_COLD) ?
-            instr::cold_sload_cost :
+            cold_access_cost :
             0;
+
+    // EIP-8038 / EIP-7928 (EELS #3064): gas must cover the access cost before the storage read
+    // below records the slot in the block access list. Post-repricing the cold access cost (3000)
+    // exceeds the EIP-2200 stipend, so the stipend sentry above is no longer sufficient on its own.
+    if (state.rev >= EVMC_AMSTERDAM && gas_left < gas_cost_cold + instr::warm_storage_read_cost)
+        return {EVMC_OUT_OF_GAS, gas_left};
+
     const auto status = state.host.set_storage(state.msg->recipient, key, value);
 
-    const auto [gas_cost_warm, gas_refund] = sstore_costs[state.rev][status];
+    const auto [gas_cost_warm, gas_refund, state_gas] = sstore_costs[state.rev][status];
     const auto gas_cost = gas_cost_warm + gas_cost_cold;
 
+    // EIP-8037: a refill (0 -> Y -> 0) is applied BEFORE the regular charge, as in EELS, so gas
+    // credited back to gas_left from a prior spill can fund that charge.
+    if (state_gas < 0)
+        credit_state_gas_refund(gas_left, state, -state_gas);
+
+    // EIP-8037: charge regular gas FIRST, then state gas. This order prevents a state
+    // gas spill from counting committed state growth behind a subsequent regular OOG.
     if ((gas_left -= gas_cost) < 0)
+        return {EVMC_OUT_OF_GAS, gas_left};
+
+    if (state_gas > 0 && !charge_state_gas(gas_left, state, state_gas))
         return {EVMC_OUT_OF_GAS, gas_left};
     state.gas_refund += gas_refund;
     return {EVMC_SUCCESS, gas_left};
