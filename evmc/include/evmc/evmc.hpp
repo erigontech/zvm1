@@ -776,16 +776,29 @@ inline VM::VM(evmc_vm* vm,
 
 namespace internal
 {
+/// Reinterprets a C type pointer as a reference to its C++ counterpart, rather than converting
+/// it by value. The C++ types add member functions but no data and no alignment of their own, and
+/// the static_asserts above pin down every offset a caller can pass from, so the cast is safe.
+inline const address& as_cpp(const evmc_address* p) noexcept
+{
+    return *reinterpret_cast<const address*>(p);
+}
+
+inline const bytes32& as_cpp(const evmc_bytes32* p) noexcept
+{
+    return *reinterpret_cast<const bytes32*>(p);
+}
+
 inline bool account_exists(evmc_host_context* h, const evmc_address* addr) noexcept
 {
-    return Host::from_context(h)->account_exists(*addr);
+    return Host::from_context(h)->account_exists(as_cpp(addr));
 }
 
 inline evmc_bytes32 get_storage(evmc_host_context* h,
                                 const evmc_address* addr,
                                 const evmc_bytes32* key) noexcept
 {
-    return Host::from_context(h)->get_storage(*addr, *key);
+    return Host::from_context(h)->get_storage(as_cpp(addr), as_cpp(key));
 }
 
 inline evmc_storage_status set_storage(evmc_host_context* h,
@@ -793,27 +806,27 @@ inline evmc_storage_status set_storage(evmc_host_context* h,
                                        const evmc_bytes32* key,
                                        const evmc_bytes32* value) noexcept
 {
-    return Host::from_context(h)->set_storage(*addr, *key, *value);
+    return Host::from_context(h)->set_storage(as_cpp(addr), as_cpp(key), as_cpp(value));
 }
 
 inline evmc_uint256be get_balance(evmc_host_context* h, const evmc_address* addr) noexcept
 {
-    return Host::from_context(h)->get_balance(*addr);
+    return Host::from_context(h)->get_balance(as_cpp(addr));
 }
 
 inline uint64_t get_nonce(evmc_host_context* h, const evmc_address* addr) noexcept
 {
-    return Host::from_context(h)->get_nonce(*addr);
+    return Host::from_context(h)->get_nonce(as_cpp(addr));
 }
 
 inline size_t get_code_size(evmc_host_context* h, const evmc_address* addr) noexcept
 {
-    return Host::from_context(h)->get_code_size(*addr);
+    return Host::from_context(h)->get_code_size(as_cpp(addr));
 }
 
 inline evmc_bytes32 get_code_hash(evmc_host_context* h, const evmc_address* addr) noexcept
 {
-    return Host::from_context(h)->get_code_hash(*addr);
+    return Host::from_context(h)->get_code_hash(as_cpp(addr));
 }
 
 inline size_t copy_code(evmc_host_context* h,
@@ -822,14 +835,14 @@ inline size_t copy_code(evmc_host_context* h,
                         uint8_t* buffer_data,
                         size_t buffer_size) noexcept
 {
-    return Host::from_context(h)->copy_code(*addr, code_offset, buffer_data, buffer_size);
+    return Host::from_context(h)->copy_code(as_cpp(addr), code_offset, buffer_data, buffer_size);
 }
 
 inline bool selfdestruct(evmc_host_context* h,
                          const evmc_address* addr,
                          const evmc_address* beneficiary) noexcept
 {
-    return Host::from_context(h)->selfdestruct(*addr, *beneficiary);
+    return Host::from_context(h)->selfdestruct(as_cpp(addr), as_cpp(beneficiary));
 }
 
 inline evmc_result call(evmc_host_context* h, const evmc_message* msg) noexcept
@@ -854,27 +867,27 @@ inline void emit_log(evmc_host_context* h,
                      const evmc_bytes32 topics[],
                      size_t num_topics) noexcept
 {
-    Host::from_context(h)->emit_log(*addr, data, data_size, static_cast<const bytes32*>(topics),
-                                    num_topics);
+    Host::from_context(h)->emit_log(as_cpp(addr), data, data_size,
+                                    static_cast<const bytes32*>(topics), num_topics);
 }
 
 inline evmc_access_status access_account(evmc_host_context* h, const evmc_address* addr) noexcept
 {
-    return Host::from_context(h)->access_account(*addr);
+    return Host::from_context(h)->access_account(as_cpp(addr));
 }
 
 inline evmc_access_status access_storage(evmc_host_context* h,
                                          const evmc_address* addr,
                                          const evmc_bytes32* key) noexcept
 {
-    return Host::from_context(h)->access_storage(*addr, *key);
+    return Host::from_context(h)->access_storage(as_cpp(addr), as_cpp(key));
 }
 
 inline evmc_bytes32 get_transient_storage(evmc_host_context* h,
                                           const evmc_address* addr,
                                           const evmc_bytes32* key) noexcept
 {
-    return Host::from_context(h)->get_transient_storage(*addr, *key);
+    return Host::from_context(h)->get_transient_storage(as_cpp(addr), as_cpp(key));
 }
 
 inline void set_transient_storage(evmc_host_context* h,
@@ -882,7 +895,7 @@ inline void set_transient_storage(evmc_host_context* h,
                                   const evmc_bytes32* key,
                                   const evmc_bytes32* value) noexcept
 {
-    Host::from_context(h)->set_transient_storage(*addr, *key, *value);
+    Host::from_context(h)->set_transient_storage(as_cpp(addr), as_cpp(key), as_cpp(value));
 }
 }  // namespace internal
 
