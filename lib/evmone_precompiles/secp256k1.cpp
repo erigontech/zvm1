@@ -326,6 +326,36 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     std::copy_n(p, SP1_POINT_SIZE, h);
     sp1_secp256k1_add(h, q);
 
+    // Q == -P makes h the zero (infinity) encoding, which the raw syscalls in the
+    // loops below reject. Then uP + vQ == (u-v)P, a single scalar multiplication.
+    // Handled out of line with the identity-safe add rather than the _nz fast
+    // path, so the hot loops keep exactly the shape they had before this case
+    // was handled. Only reachable on adversarial input.
+    if (is_zero(h)) [[unlikely]]
+    {
+        const uint64_t* base;
+        uint256 d;
+        if (u >= v)
+        {
+            d = u - v;
+            base = p;
+        }
+        else
+        {
+            d = v - u;  // (u-v)P == (v-u)(-P) == (v-u)Q
+            base = q;
+        }
+        std::fill_n(r, SP1_POINT_SIZE, 0);
+        for (auto j = intx::bit_width(d); j != 0; --j)
+        {
+            if (!is_zero(r))
+                syscall_secp256k1_double(r);
+            if (intx::bit_test(d, j - 1))
+                sp1_secp256k1_add(r, base);
+        }
+        return;
+    }
+
     // Lookup table: index = (v_bit << 1) | u_bit.
     const uint64_t* points[4] = {nullptr, p, q, h};
 
@@ -351,7 +381,6 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
             break;
         }
     }
-
     // Main loop: double-and-add. Zero-point checks skipped (accumulator and
     // table points are always non-zero), only same-x check via _nz helper.
     bool nz = true;
