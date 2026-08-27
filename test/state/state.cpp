@@ -355,7 +355,7 @@ AuthOutcome process_authorization_list(State& state, uint64_t chain_id,
             const bytes_view designation{designation_buf, std::size(designation_buf)};
             // Compare against the effective code: the account's own code member is only set
             // when this transaction modified it, the rest is borrowed from the state view.
-            if (state.get_code(*authority_addr) != designation)
+            if (state.get_code(authority_addr) != designation)
             {
                 // We are doing this only if the code is different to make the state diff precise.
                 state.journal_code_change(authority_addr);

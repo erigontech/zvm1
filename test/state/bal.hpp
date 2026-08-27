@@ -170,7 +170,7 @@ public:
     ///    BAL is never compared.
     ///
     /// Adding `on_account_read` here would be redundant in both cases.
-    bytes get_account_code(const address& addr) const noexcept override
+    bytes_view get_account_code(const address& addr) const noexcept override
     {
         return m_inner.get_account_code(addr);
     }
