@@ -26,8 +26,8 @@ struct BitsetSpan
 
     [[nodiscard]] bool test(size_t index) const noexcept
     {
-        const auto [word, bit_mask] = get_ref(index);
-        return (word & bit_mask) != 0;
+        // Shift the word down to the bit instead of materializing a mask to test against.
+        return ((m_array[index / WORD_BITS] >> (index % WORD_BITS)) & 1) != 0;
     }
 
     void set(size_t index) const noexcept
