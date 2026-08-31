@@ -1110,8 +1110,17 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     }
     else
     {
-        const auto max_refund_quotient = rev >= EVMC_LONDON ? 5 : 2;
-        const auto refund_limit = gas_used / max_refund_quotient;
+        assert(gas_used >= 0);  // The VM never returns more gas than it was given.
+
+        // Cap the refund at a fraction of the gas used: 1/5 since London (EIP-3529), 1/2 before.
+        // The quotient is applied as a compile-time constant in each branch rather than selected
+        // into a variable first, so the compiler strength-reduces the division instead of emitting
+        // a divide. The dividend is non-negative, so dividing it as unsigned reduces further: to a
+        // single shift before London, and to a multiply-high since. This matters because some of
+        // the architectures this code is compiled for have no division instruction at all.
+        const auto gas_used_unsigned = static_cast<uint64_t>(gas_used);
+        const auto refund_limit = static_cast<int64_t>(
+            rev >= EVMC_LONDON ? gas_used_unsigned / 5 : gas_used_unsigned / 2);
         const auto refund = std::min(auth.regular_refund + result.gas_refund, refund_limit);
         gas_used -= refund;
         assert(gas_used > 0);
