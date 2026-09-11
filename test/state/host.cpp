@@ -456,12 +456,6 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
         return r;
     }
 
-    auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
-    auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
-        [this](const address& addr) { return m_state.get_code(addr); });
-    if (opt_result.has_value())
-        return std::move(*opt_result);
-
     // TODO: get_code() performs the account lookup. Add a way to get an account with code?
     const auto code = m_state.get_code(msg.code_address);
     if (code.empty())
