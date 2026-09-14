@@ -10,7 +10,18 @@
 #include "baseline.hpp"
 #include <evmone/evmone.h>
 #include <cassert>
+
+/// Whether the built-in tracers (the "trace", "histogram" and "opcode.count" options) are
+/// available. They pull in <iostream> and tracing.cpp, and through them the whole standard
+/// library stream and locale machinery, which is dead weight for embedders that never enable
+/// them -- notably zkVM guests, where it is a large fraction of the program image.
+#ifndef EVMONE_TRACING
+#define EVMONE_TRACING 1
+#endif
+
+#if EVMONE_TRACING
 #include <iostream>
+#endif
 
 namespace evmone
 {
@@ -25,8 +36,10 @@ void destroy(evmc_vm* vm) noexcept
 evmc_set_option_result set_option(evmc_vm* c_vm, char const* c_name, char const* c_value) noexcept
 {
     const auto name = (c_name != nullptr) ? std::string_view{c_name} : std::string_view{};
-    const auto value = (c_value != nullptr) ? std::string_view{c_value} : std::string_view{};
-    auto& vm = *static_cast<VM*>(c_vm);
+    // Both are unused if neither the cgoto option nor the tracers are compiled in.
+    [[maybe_unused]] const auto value =
+        (c_value != nullptr) ? std::string_view{c_value} : std::string_view{};
+    [[maybe_unused]] auto& vm = *static_cast<VM*>(c_vm);
 
     if (name == "advanced")
     {
@@ -46,6 +59,7 @@ evmc_set_option_result set_option(evmc_vm* c_vm, char const* c_name, char const*
         return EVMC_SET_OPTION_INVALID_NAME;
 #endif
     }
+#if EVMONE_TRACING
     else if (name == "trace")
     {
         vm.add_tracer(create_instruction_tracer(std::clog));
@@ -60,6 +74,7 @@ evmc_set_option_result set_option(evmc_vm* c_vm, char const* c_name, char const*
     {
         vm.add_tracer(create_instruction_counter(value));
     }
+#endif
     return EVMC_SET_OPTION_INVALID_NAME;
 }
 
