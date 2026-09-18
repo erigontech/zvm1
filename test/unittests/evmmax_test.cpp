@@ -167,3 +167,39 @@ TYPED_TEST(evmmax_test, inv)
         EXPECT_EQ(m.from_mont(pm), 1);
     }
 }
+
+TYPED_TEST(evmmax_test, inv_matches_binary_gcd)
+{
+    const TypeParam m;
+
+    // Deterministic xorshift64; the differential holds for every input in [0, mod),
+    // Montgomery interpretation included.
+    uint64_t rng = 0x243F6A8885A308D3;
+    const auto rand_value = [&rng, &m] {
+        typename TypeParam::uint v;
+        for (size_t i = 0; i < TypeParam::uint::num_words; ++i)
+        {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            v[i] = rng;
+        }
+        return udivrem(v, m.mod()).rem;
+    };
+
+    const auto check = [&m](const auto& x) {
+        const auto r = m.inv(x);
+        EXPECT_EQ(r, m.inv_binary_gcd(x));
+        if (r != 0)
+            EXPECT_EQ(m.from_mont(m.mul(x, r)), 1);
+    };
+
+    const typename TypeParam::uint edges[] = {0, 1, 2, m.mod() - 1, m.mod() - 2, m.mod() >> 1};
+    for (const auto& x : edges)
+        check(x);
+    for (int i = 0; i < 1000; ++i)
+        check(rand_value());
+    if (m.mod() % 3 == 0)  // composite modulus: force non-invertible inputs
+        for (int i = 0; i < 100; ++i)
+            check(udivrem(rand_value() * 3, m.mod()).rem);
+}

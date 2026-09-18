@@ -53,6 +53,35 @@ void evmmax_mul(benchmark::State& state)
         b = m.mul(b, a);
     }
 }
+template <typename UintT, const UintT& Mod>
+void evmmax_inv(benchmark::State& state)
+{
+    const evmmax::ModArith<UintT> m{Mod};
+    auto a = m.to_mont(Mod / 2);
+    auto b = m.to_mont(Mod / 3);
+
+    // The add keeps the inputs evolving: the safegcd path is variable-time, and a bare
+    // inv ping-pong would alternate between two values.
+    while (state.KeepRunningBatch(2))
+    {
+        a = m.inv(m.add(a, b));
+        b = m.inv(m.add(b, a));
+    }
+}
+
+template <typename UintT, const UintT& Mod>
+void evmmax_inv_binary_gcd(benchmark::State& state)
+{
+    const evmmax::ModArith<UintT> m{Mod};
+    auto a = m.to_mont(Mod / 2);
+    auto b = m.to_mont(Mod / 3);
+
+    while (state.KeepRunningBatch(2))
+    {
+        a = m.inv_binary_gcd(m.add(a, b));
+        b = m.inv_binary_gcd(m.add(b, a));
+    }
+}
 }  // namespace
 
 BENCHMARK_TEMPLATE(evmmax_add, uint256, bn254);
@@ -61,3 +90,7 @@ BENCHMARK_TEMPLATE(evmmax_sub, uint256, bn254);
 BENCHMARK_TEMPLATE(evmmax_sub, uint256, secp256k1);
 BENCHMARK_TEMPLATE(evmmax_mul, uint256, bn254);
 BENCHMARK_TEMPLATE(evmmax_mul, uint256, secp256k1);
+BENCHMARK_TEMPLATE(evmmax_inv, uint256, bn254);
+BENCHMARK_TEMPLATE(evmmax_inv, uint256, secp256k1);
+BENCHMARK_TEMPLATE(evmmax_inv_binary_gcd, uint256, bn254);
+BENCHMARK_TEMPLATE(evmmax_inv_binary_gcd, uint256, secp256k1);
