@@ -504,6 +504,35 @@ inline void callvalue(StackTop stack, ExecutionState& state) noexcept
     stack.push(intx::be::load<uint256>(state.msg->value));
 }
 
+#if defined(__riscv) && !defined(__riscv_zbb)
+// Without a byte-swap instruction an access of unproven alignment is split into byte accesses,
+// and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap.
+
+[[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
+{
+    if (reinterpret_cast<uintptr_t>(p) % 8 == 0) [[likely]]
+        return intx::be::unsafe::load<uint256>(std::assume_aligned<8>(p));
+    return intx::be::unsafe::load<uint256>(p);
+}
+
+[[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& value) noexcept
+{
+    if (reinterpret_cast<uintptr_t>(p) % 8 == 0) [[likely]]
+        return intx::be::unsafe::store(std::assume_aligned<8>(p), value);
+    intx::be::unsafe::store(p, value);
+}
+#else
+[[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
+{
+    return intx::be::unsafe::load<uint256>(p);
+}
+
+[[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& value) noexcept
+{
+    intx::be::unsafe::store(p, value);
+}
+#endif
+
 inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
@@ -782,7 +811,7 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
-    index = intx::be::unsafe::load<uint256>(&state.memory[static_cast<size_t>(index)]);
+    index = load_be_word(&state.memory[static_cast<size_t>(index)]);
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -794,7 +823,7 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
-    intx::be::unsafe::store(&state.memory[static_cast<size_t>(index)], value);
+    store_be_word(&state.memory[static_cast<size_t>(index)], value);
     return {EVMC_SUCCESS, gas_left};
 }
 
