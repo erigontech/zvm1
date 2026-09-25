@@ -406,6 +406,183 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     }
 }
 
+
+#ifndef SP1TURBO
+// GLV endomorphism: phi(x, y) = (BETA * x, y) = LAMBDA * (x, y). A scalar splits as
+// k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (libsecp256k1 scalar_split_lambda),
+// so u*G + v*Q becomes four half-length scalars sharing one run of 128 doublings.
+constexpr auto GLV_BETA = 0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee_u256;
+constexpr auto GLV_G1 = 0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
+constexpr auto GLV_G2 = 0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+constexpr auto GLV_MINUS_B1 = 0xe4437ed6010e88286f547fa90abfe4c3_u256;
+constexpr auto GLV_B2 = 0x3086d221a7d46bcde86c90e49284eb15_u256;  // == A1
+constexpr auto GLV_A2 = 0x114ca50f7a8e2f3f657c1108d9d44cfd8_u256;
+
+constexpr auto PhiGx_val = 0xbcace2e99da01887ab0102b696902325872844067f15e98da7bba04400b88fcb_u256;
+constexpr auto GpPhiGx_val = 0xc994b69768832bcbff5e9ab39ae8d1d3763bbf1e531bed98fe51de5ee84f50fb_u256;
+constexpr auto GpPhiGy_val = 0xb7c52588d95c3b9aa25b0403f1eef75702e84bb7597aabe663b82f6f04ef2777_u256;
+constexpr auto GmPhiGx_val = 0x93c4d65b4cc437be9f2b0aa72325ba6ce5015022596e21f2ea6eadae415a87b0_u256;
+constexpr auto GmPhiGy_val = 0xde87653b1778d37f77e9403692bd956f5d419b1b625309ca50730fbc03706352_u256;
+
+constexpr sp1_AffinePoint sp1_PhiG = {PhiGx_val[0], PhiGx_val[1], PhiGx_val[2], PhiGx_val[3],
+    Gy_val[0], Gy_val[1], Gy_val[2], Gy_val[3]};
+constexpr sp1_AffinePoint sp1_GpPhiG = {GpPhiGx_val[0], GpPhiGx_val[1], GpPhiGx_val[2],
+    GpPhiGx_val[3], GpPhiGy_val[0], GpPhiGy_val[1], GpPhiGy_val[2], GpPhiGy_val[3]};
+constexpr sp1_AffinePoint sp1_GmPhiG = {GmPhiGx_val[0], GmPhiGx_val[1], GmPhiGx_val[2],
+    GmPhiGx_val[3], GmPhiGy_val[0], GmPhiGy_val[1], GmPhiGy_val[2], GmPhiGy_val[3]};
+
+/// A GLV half-scalar: magnitude < 2^128 and sign.
+struct GlvHalf
+{
+    uint64_t lo;
+    uint64_t hi;
+    bool neg;
+};
+
+/// round(k * g / 2^384).
+inline uint256 mul_shift_384(const uint256& k, const uint256& g) noexcept
+{
+    const auto p = intx::umul(k, g);
+    return uint256{p[6], p[7], 0, 0} + (p[5] >> 63);
+}
+
+inline GlvHalf glv_half(const uint256& t) noexcept
+{
+    const bool neg = (t[3] >> 63) != 0;
+    const auto m = neg ? uint256{0} - t : t;
+    return {m[0], m[1], neg};
+}
+
+inline void glv_split(const uint256& k, GlvHalf& k1, GlvHalf& k2) noexcept
+{
+    const auto c1 = mul_shift_384(k, GLV_G1);
+    const auto c2 = mul_shift_384(k, GLV_G2);
+    // Exact small values, computed modulo 2^256.
+    k2 = glv_half(c1 * GLV_MINUS_B1 - c2 * GLV_B2);
+    k1 = glv_half(k - c1 * GLV_B2 - c2 * GLV_A2);
+}
+
+/// r = -r: y = P - y (no point of secp256k1 has y == 0).
+inline void sp1_negate(sp1_AffinePoint r) noexcept
+{
+    auto& y = reinterpret_cast<uint256&>(r[SP1_POINT_SIZE / 2]);
+    y = Curve::FIELD_PRIME - y;
+}
+
+/// Spreads the 16 bits of x to bits 0, 4, 8, ..., 60.
+inline uint64_t spread4(uint64_t x) noexcept
+{
+    x &= 0xffff;
+    x = (x | (x << 24)) & 0x000000ff000000ff;
+    x = (x | (x << 12)) & 0x000f000f000f000f;
+    x = (x | (x << 6)) & 0x0303030303030303;
+    x = (x | (x << 3)) & 0x1111111111111111;
+    return x;
+}
+
+/// SP1 u×G + v×Q with the GLV endomorphism. Falls back to sp1_msm() when a table entry is the
+/// point at infinity, which only an adversarial Q reaches.
+void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp1_AffinePoint q) noexcept
+{
+    GlvHalf k[4];
+    glv_split(u, k[0], k[1]);
+    glv_split(v, k[2], k[3]);
+
+    // t[i] is the sum of the signed bases selected by the bits of i: G, phi(G), Q, phi(Q).
+    sp1_AffinePoint t[16];
+    std::copy_n(sp1_G, SP1_POINT_SIZE, t[1]);
+    std::copy_n(sp1_PhiG, SP1_POINT_SIZE, t[2]);
+    std::copy_n(k[0].neg == k[1].neg ? sp1_GpPhiG : sp1_GmPhiG, SP1_POINT_SIZE, t[3]);
+    if (k[0].neg)
+    {
+        sp1_negate(t[1]);
+        sp1_negate(t[3]);  // -(G + phi(G)) or -(G - phi(G))
+    }
+    if (k[1].neg)
+        sp1_negate(t[2]);
+    std::copy_n(q, SP1_POINT_SIZE, t[4]);
+    if (k[2].neg)
+        sp1_negate(t[4]);
+    sp1_mulmod(reinterpret_cast<uint256&>(t[8][0]), GLV_BETA, reinterpret_cast<const uint256&>(q[0]));
+    std::copy_n(&q[SP1_POINT_SIZE / 2], SP1_POINT_SIZE / 2, &t[8][SP1_POINT_SIZE / 2]);
+    if (k[3].neg)
+        sp1_negate(t[8]);
+    std::copy_n(t[4], SP1_POINT_SIZE, t[12]);
+    sp1_secp256k1_add(t[12], t[8]);
+    for (const unsigned hi : {4u, 8u, 12u})
+    {
+        for (const unsigned lo : {1u, 2u, 3u})
+        {
+            std::copy_n(t[lo], SP1_POINT_SIZE, t[hi | lo]);
+            sp1_secp256k1_add(t[hi | lo], t[hi]);
+        }
+    }
+    for (unsigned i = 4; i < 16; ++i)
+    {
+        if (is_zero(t[i])) [[unlikely]]
+            return sp1_msm(r, u, sp1_G, v, q);
+    }
+
+    // Digits d = bit(k0) | bit(k1) << 1 | bit(k2) << 2 | bit(k3) << 3, 16 per word, bit 16w + j
+    // at nibble j of word w.
+    uint64_t d[8];
+    for (unsigned w = 0; w < 8; ++w)
+    {
+        const unsigned sh = (w % 4) * 16;
+        const bool high = w >= 4;
+        uint64_t x = 0;
+        for (unsigned j = 0; j < 4; ++j)
+            x |= spread4((high ? k[j].hi : k[j].lo) >> sh) << j;
+        d[w] = x;
+    }
+
+    int w = 7;
+    while (w >= 0 && d[w] == 0)
+        --w;
+    if (w < 0)
+    {
+        std::fill_n(r, SP1_POINT_SIZE, 0);
+        return;
+    }
+    uint64_t dw = d[w];
+    unsigned left = 16;
+    while ((dw >> 60) == 0)
+    {
+        dw <<= 4;
+        --left;
+    }
+    std::copy_n(t[dw >> 60], SP1_POINT_SIZE, r);
+    dw <<= 4;
+    --left;
+
+    bool nz = true;
+    for (;;)
+    {
+        for (; left != 0; --left)
+        {
+            const auto idx = static_cast<unsigned>(dw >> 60);
+            dw <<= 4;
+            if (nz) [[likely]]
+            {
+                syscall_secp256k1_double(r);
+                if (idx != 0)
+                    nz = sp1_secp256k1_add_nz(r, t[idx]);
+            }
+            else
+            {
+                // The accumulator hit infinity: identity-safe operations until it leaves it.
+                if (idx != 0)
+                    sp1_secp256k1_add(r, t[idx]);
+                nz = !is_zero(r);
+            }
+        }
+        if (--w < 0)
+            break;
+        dw = d[w];
+        left = 16;
+    }
+}
+#endif
 }  // namespace
 #endif
 
@@ -514,7 +691,11 @@ std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> has
 
     // Shamir's trick: compute u1*G + u2*R in a single pass
     sp1_AffinePoint sp1_Q;
+#ifdef SP1TURBO
     sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
+#else
+    sp1_msm_glv(sp1_Q, u1, u2, sp1_R);
+#endif
 
     if (is_zero(sp1_Q)) [[unlikely]]
         return std::nullopt;
