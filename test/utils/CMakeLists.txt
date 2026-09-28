@@ -20,6 +20,7 @@ target_sources(
     block_transition.cpp
     blockchaintest.hpp
     blockchaintest_loader.cpp
+    blockchaintest_runner.cpp
     bytecode.hpp
     error_matching.hpp
     error_matching.cpp
@@ -36,8 +37,15 @@ target_sources(
     statetest_export.cpp
     statetest_loader.cpp
     statetest_logs_hash.cpp
+    statetest_runner.cpp
     t8n.hpp
     t8n.cpp
+    test_collector.hpp
+    test_collector.cpp
+    test_driver.hpp
+    test_driver.cpp
+    test_report.hpp
+    test_report.cpp
     test_state.hpp
     test_state.cpp
     utils.hpp

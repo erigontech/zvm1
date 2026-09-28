@@ -8,7 +8,7 @@
 #include <sp1_syscalls.hpp>
 #endif
 
-namespace evmmax::secp256k1
+namespace evmone::crypto::secp256k1
 {
 namespace
 {
@@ -668,6 +668,4 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
 
     return z;
 }
-
-
-}  // namespace evmmax::secp256k1
+}  // namespace evmone::crypto::secp256k1

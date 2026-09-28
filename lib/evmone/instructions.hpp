@@ -4,6 +4,7 @@
 #pragma once
 
 #include "baseline.hpp"
+#include "constants.hpp"
 #include "execution_state.hpp"
 #include "instructions_traits.hpp"
 #include "instructions_xmacro.hpp"
@@ -479,7 +480,7 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -626,7 +627,7 @@ inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -650,7 +651,7 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -707,7 +708,7 @@ inline Result extcodehash(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -860,7 +861,7 @@ inline void tload(StackTop stack, ExecutionState& state) noexcept
 inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     if (state.in_static_mode())
-        return {EVMC_STATIC_MODE_VIOLATION, 0};
+        return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
@@ -1049,7 +1050,7 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     static_assert(NumTopics <= 4);
 
     if (state.in_static_mode())
-        return {EVMC_STATIC_MODE_VIOLATION, 0};
+        return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
     const auto& offset = stack.pop();
     const auto& size = stack.pop();
@@ -1115,7 +1116,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(beneficiary) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::cold_account_access_cost) < 0)
+        if ((gas_left -= cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -1127,17 +1128,29 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
             // sending value to a non-existing account.
             if (!state.host.account_exists(beneficiary))
             {
-                if ((gas_left -= 25000) < 0)
-                    return {EVMC_OUT_OF_GAS, gas_left};
+                if (state.rev >= EVMC_AMSTERDAM)
+                {
+                    // Balance update costs ACCOUNT_WRITE, charged first so in case of OOG
+                    // the state-gas is not consumed.
+                    if ((gas_left -= ACCOUNT_WRITE) < 0)
+                        return {EVMC_OUT_OF_GAS, gas_left};
+                    if (!state.state_gas.charge(gas_left, NEW_ACCOUNT_STATE_GAS))
+                        return {EVMC_OUT_OF_GAS, gas_left};
+                }
+                else
+                {
+                    if ((gas_left -= 25000) < 0)
+                        return {EVMC_OUT_OF_GAS, gas_left};
+                }
             }
         }
     }
 
-    if (state.host.selfdestruct(state.msg->recipient, beneficiary))
-    {
-        if (state.rev < EVMC_LONDON)
-            state.gas_refund += 24000;
-    }
+    const auto first_time = state.host.selfdestruct(state.msg->recipient, beneficiary);
+
+    if (first_time && state.rev < EVMC_LONDON)
+        state.gas_refund += 24000;
+
     return {EVMC_SUCCESS, gas_left};
 }
 

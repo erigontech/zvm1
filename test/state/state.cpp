@@ -9,6 +9,7 @@
 #include "state_view.hpp"
 #include <evmone/constants.hpp>
 #include <evmone/delegation.hpp>
+#include <evmone/instructions_traits.hpp>
 #include <algorithm>
 #include <ranges>
 
@@ -64,6 +65,10 @@ TransactionCost compute_tx_intrinsic_cost(evmc_revision rev, const Transaction& 
     static constexpr auto TX_CREATE_COST = 32000;
     static constexpr auto ACCESS_LIST_ADDRESS_COST = 2400;
     static constexpr auto ACCESS_LIST_STORAGE_KEY_COST = 1900;
+    static constexpr auto ACCESS_LIST_ADDRESS_COST_AMSTERDAM =
+        instr::additional_cold_account_access(EVMC_AMSTERDAM);
+    static constexpr auto ACCESS_LIST_STORAGE_KEY_COST_AMSTERDAM =
+        instr::ADDITIONAL_COLD_STORAGE_ACCESS;
     static constexpr auto ACCESS_LIST_ADDRESS_BYTES = 20;
     static constexpr auto ACCESS_LIST_STORAGE_KEY_BYTES = 32;
     static constexpr auto DATA_TOKEN_COST = 4;
@@ -82,8 +87,12 @@ TransactionCost compute_tx_intrinsic_cost(evmc_revision rev, const Transaction& 
     const auto access_list_num_bytes =
         static_cast<int64_t>(num_addresses * ACCESS_LIST_ADDRESS_BYTES +
                              num_storage_keys * ACCESS_LIST_STORAGE_KEY_BYTES);
-    const auto access_list_cost = static_cast<int64_t>(
-        num_addresses * ACCESS_LIST_ADDRESS_COST + num_storage_keys * ACCESS_LIST_STORAGE_KEY_COST);
+    const auto address_cost =
+        (rev >= EVMC_AMSTERDAM) ? ACCESS_LIST_ADDRESS_COST_AMSTERDAM : ACCESS_LIST_ADDRESS_COST;
+    const auto storage_key_cost = (rev >= EVMC_AMSTERDAM) ? ACCESS_LIST_STORAGE_KEY_COST_AMSTERDAM :
+                                                            ACCESS_LIST_STORAGE_KEY_COST;
+    const auto access_list_cost = static_cast<int64_t>(num_addresses) * address_cost +
+                                  static_cast<int64_t>(num_storage_keys) * storage_key_cost;
 
     const auto auth_list_cost =
         static_cast<int64_t>(tx.authorization_list.size()) * AUTHORIZATION_EMPTY_ACCOUNT_COST;
@@ -196,7 +205,7 @@ int64_t process_authorization_list(
     return delegation_refund;
 }
 
-evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) noexcept
+evmc_message build_message(const Transaction& tx, const TransactionProperties& tx_props) noexcept
 {
     const auto recipient = tx.to.has_value() ? *tx.to : compute_create_address(tx.sender, tx.nonce);
 
@@ -204,7 +213,8 @@ evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) n
         .kind = tx.to.has_value() ? EVMC_CALL : EVMC_CREATE,
         .flags = 0,
         .depth = 0,
-        .gas = execution_gas_limit,
+        .gas = tx_props.execution_gas_limit,
+        .state_gas = tx_props.state_gas_limit,
         .recipient = recipient,
         .sender = tx.sender,
         .input_data = tx.data.data(),
@@ -438,11 +448,11 @@ void State::rollback(size_t checkpoint)
     }
 }
 
-/// Validates transaction and computes its execution gas limit (the amount of gas provided to EVM).
-/// @return  Execution gas limit or transaction validation error.
+/// Validates transaction and computes the gas limits it provides to the EVM.
+/// @return  The transaction's computed gas properties or a validation error.
 std::variant<TransactionProperties, std::error_code> validate_transaction(
     const StateView& state_view, const BlockInfo& block, const Transaction& tx, evmc_revision rev,
-    int64_t block_gas_left, int64_t blob_gas_left) noexcept
+    int64_t block_gas_left, int64_t block_state_gas_left, int64_t blob_gas_left) noexcept
 {
     if (tx.chain_id_protected() && tx.chain_id != block.chain_id)
         return make_error_code(INVALID_CHAIN_ID);
@@ -503,11 +513,22 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
 
     // assert(tx.max_priority_gas_price <= tx.max_gas_price);
 
-    if (rev >= EVMC_OSAKA && tx.gas_limit > MAX_TX_GAS_LIMIT)
+    if (rev == EVMC_OSAKA && tx.gas_limit > MAX_TX_GAS_LIMIT)
         return make_error_code(GAS_LIMIT_EXCEEDS_MAXIMUM);
 
-    if (tx.gas_limit > block_gas_left)
-        return make_error_code(GAS_ALLOWANCE_EXCEEDED);
+    if (rev < EVMC_AMSTERDAM)
+    {
+        if (tx.gas_limit > block_gas_left)
+            return make_error_code(GAS_ALLOWANCE_EXCEEDED);
+    }
+    else
+    {
+        // Check gas limits in both dimensions.
+        if (std::min(tx.gas_limit, int64_t{MAX_TX_GAS_LIMIT}) > block_gas_left)
+            return make_error_code(GAS_ALLOWANCE_EXCEEDED);
+        if (tx.gas_limit > block_state_gas_left)
+            return make_error_code(GAS_ALLOWANCE_EXCEEDED);
+    }
 
     if (tx.max_gas_price < block.base_fee)
         return make_error_code(INSUFFICIENT_MAX_FEE_PER_GAS);
@@ -543,20 +564,22 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     max_total_fee += tx.value;
 
     if (tx.type == Transaction::Type::blob)
-    {
-        const auto total_blob_gas = tx.blob_gas_used();
-        // FIXME: Can overflow uint256.
-        max_total_fee += total_blob_gas * tx.max_blob_gas_price;
-    }
+        max_total_fee += umul(uint256{tx.blob_gas_used()}, tx.max_blob_gas_price);
     if (sender_acc.balance < max_total_fee)
         return make_error_code(INSUFFICIENT_ACCOUNT_FUNDS);
 
     const auto [intrinsic_cost, min_cost] = compute_tx_intrinsic_cost(rev, tx);
-    if (tx.gas_limit < std::max(intrinsic_cost, min_cost))
+
+    // The transaction state-gas limit is all above the cap constant (EIP-8037).
+    const auto state_gas_limit =
+        rev >= EVMC_AMSTERDAM ? std::max(tx.gas_limit - MAX_TX_GAS_LIMIT, int64_t{0}) : 0;
+
+    // Transaction gas limit with state-gas limit excluded must cover intrinsic and min cost.
+    if (tx.gas_limit - state_gas_limit < std::max(intrinsic_cost, min_cost))
         return make_error_code(INTRINSIC_GAS_TOO_LOW);
 
-    const auto execution_gas_limit = tx.gas_limit - intrinsic_cost;
-    return TransactionProperties{execution_gas_limit, min_cost};
+    const auto execution_gas_limit = tx.gas_limit - intrinsic_cost - state_gas_limit;
+    return TransactionProperties{execution_gas_limit, state_gas_limit, min_cost};
 }
 
 StateDiff finalize(const StateView& state_view, evmc_revision rev, const address& coinbase,
@@ -623,7 +646,7 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
 
     Host host{rev, vm, state, block, block_hashes, tx};
 
-    auto message = build_message(tx, tx_props.execution_gas_limit);
+    auto message = build_message(tx, tx_props);
 
     sender_acc.access_status = EVMC_ACCESS_WARM;  // Sender is always warm.
     host.access_account(message.recipient);  // Recipient (incl. create address) is always warm.
@@ -653,10 +676,9 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
 
     const auto result = host.call(message);
 
-    const auto gas_used_b4_refund = tx.gas_limit - result.gas_left;
+    const auto gas_used_b4_refund = tx.gas_limit - result.gas_left - result.state_gas.left;
 
-    const auto max_refund_quotient = rev >= EVMC_LONDON ? 5 : 2;
-    const auto refund_limit = gas_used_b4_refund / max_refund_quotient;
+    const auto refund_limit = rev >= EVMC_LONDON ? gas_used_b4_refund / 5 : gas_used_b4_refund / 2;
     const auto refund = std::min(delegation_refund + result.gas_refund, refund_limit);
     auto gas_used = gas_used_b4_refund - refund;
     assert(gas_used > 0);
@@ -664,15 +686,31 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     // The gas used by the transaction must be at least the min_gas_cost (EIP-7623).
     gas_used = std::max(gas_used, tx_props.min_gas_cost);
 
-    // For block gas accounting, compute the gas refund capped by the min gas cost (EIP-7778).
-    const auto block_gas_used = std::max(gas_used_b4_refund, tx_props.min_gas_cost);
-    const auto gas_refund = block_gas_used - gas_used;
+    const auto state_gas_used =
+        tx_props.state_gas_limit - result.state_gas.left + result.state_gas.spilled;
+    assert(state_gas_used >= 0);
+
+    // For block gas accounting, exclude refunds and enforce the min gas cost, raised by the
+    // state gas so state-gas spending cannot discount it (EIP-7778, EIP-8037).
+    const auto block_gas_used =
+        (rev >= EVMC_AMSTERDAM) ?
+            std::max(gas_used_b4_refund, tx_props.min_gas_cost + state_gas_used) :
+            gas_used;
 
     sender_acc.balance += tx_max_cost - gas_used * effective_gas_price;
     state.touch(block.coinbase).balance += gas_used * priority_gas_price;
 
     // Cumulative gas used is unknown in this scope.
-    return TransactionReceipt{tx.type, result.status_code, gas_used, gas_refund, {},
-        host.take_logs(), state.build_diff(rev)};
+    TransactionReceipt receipt{
+        .type = tx.type,
+        .status = result.status_code,
+        .gas_used = gas_used,
+        .block_gas_used = block_gas_used,
+        .state_gas_used = state_gas_used,
+        .logs = host.take_logs(),
+        .state_diff = state.build_diff(rev),
+    };
+
+    return receipt;
 }
 }  // namespace evmone::state

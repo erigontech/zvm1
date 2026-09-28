@@ -1,0 +1,71 @@
+# evmone: Fast Ethereum Virtual Machine implementation
+# Copyright 2026 The evmone Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: CodSpeed
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+env:
+  BUILD_DIR: build
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+  # The newest GCC on the ubuntu-24.04 image, which otherwise defaults to GCC 13.
+  CC: gcc-14
+  CXX: g++-14
+
+jobs:
+  benchmark:
+    name: Benchmark
+    # CodSpeed ships its instrumented Valgrind for Ubuntu 22.04, Ubuntu 24.04 and Debian 12 only,
+    # and bails out with "Unsupported system" anywhere else, so the image cannot be `latest`.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # required for actions/checkout
+      id-token: write # required for OIDC authentication with CodSpeed
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install GMP
+        run: sudo apt-get -q update && sudo apt-get -qy install libgmp-dev
+
+      - name: Configure
+        # The Release build type keeps the -O3 optimizations on, -g adds the debug information
+        # needed by CodSpeed to attribute the measurements to the source code. CodSpeed recommends
+        # (and warns about) RelWithDebInfo, but that would downgrade the optimizations to -O2.
+        run: >
+          cmake -S . -B $BUILD_DIR
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_FLAGS=-g
+          -DCMAKE_CXX_FLAGS=-g
+          -DBUILD_SHARED_LIBS=OFF
+          -DEVMONE_TESTING=ON
+          -DEVMONE_PRECOMPILES_GMP=ON
+          -DEVMONE_PRECOMPILES_LIBSECP256K1=ON
+          -DCODSPEED_MODE=simulation
+
+      - name: Build
+        run: cmake --build $BUILD_DIR --target evmone-bench evmone-precompiles-bench
+
+      # CodSpeed aggregates the results of all the runs of a single workflow run.
+      - name: Benchmark the baseline VM
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: ${{ env.BUILD_DIR }}/bin/evmone-bench test/evm-benchmarks/benchmarks --benchmark_filter='baseline/(analyse|execute)'
+
+      # Both the mainnet inputs and the modexp parameter sweep: the mainnet moduli are all odd
+      # and 256-bit, so they cover a single code path and hide the work done on the others.
+      - name: Benchmark the precompiles
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: ${{ env.BUILD_DIR }}/bin/evmone-precompiles-bench

@@ -11,12 +11,12 @@
 #include <sp1_syscalls.hpp>
 #endif
 
-namespace evmmax::bn254
+namespace evmone::crypto::bn254
 {
 struct Fq2Config;
 }
 
-namespace evmmax::ecc
+namespace evmone::crypto::ecc
 {
 /// Implements extension field over the base field or other extension fields.
 /// It is a template struct which can be reused for different pairing implementations.
@@ -148,4 +148,4 @@ struct ExtFieldElem
     }
 };
 
-}  // namespace evmmax::ecc
+}  // namespace evmone::crypto::ecc

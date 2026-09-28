@@ -111,6 +111,30 @@ TEST_F(state_transition, tx_blob_gas_price)
     expect.status = EVMC_SUCCESS;
 }
 
+TEST_F(state_transition, invalid_tx_blob_max_fee_overflow)
+{
+    // With one blob, GAS_PER_BLOB * max_blob_gas_price is 2^17 * 2^239 = 2^256, which wraps to 0
+    // in uint256 and would make the blob fee vanish from the affordability check.
+    rev = EVMC_CANCUN;
+    tx.type = Transaction::Type::blob;
+    tx.to = To;
+    tx.gas_limit = 25000;
+    tx.max_gas_price = block.base_fee;
+    tx.max_priority_gas_price = 0;
+    tx.nonce = 1;
+    tx.blob_hashes.emplace_back(
+        0x0100000000000000000000000000000000000000000000000000000000000000_bytes32);
+    tx.max_blob_gas_price = intx::uint256{1} << 239;
+
+    block.excess_blob_gas = 0;
+    block.blob_base_fee = 1;
+    block.blob_gas_used = 786432;
+
+    pre[tx.sender].balance = tx.gas_limit * tx.max_gas_price;
+
+    expect.tx_error = INSUFFICIENT_ACCOUNT_FUNDS;
+}
+
 TEST_F(state_transition, empty_coinbase_fee_0_sd)
 {
     rev = EVMC_SPURIOUS_DRAGON;
@@ -268,11 +292,12 @@ TEST_F(state_transition, tx_data_floor_osaka_uses_eip7623)
 TEST_F(state_transition, access_list_cost_amsterdam)
 {
     // EIP-7981: 1280 gas (64*20) per address, 2048 gas (64*32) per storage key.
+    // EIP-8038: the per-entry prices become 2900 and 2000.
     rev = EVMC_AMSTERDAM;
     tx.to = To;
     tx.access_list = {{To, {0x01_bytes32}}};
-    // intrinsic = 21000 + 2400 + 1900 + 1280 + 2048 = 28628
-    expect.gas_used = 28628;
+    // intrinsic = 21000 + 2900 + 2000 + 1280 + 2048 = 29228
+    expect.gas_used = 29228;
 }
 
 TEST_F(state_transition, access_list_cost_osaka_unchanged)
@@ -303,14 +328,14 @@ TEST_F(state_transition, access_list_floor_amsterdam)
     tx.to = To;
     tx.data = bytes(100, 0x00);
     tx.access_list = {{To, {}}};
-    // intrinsic = 21000 + 100*4 + 2400 + 1280 = 25080
+    // intrinsic = 21000 + 100*4 + 2900 + 1280 = 25580
     // floor     = 21000 + 64*(100 + 20)       = 28680  (dominates)
     expect.gas_used = 28680;
 }
 
 TEST_F(state_transition, invalid_access_list_amsterdam_gas_limit_below_floor)
 {
-    // EIP-7981: gas limit must cover the floor (28680) — pre-7981 intrinsic (23800) is not enough.
+    // EIP-7981: gas limit must cover the floor (28680) — the intrinsic cost (25580) is not enough.
     rev = EVMC_AMSTERDAM;
     tx.to = To;
     tx.data = bytes(100, 0x00);

@@ -5,7 +5,7 @@
 
 #include "fields.hpp"
 
-namespace evmmax::bn254
+namespace evmone::crypto::bn254
 {
 /// Defines coefficients needed for fast Frobenius endomorphism computation.
 /// For more ref see https://eprint.iacr.org/2010/354.pdf 3.2 Frobenius Operator.
@@ -251,8 +251,8 @@ constexpr bool g2_subgroup_check(const ecc::AffinePoint<E2>& p_aff) noexcept
     const auto _2px = dbl(px);
 
     const auto e_px = endomorphism<1>(px);
-    const auto ee_px = endomorphism<1>(e_px);
-    const auto eee_2px = endomorphism<1>(endomorphism<2>(_2px));
+    const auto ee_px = endomorphism<2>(px);
+    const auto eee_2px = endomorphism<3>(_2px);
 
     const auto l = add(add(px1, e_px), ee_px);
 
@@ -472,4 +472,4 @@ constexpr Fq12 cyclotomic_pow_to_X(const Fq12& a) noexcept
     return c;
 }
 
-}  // namespace evmmax::bn254
+}  // namespace evmone::crypto::bn254

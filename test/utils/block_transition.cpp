@@ -49,8 +49,8 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
     std::vector<state::TransactionReceipt> receipts;
 
     int64_t block_gas_left = block.gas_limit;
+    int64_t block_state_gas_left = block.gas_limit;
     int64_t cumulative_gas_used = 0;
-    int64_t block_gas_used = 0;
     auto blob_gas_left = blob_gas_limit;
 
     for (size_t i = 0; i < txs.size(); ++i)
@@ -62,8 +62,8 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
         if (trace_enabled)
             trace_guard.emplace(std::clog, opts.open_trace(i, computed_tx_hash).rdbuf());
 
-        auto res = transition(
-            block_state, block, block_hashes, tx, rev, vm, block_gas_left, blob_gas_left);
+        auto res = transition(block_state, block, block_hashes, tx, rev, vm, block_gas_left,
+            block_state_gas_left, blob_gas_left);
 
         if (holds_alternative<std::error_code>(res))
         {
@@ -78,11 +78,10 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
             if (rev < EVMC_BYZANTIUM)
                 receipt.post_state = state::mpt_hash(block_state);
 
-            // Block gas accounting, refunds excluded (EIP-7778).
-            const auto block_tx_gas =
-                (rev >= EVMC_AMSTERDAM) ? receipt.gas_used + receipt.gas_refund : receipt.gas_used;
-            block_gas_used += block_tx_gas;
-            block_gas_left -= block_tx_gas;
+            // Block gas accounting, with EIP-7778 applied in transition(). The execution
+            // dimension is the block gas less the state one (EIP-8037).
+            block_gas_left -= receipt.block_gas_used - receipt.state_gas_used;
+            block_state_gas_left -= receipt.state_gas_used;
             blob_gas_left -= static_cast<int64_t>(tx.blob_gas_used());
             receipts.emplace_back(std::move(receipt));
         }
@@ -112,6 +111,9 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
 
     finalize(block_state, rev, block.coinbase, opts.block_reward, block.ommers, block.withdrawals);
 
+    // Both counters start at block.gas_limit, so this is max(execution used, state used):
+    // the block's gas used is its bottleneck dimension (EIP-8037).
+    const auto block_gas_used = block.gas_limit - std::min(block_gas_left, block_state_gas_left);
     const auto bloom = compute_bloom_filter(receipts);
 
     return {std::move(receipts), std::move(rejected_txs), std::move(requests), requests_error,
