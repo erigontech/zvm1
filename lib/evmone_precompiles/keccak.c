@@ -1,5 +1,6 @@
 // ethash: C/C++ implementation of Ethash, the Ethereum Proof of Work algorithm.
-// Copyright 2018 Pawel Bylica.
+// Copyright 2026 The zvm1 Authors (modifications)
+// Copyright 2018 Pawel Bylica (original)
 // SPDX-License-Identifier: Apache-2.0
 
 #include "keccak.h"

@@ -1,5 +1,6 @@
 // evmone-fuzzer: LibFuzzer based testing tool for EVMC-compatible EVM implementations.
-// Copyright 2019 The evmone Authors.
+// Copyright 2026 The zvm1 Authors (modifications)
+// Copyright 2019 The evmone Authors (original)
 // SPDX-License-Identifier: Apache-2.0
 
 #include <evmc/mocked_host.hpp>

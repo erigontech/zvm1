@@ -1,5 +1,6 @@
 // evmone: Fast Ethereum Virtual Machine implementation
-// Copyright 2025 The evmone Authors.
+// Copyright 2026 The zvm1 Authors (modifications)
+// Copyright 2025 The evmone Authors (original)
 // SPDX-License-Identifier: Apache-2.0
 
 #include "modexp.hpp"

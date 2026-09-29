@@ -1,4 +1,6 @@
 #!/bin/sh
+# Copyright 2026 The zvm1 Authors (modifications)
+#
 # Patch blst's vect.h, fields.h and no_asm.h for SP1 BLS12-381 syscalls.
 #
 # THREE-PHASE PATCHING:

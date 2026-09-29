@@ -1,3 +1,5 @@
+// Copyright 2026 The zvm1 Authors (modifications)
+
 #include "bls.hpp"
 #include <blst.h>
 #include <memory>

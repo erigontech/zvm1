@@ -1,5 +1,6 @@
 // evmone: Fast Ethereum Virtual Machine implementation
-// Copyright 2022 The Silkworm & evmone Authors.
+// Copyright 2026 The zvm1 Authors (modifications)
+// Copyright 2022 The Silkworm & evmone Authors (original)
 // SPDX-License-Identifier: Apache-2.0
 
 /// @file

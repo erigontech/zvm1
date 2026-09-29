@@ -1,5 +1,6 @@
 /* ethash: C/C++ implementation of Ethash, the Ethereum Proof of Work algorithm.
- * Copyright 2018-2019 Pawel Bylica.
+ * Copyright 2026 The zvm1 Authors (modifications)
+ * Copyright 2018-2019 Pawel Bylica (original)
  * Licensed under the Apache License, Version 2.0.
  */
 
