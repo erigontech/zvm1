@@ -13,45 +13,33 @@ namespace evmone::instr
 /// The special gas cost value marking an EVM instruction as "undefined".
 constexpr int16_t undefined = -1;
 
-/// EIP-2929 constants (https://eips.ethereum.org/EIPS/eip-2929),
-/// repriced from Amsterdam by EIP-8038 (https://eips.ethereum.org/EIPS/eip-8038).
+/// State-access cost constants (EIP-2929, EIP-8038).
 /// @{
-inline constexpr auto cold_sload_cost = 2100;
-inline constexpr auto cold_account_access_cost = 2600;
-inline constexpr auto warm_storage_read_cost = 100;
+inline constexpr auto WARM_ACCESS = 100;
+inline constexpr auto COLD_STORAGE_ACCESS = 2100;
+inline constexpr auto COLD_ACCOUNT_ACCESS = 2600;
+inline constexpr auto COLD_ACCOUNT_ACCESS_AMSTERDAM = 3000;
+inline constexpr auto ACCOUNT_WRITE = 9000;
+inline constexpr auto STORAGE_WRITE = 10000;
+inline constexpr auto CREATE_ACCESS = ACCOUNT_WRITE + COLD_ACCOUNT_ACCESS_AMSTERDAM;
 
-/// EIP-8038 repriced state-access costs, applied from Amsterdam.
-/// COLD_STORAGE_ACCESS is only a rename of COLD_SLOAD_COST: its value is not repriced,
-/// so cold_sload_cost is used for it on every revision.
-inline constexpr auto cold_account_access_cost_amsterdam = 3000;
-inline constexpr auto account_write_cost_amsterdam = 9000;
-inline constexpr auto storage_write_cost_amsterdam = 10000;
-
-/// EIP-8038: CREATE_ACCESS = ACCOUNT_WRITE + COLD_ACCOUNT_ACCESS.
-inline constexpr auto create_access_cost_amsterdam =
-    account_write_cost_amsterdam + cold_account_access_cost_amsterdam;
-
-/// The full cold-account-access cost for the given revision (EIP-2929 / EIP-8038).
-/// Used where no warm base cost has been pre-charged: SELFDESTRUCT, delegation resolution.
-inline constexpr int64_t cold_account_access(evmc_revision rev) noexcept
+/// The full cold-account-access cost for the given revision.
+constexpr auto cold_account_access(evmc_revision rev) noexcept
 {
-    return rev >= EVMC_AMSTERDAM ? cold_account_access_cost_amsterdam : cold_account_access_cost;
+    return rev >= EVMC_AMSTERDAM ? COLD_ACCOUNT_ACCESS_AMSTERDAM : COLD_ACCOUNT_ACCESS;
 }
 
 /// Additional cold account access cost over the unconditionally-charged warm cost.
 ///
 /// The warm access cost is part of the base cost of every account access instruction.
 /// If the access turns out to be cold, this cost must be applied additionally.
-inline constexpr int64_t additional_cold_account_access_cost(evmc_revision rev) noexcept
+constexpr auto additional_cold_account_access(evmc_revision rev) noexcept
 {
-    return cold_account_access(rev) - warm_storage_read_cost;
+    return cold_account_access(rev) - WARM_ACCESS;
 }
 
-/// Additional cold storage access cost over the unconditionally-charged warm cost
-/// (SLOAD always; SSTORE from Amsterdam). Revision-independent: EIP-8038 renames
-/// COLD_SLOAD_COST to COLD_STORAGE_ACCESS but does not reprice it.
-inline constexpr int64_t additional_cold_storage_access_cost =
-    cold_sload_cost - warm_storage_read_cost;
+/// Additional cold storage access cost over the unconditionally-charged warm cost.
+inline constexpr auto ADDITIONAL_COLD_STORAGE_ACCESS = COLD_STORAGE_ACCESS - WARM_ACCESS;
 /// @}
 
 
@@ -171,15 +159,15 @@ constexpr inline GasCostTable gas_costs = []() noexcept {
     table[EVMC_ISTANBUL][OP_SLOAD] = 800;
 
     table[EVMC_BERLIN] = table[EVMC_ISTANBUL];
-    table[EVMC_BERLIN][OP_EXTCODESIZE] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_EXTCODECOPY] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_EXTCODEHASH] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_BALANCE] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_CALL] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_CALLCODE] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_DELEGATECALL] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_STATICCALL] = warm_storage_read_cost;
-    table[EVMC_BERLIN][OP_SLOAD] = warm_storage_read_cost;
+    table[EVMC_BERLIN][OP_EXTCODESIZE] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_EXTCODECOPY] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_EXTCODEHASH] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_BALANCE] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_CALL] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_CALLCODE] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_DELEGATECALL] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_STATICCALL] = WARM_ACCESS;
+    table[EVMC_BERLIN][OP_SLOAD] = WARM_ACCESS;
 
     table[EVMC_LONDON] = table[EVMC_BERLIN];
     table[EVMC_LONDON][OP_BASEFEE] = 2;
@@ -192,8 +180,8 @@ constexpr inline GasCostTable gas_costs = []() noexcept {
     table[EVMC_CANCUN] = table[EVMC_SHANGHAI];
     table[EVMC_CANCUN][OP_BLOBHASH] = 3;
     table[EVMC_CANCUN][OP_BLOBBASEFEE] = 2;
-    table[EVMC_CANCUN][OP_TLOAD] = warm_storage_read_cost;
-    table[EVMC_CANCUN][OP_TSTORE] = warm_storage_read_cost;
+    table[EVMC_CANCUN][OP_TLOAD] = WARM_ACCESS;
+    table[EVMC_CANCUN][OP_TSTORE] = WARM_ACCESS;
     table[EVMC_CANCUN][OP_MCOPY] = 3;
 
     table[EVMC_PRAGUE] = table[EVMC_CANCUN];
@@ -206,10 +194,10 @@ constexpr inline GasCostTable gas_costs = []() noexcept {
     table[EVMC_AMSTERDAM][OP_DUPN] = 3;
     table[EVMC_AMSTERDAM][OP_SWAPN] = 3;
     table[EVMC_AMSTERDAM][OP_EXCHANGE] = 3;
-    // EIP-8038: the flat GAS_CREATE (32000, kept through EIP-8037) is replaced by CREATE_ACCESS.
-    // The new-account state-creation cost stays in state gas (EIP-8037).
-    table[EVMC_AMSTERDAM][OP_CREATE] = create_access_cost_amsterdam;
-    table[EVMC_AMSTERDAM][OP_CREATE2] = create_access_cost_amsterdam;
+    table[EVMC_AMSTERDAM][OP_CREATE] = CREATE_ACCESS;
+    table[EVMC_AMSTERDAM][OP_CREATE2] = CREATE_ACCESS;
+    table[EVMC_AMSTERDAM][OP_EXTCODESIZE] = 2 * WARM_ACCESS;
+    table[EVMC_AMSTERDAM][OP_EXTCODECOPY] = 2 * WARM_ACCESS;
 
     table[EVMC_EXPERIMENTAL] = table[EVMC_AMSTERDAM];
 

@@ -9,6 +9,7 @@ target_sources(
     analysis_test.cpp
     baseline_analysis_test.cpp
     blockchaintest_loader_test.cpp
+    blockchaintest_runner_test.cpp
     bytecode_test.cpp
     create_address_test.cpp
     evm_fixture.cpp
@@ -31,12 +32,12 @@ target_sources(
     evm_other_test.cpp
     evm_benchmark_test.cpp
     evm_undefined_instructions_test.cpp
-    evmmax_bn254_add_test.cpp
-    evmmax_bn254_from_bytes.cpp
-    evmmax_bn254_mul_test.cpp
-    evmmax_bn254_pairing_test.cpp
-    evmmax_test.cpp
-    evmmax_secp256k1_test.cpp
+    bn254_add_test.cpp
+    bn254_from_bytes.cpp
+    bn254_mul_test.cpp
+    bn254_pairing_test.cpp
+    modarith_test.cpp
+    secp256k1_test.cpp
     evmone_test.cpp
     execution_state_test.cpp
     exportable_fixture.hpp
@@ -80,11 +81,16 @@ target_sources(
     state_transition_transient_storage_test.cpp
     state_transition_tx_test.cpp
     state_tx_test.cpp
+    statediff_export_test.cpp
     statetest_loader_block_info_test.cpp
     statetest_loader_test.cpp
     statetest_loader_tx_test.cpp
     statetest_logs_hash_test.cpp
+    statetest_runner_test.cpp
     statetest_withdrawals_test.cpp
+    test_collector_test.cpp
+    test_driver_test.cpp
+    test_report_test.cpp
     tooling_run_test.cpp
     tooling_t8n_test.cpp
     tracing_test.cpp
@@ -100,7 +106,7 @@ target_compile_definitions(
 )
 target_include_directories(evmone-keccak-strict PRIVATE ${PROJECT_SOURCE_DIR}/lib/evmone_precompiles)
 
-target_link_libraries(evmone-unittests PRIVATE evmone evmone::evmmax evmone::experimental evmone::precompiles evmone::state evmone::testutils blst::blst GTest::gtest GTest::gtest_main evmone-keccak-strict)
+target_link_libraries(evmone-unittests PRIVATE evmone evmone::experimental evmone::precompiles evmone::state evmone::testutils blst::blst GTest::gtest GTest::gtest_main evmone-keccak-strict)
 target_include_directories(evmone-unittests PRIVATE ${evmone_private_include_dir})
 if(NOT CMAKE_CXX_CLANG_TIDY)
     target_precompile_headers(

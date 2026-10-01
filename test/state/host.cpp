@@ -18,8 +18,7 @@ namespace
 /// the caller derives it as `initial - left + spilled`.
 void set_state_gas(evmc::Result& r, int64_t left, int64_t spilled) noexcept
 {
-    r.state_gas_left = left;
-    r.state_gas_spilled = spilled;
+    r.state_gas = {.left = left, .spilled = spilled};
 }
 }  // namespace
 
@@ -218,7 +217,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
             // Preserve reservoir so the parent (or transition() at depth 0) can refund
             // any unused state gas. No execution happened, so the derived state gas
             // used is 0.
-            r.state_gas_left = msg.state_gas;
+            r.state_gas.left = msg.state_gas;
             return r;
         }
         m_state.journal_create(msg.recipient);
@@ -255,11 +254,11 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     int64_t new_account_reservoir = 0;  // Portion drawn from the state-gas reservoir.
     if (m_rev >= EVMC_AMSTERDAM && msg.depth == 0 && target_empty)
     {
-        StateGas sg{.left = create_msg.state_gas};
+        StateGas sg{{.left = create_msg.state_gas}};
         if (!sg.charge(create_msg.gas, NEW_ACCOUNT_STATE_GAS))
         {
             auto r = evmc::Result{EVMC_OUT_OF_GAS};
-            r.state_gas_left = msg.state_gas;  // no account created: refill the entry reservoir
+            r.state_gas.left = msg.state_gas;  // no account created: refill the entry reservoir
             return r;
         }
         new_account_charged = true;
@@ -278,7 +277,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
         // gas_left = 0). The initcode frame already refilled its own state gas at its boundary.
         if (new_account_charged)
         {
-            result.state_gas_left += new_account_reservoir;
+            result.state_gas.left += new_account_reservoir;
             if (result.status_code == EVMC_REVERT)
                 result.gas_left += new_account_spilled;
         }
@@ -294,7 +293,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > max_code_size)
     {
         auto r = evmc::Result{EVMC_FAILURE};
-        r.state_gas_left = msg.state_gas;  // refill the full reservoir (nothing persists)
+        r.state_gas.left = msg.state_gas;  // refill the full reservoir (nothing persists)
         return r;
     }
 
@@ -302,14 +301,14 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     if (m_rev >= EVMC_LONDON && code.starts_with(0xEF))
     {
         auto r = evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-        r.state_gas_left = msg.state_gas;  // refill the full reservoir (nothing persists)
+        r.state_gas.left = msg.state_gas;  // refill the full reservoir (nothing persists)
         return r;
     }
 
     // Code deployment cost. Continue the init frame's state gas (left + spill), carrying the
     // NEW_ACCOUNT charge's spill so the created account's state gas is reported on success.
-    StateGas state_gas{
-        .left = result.state_gas_left, .spilled = new_account_spilled + result.state_gas_spilled};
+    StateGas state_gas{{.left = result.state_gas.left,
+        .spilled = new_account_spilled + result.state_gas.spilled}};
     if (m_rev >= EVMC_AMSTERDAM)
     {
         // EIP-8037: split code deposit into regular and state components.
@@ -319,7 +318,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
         if (gas_left < 0 || !state_gas.charge(gas_left, state_cost))
         {
             auto r = evmc::Result{EVMC_FAILURE};
-            r.state_gas_left = msg.state_gas;  // refill the full reservoir (nothing persists)
+            r.state_gas.left = msg.state_gas;  // refill the full reservoir (nothing persists)
             return r;
         }
     }
@@ -336,7 +335,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
                 return r;
             }
             auto r = evmc::Result{EVMC_FAILURE};
-            r.state_gas_left = msg.state_gas;  // refill on failure
+            r.state_gas.left = msg.state_gas;  // refill on failure
             return r;
         }
     }
@@ -369,12 +368,12 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
     // EIP-8037: `msg.state_gas` stays the entry reservoir; `top_level_sg` holds the post-charge
     // pools (left/spilled) so a consuming path can commit the NEW_ACCOUNT charge on success or
     // refund it on failure. `used` is always derived as `msg.state_gas - left + spilled`.
-    StateGas top_level_sg{.left = msg.state_gas};
+    StateGas top_level_sg{{.left = msg.state_gas}};
     // Builds the failure result for a pre-execution charge OOG: all regular gas
     // is consumed and the entry reservoir is returned intact.
     const auto out_of_gas_result = [&msg] {
         evmc::Result r{EVMC_OUT_OF_GAS, 0};
-        r.state_gas_left = msg.state_gas;
+        r.state_gas.left = msg.state_gas;
         return r;
     };
     if (m_rev >= EVMC_AMSTERDAM && msg.depth == 0)
@@ -442,7 +441,7 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
         if (r.status_code == EVMC_SUCCESS)
             set_state_gas(r, top_level_sg.left, top_level_sg.spilled);
         else
-            r.state_gas_left = msg.state_gas;
+            r.state_gas.left = msg.state_gas;
         return r;
     }
 

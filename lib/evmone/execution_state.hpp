@@ -156,11 +156,7 @@ public:
         const advanced::AdvancedCodeAnalysis* advanced;
     } analysis{};
 
-    /// EIP-8037: the frame's state-gas reservoir + spill (used is derived).
-    ///
-    /// Declared in the cold tail: inserting it earlier shifts `status` and `host` past the
-    /// x86-64 disp8 window, which costs 3 bytes of encoding on every one of the ~195 `status`
-    /// accesses in each dispatch loop.
+    /// The frame's state-gas counters (EIP-8037).
     StateGas state_gas;
 
     /// Stack space allocation.
@@ -177,7 +173,7 @@ public:
         host{host_interface, host_ctx},
         rev{revision},
         original_code{_code},
-        state_gas{.left = message.state_gas}
+        state_gas{{.left = message.state_gas}}
     {}
 
     /// Resets the contents of the ExecutionState so that it could be reused.
@@ -186,8 +182,7 @@ public:
         bytes_view _code) noexcept
     {
         gas_refund = 0;
-        // EIP-8037: initialize the state-gas reservoir from the message budget.
-        state_gas = {.left = message.state_gas};
+        state_gas = {{.left = message.state_gas}};
         memory.clear();
         msg = &message;
         host = {host_interface, host_ctx};
@@ -217,12 +212,9 @@ public:
 /// success, and the output is the memory range recorded in the state.
 inline evmc_result make_execution_result(ExecutionState& state, int64_t gas_left) noexcept
 {
-    // EIP-8037: on revert or exceptional halt, roll back this frame's state gas (LIFO). The
-    // spilled portion returns to `gas_left` (kept on revert; discarded by the halt's gas_left = 0
-    // below, consuming it — matching EELS interpreter.py), and the reservoir is restored to the
-    // frame's budget, leaving the net state gas used at zero.
     if (state.rev >= EVMC_AMSTERDAM && state.status != EVMC_SUCCESS)
     {
+        // Unsuccessful frame doesn't commit any state changes, roll-back all state-gas costs.
         gas_left += state.state_gas.spilled;
         state.state_gas.left = state.msg->state_gas;
         state.state_gas.spilled = 0;
@@ -234,15 +226,9 @@ inline evmc_result make_execution_result(ExecutionState& state, int64_t gas_left
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
 
     assert(state.output_size != 0 || state.output_offset == 0);
-    auto result = evmc::make_result(state.status, gas_left, gas_refund,
-        state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size);
-
-    // EIP-8037: return the leftover reservoir and spill; the net used is derived by the caller
-    // as `initial - state_gas_left + state_gas_spilled`. The reservoir stays non-negative:
-    // charge/refill preserve this from a non-negative message budget.
-    assert(state.state_gas.left >= 0);
-    result.state_gas_left = state.state_gas.left;
-    result.state_gas_spilled = state.state_gas.spilled;
-    return result;
+    return evmc::Result{state.status, gas_left, gas_refund,
+        state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size,
+        state.state_gas}
+        .release_raw();
 }
 }  // namespace evmone

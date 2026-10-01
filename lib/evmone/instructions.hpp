@@ -120,31 +120,6 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     return num_words(size_in_bytes) * WordCopyCost;
 }
 
-
-/// Charge state gas (EIP-8037) against the frame's state-gas reservoir/spill.
-[[nodiscard]] inline bool charge_state_gas(
-    int64_t& gas_left, ExecutionState& state, int64_t cost) noexcept
-{
-    return state.state_gas.charge(gas_left, cost);
-}
-
-/// EIP-8037: credit a state-gas refund (LIFO) to the frame.
-inline void credit_state_gas_refund(
-    int64_t& gas_left, ExecutionState& state, int64_t amount) noexcept
-{
-    state.state_gas.refill(gas_left, amount);
-}
-
-/// EIP-8037: thread a child frame's state gas back to the parent — take its leftover reservoir
-/// and accumulate its spill. A failed child already rolled itself back at its boundary (reservoir
-/// restored, spill zeroed), so success and failure are handled identically; the parent's net
-/// `used` is derived from these at its own boundary.
-inline void accumulate_child_state_gas(ExecutionState& state, const evmc::Result& result) noexcept
-{
-    state.state_gas.left = result.state_gas_left;
-    state.state_gas.spilled += result.state_gas_spilled;
-}
-
 /// Grows EVM memory and checks its cost.
 ///
 /// This function should not be inlined because this may affect other inlining decisions:
@@ -506,7 +481,7 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -653,15 +628,7 @@ inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost(state.rev)) < 0)
-            return {EVMC_OUT_OF_GAS, gas_left};
-    }
-
-    // EIP-8038: EXTCODESIZE performs a second database read (the code size) beyond the
-    // account object, charged an additional WARM_ACCESS.
-    if (state.rev >= EVMC_AMSTERDAM)
-    {
-        if ((gas_left -= instr::warm_storage_read_cost) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -685,15 +652,7 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost(state.rev)) < 0)
-            return {EVMC_OUT_OF_GAS, gas_left};
-    }
-
-    // EIP-8038: EXTCODECOPY performs a second database read (the code) beyond the account
-    // object, charged an additional WARM_ACCESS regardless of the number of bytes copied.
-    if (state.rev >= EVMC_AMSTERDAM)
-    {
-        if ((gas_left -= instr::warm_storage_read_cost) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -757,7 +716,7 @@ inline Result extcodehash(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -910,7 +869,7 @@ inline void tload(StackTop stack, ExecutionState& state) noexcept
 inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     if (state.in_static_mode())
-        return {EVMC_STATIC_MODE_VIOLATION, 0};
+        return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
@@ -1099,7 +1058,7 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     static_assert(NumTopics <= 4);
 
     if (state.in_static_mode())
-        return {EVMC_STATIC_MODE_VIOLATION, 0};
+        return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
     const auto& offset = stack.pop();
     const auto& size = stack.pop();
@@ -1165,7 +1124,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(beneficiary) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::cold_account_access(state.rev)) < 0)
+        if ((gas_left -= cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -1179,13 +1138,11 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
             {
                 if (state.rev >= EVMC_AMSTERDAM)
                 {
-                    // EIP-8038: a positive balance sent to an empty account pays ACCOUNT_WRITE in
-                    // regular gas, charged before the state gas so a regular-gas OOG here does not
-                    // consume state gas.
-                    if ((gas_left -= instr::account_write_cost_amsterdam) < 0)
+                    // Balance update costs ACCOUNT_WRITE, charged first so in case of OOG
+                    // the state-gas is not consumed.
+                    if ((gas_left -= ACCOUNT_WRITE) < 0)
                         return {EVMC_OUT_OF_GAS, gas_left};
-                    // EIP-8037: the new account leaf is paid in state gas.
-                    if (!charge_state_gas(gas_left, state, NEW_ACCOUNT_STATE_GAS))
+                    if (!state.state_gas.charge(gas_left, NEW_ACCOUNT_STATE_GAS))
                         return {EVMC_OUT_OF_GAS, gas_left};
                 }
                 else
@@ -1197,11 +1154,11 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
         }
     }
 
-    if (state.host.selfdestruct(state.msg->recipient, beneficiary))
-    {
-        if (state.rev < EVMC_LONDON)
-            state.gas_refund += 24000;
-    }
+    const auto first_time = state.host.selfdestruct(state.msg->recipient, beneficiary);
+
+    if (first_time && state.rev < EVMC_LONDON)
+        state.gas_refund += 24000;
+
     return {EVMC_SUCCESS, gas_left};
 }
 

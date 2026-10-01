@@ -35,7 +35,7 @@ executors:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
   linux-gcc-min:
     docker:
-      - image: ethereum/cpp-build-env:17-gcc-11
+      - image: ethereum/cpp-build-env:20-gcc-11
     resource_class: small
     environment:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
@@ -162,9 +162,10 @@ commands:
       fixtures_suffix:
         type: string
         default: ""
-      filter:
+      ignore:
+        description: "--ignore flags for the paths not to collect"
         type: string
-        default: "*"
+        default: ""
     steps:
       - download_execution_spec_tests:
           repo: <<parameters.repo>>
@@ -176,17 +177,58 @@ commands:
           working_directory: ~/build
           command: >
             LLVM_PROFILE_FILE=state_tests.profraw
-            bin/evmone-statetest --gtest_filter='<<parameters.filter>>' ~/spec-tests/fixtures/state_tests
+            bin/evmone test <<parameters.ignore>> ~/spec-tests/fixtures/state_tests
       - run:
           name: "Execution spec tests (<<parameters.release>>, blockchain_tests)"
           # Tests for in-development EVM revision currently passing.
           working_directory: ~/build
           command: >
             LLVM_PROFILE_FILE=blockchain_tests.profraw
-            bin/evmone-blockchaintest --gtest_filter='<<parameters.filter>>' ~/spec-tests/fixtures/blockchain_tests
+            bin/evmone test <<parameters.ignore>> ~/spec-tests/fixtures/blockchain_tests
+
+  configure:
+    description: "Configure"
+    parameters:
+      testing:
+        description: "Build the tests and the test tools"
+        type: boolean
+        default: true
+    steps:
+      - run:
+          name: "Configure (testing << parameters.testing >>)"
+          working_directory: ~/build
+          command: |
+            if [ "$TOOLCHAIN" ]; then
+              export toolchain_option="-DTOOLCHAIN=$TOOLCHAIN"
+            fi
+            cmake ../project $toolchain_option -DCMAKE_INSTALL_PREFIX=~/install -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_COMPILE_WARNING_AS_ERROR=TRUE -DEVMONE_TESTING=<< parameters.testing >> $CMAKE_OPTIONS
+
+  compile:
+    description: "Compile"
+    steps:
+      - run:
+          name: "Build"
+          command: cmake --build ~/build
+
+  smoke_test:
+    description: "Run the tool once to check the build works"
+    steps:
+      - run:
+          name: "Smoke test the tool"
+          working_directory: ~/build
+          command: |
+            bin/evmone --version
+            bin/evmone run 600160005260206000f3 | tee out.txt
+            grep -q "Result: *success" out.txt
+            grep -q "Output: *0\{63\}1" out.txt
 
   build:
     description: "Build"
+    parameters:
+      tools_only_first:
+        description: "Build with testing off first and smoke-test the tool, then reconfigure"
+        type: boolean
+        default: false
     steps:
       - checkout
       - checkout_submodules
@@ -212,22 +254,22 @@ commands:
       - restore_cache:
           name: "Restore Hunter cache"
           key: &hunter-cache-key hunter-{{arch}}-{{checksum "build.info"}}-{{checksum "cmake/Hunter/init.cmake"}}-{{checksum "cmake/Hunter/config.cmake"}}
-      - run:
-          name: "Configure"
-          working_directory: ~/build
-          command: |
-            if [ "$TOOLCHAIN" ]; then
-              export toolchain_option="-DTOOLCHAIN=$TOOLCHAIN"
-            fi
-            cmake ../project $toolchain_option -DCMAKE_INSTALL_PREFIX=~/install -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_COMPILE_WARNING_AS_ERROR=TRUE -DEVMONE_TESTING=ON $CMAKE_OPTIONS
+      # Testing off is the only configuration that never fetches GTest. It goes first because the
+      # Hunter cache is saved after the configure below, which is the one that has GTest in it.
+      - when:
+          condition: << parameters.tools_only_first >>
+          steps:
+            - configure:
+                testing: false
+            - compile
+            - smoke_test
+      - configure
       - save_cache:
           name: "Save Hunter cache"
           key: *hunter-cache-key
           paths:
             - ~/.hunter/_Base/Cache
-      - run:
-          name: "Build"
-          command: cmake --build ~/build
+      - compile
       - run:
           name: "Install"
           command: cmake --build ~/build --target install
@@ -267,7 +309,7 @@ commands:
         default: ""
       binaries:
         type: string
-        default: evmone evmone-unittests evmone-statetest evmone-blockchaintest
+        default: evmone evmone-unittests
     steps:
       - run:
           name: "Collect coverage data (clang, <<parameters.flags>>)"
@@ -424,19 +466,20 @@ jobs:
     steps:
       - build
       - run_execution_spec_tests:
-          release: tests-glamsterdam-devnet@v6.1.1
+          release: tests-glamsterdam-devnet@v8.1.4
           fixtures_suffix: _glamsterdam-devnet
-          filter: "-for_amsterdam/*:for_bpo2toamsterdamattime15k/*"
+          ignore: "--ignore for_amsterdam --ignore for_bpo2toamsterdamattime15k"
       - collect_coverage_clang:
           flags: eest-develop
           ignore_filename_regex: lib/evmone/(advanced|cpu_check|eof|lru_cache|tracing|vm)|test/(experimental|unittests)
-          binaries: evmone-statetest evmone-blockchaintest
+          binaries: evmone
       - run_execution_spec_tests:
-          release: tests@v20.0.1
+          release: tests@v21.0.0
+          ignore: "--ignore for_amsterdam --ignore for_bpo2toamsterdamattime15k"
       - collect_coverage_clang:
           flags: eest-stable
           ignore_filename_regex: lib/evmone/(advanced|cpu_check|eof|lru_cache|tracing|vm)|test/(experimental|unittests)
-          binaries: evmone-statetest evmone-blockchaintest
+          binaries: evmone
 
   ethereum-tests:
     executor: linux-clang-latest
@@ -467,8 +510,7 @@ jobs:
           working_directory: ~/build
           command: >
             LLVM_PROFILE_FILE=blockchain_tests_valid.profraw
-            bin/evmone-blockchaintest
-            --gtest_filter='-bcValidBlockTest.SimpleTx3LowS'
+            bin/evmone test
             ~/tests/BlockchainTests/ValidBlocks
             ~/tests/LegacyTests/Cancun/BlockchainTests/ValidBlocks
       - run:
@@ -476,8 +518,10 @@ jobs:
           working_directory: ~/build
           command: >
             LLVM_PROFILE_FILE=blockchain_tests_invalid.profraw
-            bin/evmone-blockchaintest
-            --gtest_filter='-bc4895-withdrawals.shanghaiWithoutWithdrawalsRLP:bcInvalidHeaderTest.*:bcUncleHeaderValidity.gasLimitTooLowExactBound'
+            bin/evmone test
+            --ignore bc4895-withdrawals/shanghaiWithoutWithdrawalsRLP.json
+            --ignore bcInvalidHeaderTest
+            --ignore bcUncleHeaderValidity/gasLimitTooLowExactBound.json
             ~/tests/BlockchainTests/InvalidBlocks
             ~/tests/LegacyTests/Cancun/BlockchainTests/InvalidBlocks
       - collect_coverage_clang:
@@ -491,12 +535,12 @@ jobs:
     steps:
       - build
       - download_execution_spec_tests:
-          release: tests@v20.0.1
+          release: tests@v21.0.0
       - run:
           name: "Execution spec tests (state_tests)"
           working_directory: ~/build
           command: >
-            bin/evmone-statetest ~/spec-tests/fixtures/state_tests
+            bin/evmone test --ignore for_amsterdam ~/spec-tests/fixtures/state_tests
       - collect_coverage_clang:
           flags: eest-libsecp256k1
 
@@ -511,19 +555,20 @@ jobs:
           command: sudo apt-get -q update && sudo apt-get -qy install libgmp-dev
       - build
       - download_execution_spec_tests:
-          release: tests@v20.0.1
+          release: tests@v21.0.0
       - run:
           name: "Execution spec tests (state_tests)"
           working_directory: ~/build
           command: >
-            bin/evmone-statetest ~/spec-tests/fixtures/state_tests
+            bin/evmone test --ignore for_amsterdam ~/spec-tests/fixtures/state_tests
       - collect_coverage_clang:
           flags: eest-develop-gmp
 
   gcc-min:
     executor: linux-gcc-min
     steps:
-      - build
+      - build:
+          tools_only_first: true
       - test
 
   clang-min:
@@ -531,7 +576,8 @@ jobs:
     environment:
       CMAKE_OPTIONS=-DEVMONE_X86_64_ARCH_LEVEL=3
     steps:
-      - build
+      - build:
+          tools_only_first: true
       - test
 
   gcc-latest-memcheck:
@@ -566,17 +612,47 @@ jobs:
       - build
       - test
       - run_execution_spec_tests:
-          release: tests@v20.0.1
+          release: tests@v21.0.0
+          ignore: "--ignore for_amsterdam --ignore for_bpo2toamsterdamattime15k"
 
   clang-tidy:
     executor: linux-clang-selfhosted
     environment:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_GENERATOR: Ninja
-      CMAKE_OPTIONS: -DCMAKE_CXX_CLANG_TIDY=clang-tidy
+      CMAKE_OPTIONS: -DCMAKE_CXX_CLANG_TIDY=clang-tidy-cache;clang-tidy
       BUILD_TYPE: None
+      CTCACHE_DIR: /tmp/ctcache
+      # Hash comments too, otherwise editing a NOLINT reuses the old result.
+      CTCACHE_KEEP_COMMENTS: 1
     steps:
+      - run:
+          name: "Check clang-tidy version"
+          # The version is part of the cache key: ctcache does not hash the analyzer itself.
+          command: clang-tidy --version | tee /tmp/clang-tidy-version
+      - restore_cache:
+          name: "Restore clang-tidy cache"
+          key: clang-tidy-cache-{{checksum "/tmp/clang-tidy-version"}}
+      - run:
+          name: "Setup clang-tidy-cache"
+          command: |
+            mkdir -p /tmp/ctcache
+            find /tmp/ctcache -type f -mtime +7 -delete
+            # ctcache 1.2.0, pinned by commit because tags are mutable.
+            curl -L --fail --retry 3 -o /tmp/clang-tidy-cache https://raw.githubusercontent.com/matus-chochlik/ctcache/e33c063ca6e52b48bcefbc45d46d8c150ffa81ca/src/ctcache/clang_tidy_cache.py
+            sudo install -m 0755 /tmp/clang-tidy-cache /usr/local/bin/clang-tidy-cache
+            clang-tidy-cache --zero-stats
       - build
+      - run:
+          name: "clang-tidy cache stats"
+          when: always
+          command: clang-tidy-cache --print-stats
+      - save_cache:
+          name: "Save clang-tidy cache"
+          when: always
+          key: clang-tidy-cache-{{checksum "/tmp/clang-tidy-version"}}-{{epoch}}
+          paths:
+            - /tmp/ctcache
 
   clang-latest-coverage:
     executor: linux-clang-latest
@@ -638,7 +714,7 @@ jobs:
     executor: linux-base
     steps:
       - install_cmake:
-          version: 3.22.6
+          version: 3.25.3
       - build
       - test
 

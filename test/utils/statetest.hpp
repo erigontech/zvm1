@@ -4,11 +4,14 @@
 #pragma once
 
 #include "blob_schedule.hpp"
+#include "utils.hpp"
 #include <nlohmann/json.hpp>
 #include <test/state/block.hpp>
 #include <test/state/errors.hpp>
 #include <test/state/transaction.hpp>
+#include <test/utils/test_report.hpp>
 #include <test/utils/test_state.hpp>
+#include <iosfwd>
 #include <optional>
 
 namespace json = nlohmann;
@@ -144,6 +147,12 @@ T load_or(const json::json& j, std::string_view key, T default_value)
 /// Exports the State (accounts) to JSON format (aka pre/post/alloc state).
 json::json to_json(const TestState& state);
 
+/// Exports a transaction log to JSON format (as in a receipt's log list).
+json::json to_json(const state::Log& log);
+
+/// Exports a StateDiff to JSON.
+json::json to_json(const state::StateDiff& diff);
+
 /// Export the state test to JSON format.
 json::json to_state_test(std::string_view test_name, const state::BlockInfo& block,
     state::Transaction& tx, const TestState& pre, evmc_revision rev,
@@ -151,32 +160,33 @@ json::json to_state_test(std::string_view test_name, const state::BlockInfo& blo
 
 std::vector<StateTransitionTest> load_state_tests(std::istream& input);
 
+/// Builds the test named @p name in a fixture file from its JSON value @p j.
+StateTransitionTest make_state_test(const std::string& name, const json::json& j);
+
 /// Validates the invariants of the Ethereum state (e.g. no zero-value storage entries).
 /// Throws std::invalid_argument exception.
 void validate_state(const TestState& state, evmc_revision rev);
 
-/// Execute the state @p test using the @p vm.
-///
-/// @param trace_summary  Output execution summary to the default trace stream.
-void run_state_test(const StateTransitionTest& test, evmc::VM& vm, bool trace_summary);
+/// What run_state_test() reports besides the failures, and where.
+struct StateTestOptions
+{
+    /// The stream the enabled reports are written to.
+    std::ostream& output;
+
+    /// Report each case's execution summary.
+    bool trace_summary = false;
+
+    /// Report each case's execution summary and state diff.
+    bool state_diff = false;
+};
+
+/// Execute the state @p test using the @p vm, recording what does not match into @p report.
+void run_state_test(const StateTransitionTest& test, evmc::VM& vm, const StateTestOptions& options,
+    TestReport& report);
 
 /// Computes the hash of the RLP-encoded list of transaction logs.
 /// This method is only used in tests.
 hash256 logs_hash(const std::vector<state::Log>& logs);
-
-/// Converts an integer to hex string representation with 0x prefix.
-///
-/// This handles also builtin types like uint64_t. Not optimal but works for now.
-inline std::string hex0x(const intx::uint256& v)
-{
-    return "0x" + intx::hex(v);
-}
-
-/// Encodes bytes as hex with 0x prefix.
-inline std::string hex0x(bytes_view v)
-{
-    return "0x" + evmc::hex(v);
-}
 }  // namespace evmone::test
 
 inline std::ostream& operator<<(std::ostream& out, const evmone::address& a)

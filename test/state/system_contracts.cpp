@@ -107,12 +107,12 @@ evmc::Result execute_system_call(State& state, const BlockInfo& block,
     const evmc_message msg{
         .kind = EVMC_CALL,
         .gas = 30'000'000,
+        .state_gas =
+            (rev >= EVMC_AMSTERDAM) ? SYSTEM_MAX_SSTORES_PER_CALL * STORAGE_SET_STATE_GAS : 0,
         .recipient = addr,
         .sender = SYSTEM_ADDRESS,
         .input_data = input.data(),
         .input_size = input.size(),
-        .state_gas =
-            (rev >= EVMC_AMSTERDAM) ? SYSTEM_MAX_SSTORES_PER_CALL * STORAGE_SET_STATE_GAS : 0,
     };
 
     const Transaction empty_tx{};

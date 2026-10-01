@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "modexp.hpp"
+#include "modarith.hpp"
 #include "mulmod.hpp"
-#include <evmmax/evmmax.hpp>
 #include <bit>
 #include <memory_resource>
 #include <ranges>
@@ -118,13 +118,6 @@ void store(std::span<uint8_t> r, std::span<const uint64_t> words) noexcept
 
     // Zero-fill leading padding.
     std::ranges::fill(r.subspan(0, pos), uint8_t{0});
-}
-
-/// Compares two same-size little-endian word arrays as unsigned integers: returns true if x < y.
-constexpr bool less(std::span<const uint64_t> x, std::span<const uint64_t> y) noexcept
-{
-    assert(x.size() == y.size());
-    return std::ranges::lexicographical_compare(std::views::reverse(x), std::views::reverse(y));
 }
 
 /// Right-shifts a little-endian word array by k bits.
@@ -268,32 +261,31 @@ void rem(std::span<uint64_t> r, std::span<const uint64_t> u, std::span<const uin
 /// This is a view type of the big-endian bytes representing the bits of the exponent.
 class Exponent
 {
-    const uint8_t* data_ = nullptr;
-    size_t bit_width_ = 0;
+    std::span<const uint8_t> bytes_;  ///< Big-endian bytes with the leading zeros trimmed.
 
 public:
     explicit Exponent(std::span<const uint8_t> bytes) noexcept
+      : bytes_{std::ranges::find_if(bytes, [](auto x) { return x != 0; }), bytes.end()}
+    {}
+
+    /// Returns true for the exponent of zero.
+    [[nodiscard]] bool empty() const noexcept { return bytes_.empty(); }
+
+    /// The number of significant bits of the exponent. Must not be empty.
+    [[nodiscard]] size_t bit_width() const noexcept
     {
-        const auto it = std::ranges::find_if(bytes, [](auto x) { return x != 0; });
-        const auto trimmed_bytes = std::span{it, bytes.end()};
-        bit_width_ = trimmed_bytes.empty() ? 0 :
-                                             static_cast<size_t>(std::bit_width(trimmed_bytes[0])) +
-                                                 (trimmed_bytes.size() - 1) * 8;
-        data_ = trimmed_bytes.data();
+        assert(!empty());
+        return static_cast<size_t>(std::bit_width(bytes_.front())) + (bytes_.size() - 1) * 8;
     }
-
-
-    [[nodiscard]] size_t bit_width() const noexcept { return bit_width_; }
 
     /// Returns the bit value of the exponent at the given index, counting from the least
     /// significant bit (e[0] is the bottom bit, e[bit_width() - 1] is the top bit, always set).
-    bool operator[](size_t index) const noexcept
+    [[nodiscard]] bool operator[](size_t index) const noexcept
     {
         // TODO: Replace this with a custom iterator type.
-        const auto exp_size = (bit_width_ + 7) / 8;
         const auto byte_index = index / 8;
-        const auto byte = data_[exp_size - 1 - byte_index];
         const auto bit_index = index % 8;
+        const auto byte = bytes_[bytes_.size() - 1 - byte_index];
         const auto bit = (byte >> bit_index) & 1;
         return bit != 0;
     }
@@ -303,11 +295,10 @@ public:
     [[nodiscard]] size_t window(size_t lo, size_t hi) const noexcept
     {
         assert(lo <= hi && hi - lo < 8);
-        const auto exp_size = (bit_width_ + 7) / 8;
-        const auto byte_index = exp_size - 1 - lo / 8;
-        auto bytes = size_t{data_[byte_index]};
+        const auto byte_index = bytes_.size() - 1 - lo / 8;
+        auto bytes = size_t{bytes_[byte_index]};
         if (byte_index != 0)  // Prepend the next more significant byte if there is one.
-            bytes |= size_t{data_[byte_index - 1]} << 8;
+            bytes |= size_t{bytes_[byte_index - 1]} << 8;
         return (bytes >> (lo % 8)) & ((size_t{1} << (hi + 1 - lo)) - 1);
     }
 };
@@ -338,6 +329,7 @@ void mul_amm(std::span<uint64_t, N> r, std::span<const uint64_t, N> x,
     assert(y.size() == n);
     assert(mod.size() == n);
     assert(mod.back() != 0);
+    assert(mod[0] * mod_inv + 1 == 0);                     // The negative modulus inverse identity.
     assert(r.data() != x.data() && r.data() != y.data());  // r must not alias inputs.
 
     const auto r_lo = r.subspan(0, n - 1);
@@ -350,9 +342,10 @@ void mul_amm(std::span<uint64_t, N> r, std::span<const uint64_t, N> x,
         const auto c1 = crypto::mul(r, x, y[0]);
 
         const auto m = r[0] * mod_inv;
-        const auto c2 = (umul(mod[0], m) + r[0])[1];
+        const auto p = umul(mod[0], m) + r[0];
+        assert(p[0] == 0);  // The lowest word is canceled by m.
 
-        const auto c3 = addmul(r_lo, r_hi, mod_hi, m, c2);
+        const auto c3 = addmul(r_lo, r_hi, mod_hi, m, p[1]);
         std::tie(r[n - 1], r_carry) = intx::addc(c1, c3);
     }
 
@@ -360,18 +353,16 @@ void mul_amm(std::span<uint64_t, N> r, std::span<const uint64_t, N> x,
     for (size_t i = 1; i != n; ++i)
     {
         const auto c1 = addmul(r, r, x, y[i]);
-        const auto [sum1, d1] = intx::addc(c1, uint64_t{r_carry});
 
         const auto m = r[0] * mod_inv;
-        const auto c2 = (umul(mod[0], m) + r[0])[1];
+        const auto p = umul(mod[0], m) + r[0];
+        assert(p[0] == 0);  // The lowest word is canceled by m.
 
-        const auto c3 = addmul(r_lo, r_hi, mod_hi, m, c2);
-        const auto [sum2, d2] = intx::addc(sum1, c3);
-        r[n - 1] = sum2;
-        assert(!(d1 && d2));
-        r_carry = d1 || d2;
+        const auto c3 = addmul(r_lo, r_hi, mod_hi, m, p[1]);
+        std::tie(r[n - 1], r_carry) = intx::addc(c1, c3, r_carry);
     }
 
+    assert(!r_carry || less(r, mod));  // r_carry => r < mod.
     if (r_carry)
         sub(r, mod);
 }
@@ -418,10 +409,10 @@ void modexp_odd(std::span<uint64_t> result, std::span<const uint64_t> base, Expo
     assert(!mod.empty() && mod.back() != 0);    // mod must be trimmed.
     assert(!base.empty() && base.back() != 0);  // base must be trimmed.
     assert(result.size() == mod.size());
-    assert(exp.bit_width() != 0);
+    assert(!exp.empty());
 
     const auto n = mod.size();
-    const auto mod_inv = -evmmax::modinv(mod[0]);
+    const auto mod_inv = -modinv_pow2(mod[0]);
     const auto exp_bits = exp.bit_width();
 
     const auto w = window_width(exp_bits);
@@ -535,7 +526,7 @@ void modexp_pow2(std::span<uint64_t> r, std::span<const uint64_t> base, Exponent
     std::span<uint64_t> scratch) noexcept
 {
     assert(k != 0);                             // Modulus of 1 should be covered as "odd".
-    assert(exp.bit_width() != 0);               // Exponent of zero must be handled outside.
+    assert(!exp.empty());                       // Exponent of zero must be handled outside.
     assert(!base.empty() && base.back() != 0);  // base must be trimmed.
     assert(r.data() != base.data());            // No in-place operation.
 
@@ -548,10 +539,44 @@ void modexp_pow2(std::span<uint64_t> r, std::span<const uint64_t> base, Exponent
 
     const auto base_k = base.subspan(0, std::min(base.size(), num_pow2_words));
 
+    // The full exponent is not needed: base^exp % 2^k collapses to 0 for an even base
+    // and depends only on a bounded number of the low exponent bits for an odd one.
+    auto num_bits = exp.bit_width();
+    if ((base[0] & 1) == 0)  // base[0] is the least significant word, i.e. the base parity.
+    {
+        // For an even base the result is 0 once exp >= k. The bit width comparison is a
+        // sufficient condition: exp >= 2^(num_bits - 1) >= 2^bit_width(k) > k.
+        if (num_bits > static_cast<unsigned>(std::bit_width(k)))
+        {
+            std::ranges::fill(r_k, uint64_t{0});
+            return;
+        }
+    }
+    else
+    {
+        // An odd base satisfies base^λ ≡ 1 (mod 2^k), so base^exp ≡ base^(exp mod λ), which
+        // is the low period_bits of the exponent.
+        // λ is the Carmichael function: λ(2ᵏ) = 2ᵏ⁻² if k > 2 else 2ᵏ⁻¹.
+        if (const auto period_bits = k > 2 ? k - 2 : k - 1; num_bits > period_bits)
+        {
+            // Trim the leading zero bits of the reduced exponent.
+            num_bits = period_bits;
+            while (num_bits != 0 && !exp[num_bits - 1])
+                --num_bits;
+
+            if (num_bits == 0)  // The exponent is reduced to 0 and base^0 % 2^k == 1.
+            {
+                std::ranges::fill(r_k, uint64_t{0});
+                r_k[0] = 1;
+                return;
+            }
+        }
+    }
+
     const auto [_, pad] = std::ranges::copy(base_k, r_k.begin());
     std::ranges::fill(std::span{pad, r_k.end()}, uint64_t{0});
 
-    for (auto i = exp.bit_width() - 1; i != 0; --i)
+    for (auto i = num_bits - 1; i != 0; --i)
     {
         mul(tmp, r_k, r_k);
         std::swap(r_k, tmp);
@@ -579,13 +604,13 @@ void modinv_pow2(
     assert(!r.empty());
     assert(scratch.size() >= 2 * r.size());
 
-    r[0] = evmmax::modinv(x[0]);                   // Good start: 64 correct bits.
+    r[0] = crypto::modinv_pow2(x[0]);              // Good start: 64 correct bits.
     std::ranges::fill(r.subspan(1), uint64_t{0});  // Zero the rest for correct final subtraction.
 
     // Newton-Raphson iteration for modular inverse: inv' = inv * (2 - x * inv).
     // Rearranged as: inv' = 2 * inv - x * inv^2, which avoids the (2 - x) negation helper
     // and computes the result directly into r (no copy needed).
-    // Each iteration doubles the number of correct bits. See evmmax::modinv().
+    // Each iteration doubles the number of correct bits. See modinv_pow2().
     for (size_t i = 1; i < r.size(); i *= 2)
     {
         // We have i-word correct inverse in r[0..i). Double the precision to n = min(2i, r.size()).
@@ -687,7 +712,7 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
     const auto result = std::span{alloc.allocate(mod_size), mod_size};
     std::ranges::fill(result, uint64_t{0});
 
-    if (exp.bit_width() == 0)  // Exponent is 0:
+    if (exp.empty())  // Exponent is 0:
     {
         // Result is 1 except when mod is 1.
         if (mod_tz != 0 || mod_odd.size() != 1 || mod_odd[0] != 1)  // mod != 1

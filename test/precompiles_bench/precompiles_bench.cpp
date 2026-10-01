@@ -23,6 +23,7 @@ namespace
 {
 using namespace evmone::state;
 using namespace evmone::test;
+using enum PrecompileId;
 
 /// The revision used for the precompile benchmarks.
 constexpr auto REV = EVMC_OSAKA;
@@ -251,6 +252,7 @@ void modexp(benchmark::State& state)
     intx::be::unsafe::store(&input[32], intx::uint256{exp_len});
     intx::be::unsafe::store(&input[64], intx::uint256{base_mod_len});
     const std::span payload{&input[3 * 32], payload_len};
+    // TODO: The base is always odd, so the even base path of the power-of-two part is not covered.
     std::fill_n(&payload[0], base_mod_len, 0xff);
     std::fill_n(&payload[base_mod_len + 1], exp_len - 1, 0xff);
     payload[base_mod_len] = 0xff >> exp_clz;
@@ -324,58 +326,21 @@ BENCHMARK(modexp<expmod_execute_gmp>) MODEXP_ARGS;
 #endif
 #undef MODEXP_ARGS
 
-BENCHMARK_TEMPLATE(precompile, PrecompileId::identity, identity_execute);
-
-namespace bench_ecrecovery
-{
-constexpr auto evmone = ecrecover_execute_evmone;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::ecrecover, evmone);
+BENCHMARK(precompile<identity, identity_execute>);
+BENCHMARK(precompile<ecrecover, ecrecover_execute_evmone>);
 #ifdef EVMONE_PRECOMPILES_LIBSECP256K1
-constexpr auto libsecp256k1 = ecrecover_execute_libsecp256k1;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::ecrecover, libsecp256k1);
+BENCHMARK(precompile<ecrecover, ecrecover_execute_libsecp256k1>);
 #endif
-}  // namespace bench_ecrecovery
-
-namespace bench_expmod
-{
-constexpr auto evmone = expmod_execute_evmone;
-BENCHMARK(precompile<PrecompileId::expmod, evmone>);
+BENCHMARK(precompile<expmod, expmod_execute_evmone>);
 #ifdef EVMONE_PRECOMPILES_GMP
-constexpr auto gmp = expmod_execute_gmp;
-BENCHMARK(precompile<PrecompileId::expmod, gmp>);
+BENCHMARK(precompile<expmod, expmod_execute_gmp>);
 #endif
-}  // namespace bench_expmod
-
-namespace bench_ecadd
-{
-constexpr auto evmmax_cpp = ecadd_execute;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::ecadd, evmmax_cpp);
-}  // namespace bench_ecadd
-
-namespace bench_ecmul
-{
-constexpr auto evmmax_cpp = ecmul_execute;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::ecmul, evmmax_cpp);
-}  // namespace bench_ecmul
-
-namespace bench_ecpairing
-{
-constexpr auto evmmax_cpp = ecpairing_execute;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::ecpairing, evmmax_cpp);
-}  // namespace bench_ecpairing
-
-namespace bench_kzg
-{
-constexpr auto evmone_blst = point_evaluation_execute;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::point_evaluation, evmone_blst);
-}  // namespace bench_kzg
+BENCHMARK(precompile<ecadd, ecadd_execute>);
+BENCHMARK(precompile<ecmul, ecmul_execute>);
+BENCHMARK(precompile<ecpairing, ecpairing_execute>);
+BENCHMARK(precompile<point_evaluation, point_evaluation_execute>);
+BENCHMARK(precompile<p256verify, p256verify_execute>);
 
 }  // namespace
-
-namespace bench_p256verify
-{
-constexpr auto evmone_cpp = p256verify_execute;
-BENCHMARK_TEMPLATE(precompile, PrecompileId::p256verify, evmone_cpp);
-}  // namespace bench_p256verify
 
 BENCHMARK_MAIN();

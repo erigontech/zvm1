@@ -8,16 +8,14 @@
 #include "instructions.hpp"
 #include <variant>
 
-constexpr int64_t CALL_VALUE_COST = 9000;
-/// EIP-8038 redefines CALL_VALUE as ACCOUNT_WRITE + CALL_STIPEND.
-constexpr int64_t CALL_VALUE_COST_AMSTERDAM =
-    evmone::instr::account_write_cost_amsterdam + evmone::CALL_STIPEND;
-constexpr int64_t ACCOUNT_CREATION_COST = 25000;
-
 namespace evmone::instr::core
 {
 namespace
 {
+constexpr auto CALL_VALUE_COST = 9000;
+constexpr auto CALL_VALUE_COST_AMSTERDAM = ACCOUNT_WRITE + CALL_STIPEND;
+constexpr auto ACCOUNT_CREATION_COST = 25000;
+
 /// Get target address of a code executing instruction.
 ///
 /// Returns EIP-7702 delegate address if addr is delegated, or addr itself otherwise.
@@ -34,8 +32,8 @@ inline std::variant<evmc::address, Result> get_target_address(
 
     const auto delegate_account_access_cost =
         (state.host.access_account(*delegate_addr) == EVMC_ACCESS_COLD ?
-                instr::cold_account_access(state.rev) :
-                int64_t{instr::warm_storage_read_cost});
+                cold_account_access(state.rev) :
+                WARM_ACCESS);
 
     if ((gas_left -= delegate_account_access_cost) < 0)
         return Result{EVMC_OUT_OF_GAS, gas_left};
@@ -48,6 +46,30 @@ inline std::variant<evmc::address, Result> get_target_address(
     (void)state.host.account_exists(*delegate_addr);
 
     return *delegate_addr;
+}
+
+/// Absorbs a child's state-gas back to the parent (EIP-8037).
+inline void absorb_child_state_gas(
+    int64_t& gas_left, ExecutionState& state, const evmc::Result& result) noexcept
+{
+    assert(result.state_gas.left >= 0);
+    assert(result.state_gas.spilled >= 0);
+
+    // At most one of the two pools is ever non-empty.
+    assert(state.state_gas.left == 0 || state.state_gas.spilled == 0);
+    assert(result.state_gas.left == 0 || result.state_gas.spilled == 0);
+
+    // In a non-successful result, all is returned back.
+    assert(result.status_code == EVMC_SUCCESS ||
+           (result.state_gas.left == state.state_gas.left && result.state_gas.spilled == 0));
+
+    // Accumulate the spilled state-gas.
+    state.state_gas.spilled += result.state_gas.spilled;
+
+    // Rebalance the state-gas refills: the caller must move callee's refills to gas_left up to the
+    // caller's spilled counter. Do this by refilling all returned state-gas to zeroed `left`.
+    state.state_gas.left = 0;
+    state.state_gas.refill(gas_left, result.state_gas.left);
 }
 }  // namespace
 
@@ -83,7 +105,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     const auto gas = stack.pop();
     const auto dst = intx::be::trunc<evmc::address>(stack.pop());
-    const auto value = (!HAS_VALUE_ARG) ? 0 : stack.pop();
+    const auto value = HAS_VALUE_ARG ? stack.pop() : 0;
     const auto has_value = value != 0;
     const auto input_offset_u256 = stack.pop();
     const auto input_size_u256 = stack.pop();
@@ -113,7 +135,6 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     if constexpr (HAS_VALUE_ARG)
     {
-        // EIP-8038: the value-transfer cost becomes ACCOUNT_WRITE + CALL_STIPEND.
         const auto call_value_cost =
             state.rev >= EVMC_AMSTERDAM ? CALL_VALUE_COST_AMSTERDAM : CALL_VALUE_COST;
         if (has_value && (gas_left -= call_value_cost) < 0)
@@ -122,7 +143,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(dst) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -132,27 +153,16 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     const auto& code_addr = std::get<evmc::address>(target_addr_or_result);
 
-    // EIP-8037: state gas for creating the called account (value-CALL to a nonexistent account).
-    // Tracked at function scope so it can be refunded on every non-success exit below - a light
-    // failure or child revert/halt undoes the account creation (matches EELS generic_call).
-    int64_t new_account_state_gas = 0;
-    const auto refund_new_account_state_gas = [&]() noexcept {
-        if (new_account_state_gas != 0)
-            credit_state_gas_refund(gas_left, state, new_account_state_gas);
-    };
-
+    bool new_account_charged = false;  // NOLINT(*-const-correctness)
     if constexpr (Op == OP_CALL)
     {
         if ((has_value || state.rev < EVMC_SPURIOUS_DRAGON) && !state.host.account_exists(dst))
         {
             if (state.rev >= EVMC_AMSTERDAM)
             {
-                // The state charge comes after every regular cost of this instruction is
-                // committed (reservoir model), so a regular OOG cannot leave committed
-                // state growth behind.
-                new_account_state_gas = NEW_ACCOUNT_STATE_GAS;
-                if (!charge_state_gas(gas_left, state, new_account_state_gas))
+                if (!state.state_gas.charge(gas_left, NEW_ACCOUNT_STATE_GAS))
                     return {EVMC_OUT_OF_GAS, gas_left};
+                new_account_charged = true;
             }
             else if ((gas_left -= ACCOUNT_CREATION_COST) < 0)
                 return {EVMC_OUT_OF_GAS, gas_left};
@@ -166,6 +176,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     else
         msg.flags &= ~std::underlying_type_t<evmc_flags>{EVMC_DELEGATED};
     msg.depth = state.msg->depth + 1;
+    msg.state_gas = state.state_gas.left;
     msg.recipient = (Op == OP_CALL || Op == OP_STATICCALL) ? dst : state.msg->recipient;
     msg.code_address = code_addr;
     msg.sender = (Op == OP_DELEGATECALL) ? state.msg->sender : state.msg->recipient;
@@ -203,20 +214,15 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
             gas_left += CALL_STIPEND;
             if (intx::be::load<uint256>(state.host.get_balance(state.msg->recipient)) < value)
             {
-                refund_new_account_state_gas();   // No transfer, so no account created.
+                if (new_account_charged)
+                    state.state_gas.refill(gas_left, NEW_ACCOUNT_STATE_GAS);
                 return {EVMC_SUCCESS, gas_left};  // "Light" failure.
             }
         }
     }
 
-    if (state.msg->depth >= 1024)
-    {
-        refund_new_account_state_gas();   // Child never runs, so no account created.
+    if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
-    }
-
-    // EIP-8037: pass state gas to child execution.
-    msg.state_gas = state.state_gas.left;
 
     const auto result = state.host.call(msg);
     state.return_data.assign(result.output_data, result.output_size);
@@ -228,12 +234,14 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     const auto gas_used = msg.gas - result.gas_left;
     gas_left -= gas_used;
     state.gas_refund += result.gas_refund;
-    // EIP-8037: thread the child's state gas back (leftover reservoir + accumulated
-    // spill). A failed child already refilled itself, so its spill is 0; on child
-    // failure the created account is rolled back, so refund the NEW_ACCOUNT charge.
-    accumulate_child_state_gas(state, result);
-    if (result.status_code != EVMC_SUCCESS)
-        refund_new_account_state_gas();
+    absorb_child_state_gas(gas_left, state, result);
+
+    if constexpr (Op == OP_CALL)
+    {
+        if (new_account_charged && result.status_code != EVMC_SUCCESS)
+            state.state_gas.refill(gas_left, NEW_ACCOUNT_STATE_GAS);
+    }
+
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -273,21 +281,12 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     if (state.rev >= EVMC_SHANGHAI && init_code_size > max_init_code_size)
         return {EVMC_OUT_OF_GAS, gas_left};
 
-    // EIP-3860/7954: regular init-code word cost. Charged BEFORE the EIP-8037 state-gas
-    // charge (reservoir model): regular gas is committed against gas_left first, so a
-    // state charge that succeeds via spill cannot leave committed state growth behind a
-    // subsequent regular OOG, which would otherwise inflate the block's state component
-    // in max(regular, state).
     const auto init_code_word_cost = 6 * (Op == OP_CREATE2) + 2 * (state.rev >= EVMC_SHANGHAI);
     const auto init_code_cost = num_words(init_code_size) * init_code_word_cost;
     if ((gas_left -= init_code_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
-    // EIP-8037 charge-at-access (execution-specs #3116): the NEW_ACCOUNT state gas is not
-    // charged up front. The pre-access light failures below therefore never charge it; the
-    // charge is applied later, conditionally, at the deployment-address access.
-
-    if (state.msg->depth >= 1024)
+    if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
     if (endowment != 0 &&
@@ -304,59 +303,39 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     const auto init_code =
         bytes_view{init_code_size > 0 ? &state.memory[init_code_offset] : nullptr, init_code_size};
 
-    // Compute the address of the account to be created. The Host bumps the sender's
-    // nonce on create-frame entry, so CREATE uses the pre-bump value read above.
-    const auto create_addr = (Op == OP_CREATE) ? compute_create_address(sender, sender_nonce) :
-                                                 compute_create2_address(sender, salt, init_code);
+    evmc_message msg{.kind = to_call_kind(Op)};
+    msg.recipient = (Op == OP_CREATE) ? compute_create_address(sender, sender_nonce) :
+                                        compute_create2_address(sender, salt, init_code);
 
     // Access to the new address is warmed and never reverted (EIP-2929).
     if (state.rev >= EVMC_BERLIN)
-        state.host.access_account(create_addr);
+        state.host.access_account(msg.recipient);
 
-    // EIP-8037 charge-at-access: charge NEW_ACCOUNT for a deployment onto a non-existent
-    // (per EIP-161, not-alive) address. Decided by existence alone, after warming and before
-    // the 63/64 split so a reservoir spill correctly lowers the gas forwarded to the child.
-    // Refilled below when no account is created (address collision or a rolled-back initcode).
-    int64_t create_state_gas_charged = 0;
-    if (state.rev >= EVMC_AMSTERDAM)
+    bool new_account_charged = false;
+    if (state.rev >= EVMC_AMSTERDAM && !state.host.account_exists(msg.recipient))
     {
-        // EIP-161 aliveness. account_exists() is the same predicate: its pre-Spurious-Dragon
-        // arm is unreachable under the Amsterdam gate, leaving `acc != nullptr && !is_empty()`.
-        if (!state.host.account_exists(create_addr))
-        {
-            create_state_gas_charged = NEW_ACCOUNT_STATE_GAS;
-            if (!charge_state_gas(gas_left, state, create_state_gas_charged))
-                return {EVMC_OUT_OF_GAS, gas_left};
-        }
+        if (!state.state_gas.charge(gas_left, NEW_ACCOUNT_STATE_GAS))
+            return {EVMC_OUT_OF_GAS, gas_left};
+        new_account_charged = true;
     }
-
-    evmc_message msg{.kind = to_call_kind(Op)};
-    msg.recipient = create_addr;
 
     msg.gas = gas_left;
     if (state.rev >= EVMC_TANGERINE_WHISTLE)
         msg.gas -= msg.gas / 64;
 
+    msg.state_gas = state.state_gas.left;
     msg.input_data = init_code.data();
     msg.input_size = init_code.size();
     msg.sender = sender;
     msg.depth = state.msg->depth + 1;
     msg.value = intx::be::store<evmc::uint256be>(endowment);
 
-    // EIP-8037: pass state gas to child execution.
-    msg.state_gas = state.state_gas.left;
-
     const auto result = state.host.call(msg);
     gas_left -= msg.gas - result.gas_left;
     state.gas_refund += result.gas_refund;
-    // EIP-8037: handle child state gas — take the child's leftover reservoir and accumulate
-    // its spill. When no account is created — a non-success result covers both a rolled-back
-    // initcode and an address collision — refund the NEW_ACCOUNT charge in LIFO order
-    // (credit_state_gas_refund): a spilled portion returns to gas_left. A create onto an
-    // already-alive account was never charged (target_alive above), so needs no refund.
-    accumulate_child_state_gas(state, result);
-    if (create_state_gas_charged != 0 && result.status_code != EVMC_SUCCESS)
-        credit_state_gas_refund(gas_left, state, create_state_gas_charged);
+    absorb_child_state_gas(gas_left, state, result);
+    if (new_account_charged && result.status_code != EVMC_SUCCESS)
+        state.state_gas.refill(gas_left, NEW_ACCOUNT_STATE_GAS);
 
     state.return_data.assign(result.output_data, result.output_size);
     if (result.status_code == EVMC_SUCCESS)

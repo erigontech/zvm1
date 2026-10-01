@@ -121,6 +121,11 @@ struct evmc_message
     int64_t gas;
 
     /**
+     * The amount of state gas available (EIP-8037).
+     */
+    int64_t state_gas;
+
+    /**
      * The recipient of the message.
      *
      * This is the address of the account which storage/balance/nonce is going to be modified
@@ -189,13 +194,6 @@ struct evmc_message
      * The length of the code to be executed.
      */
     size_t code_size;
-
-    /**
-     * The amount of state gas available (EIP-8037).
-     *
-     * It draws from a reservoir allocated at transaction level.
-     */
-    int64_t state_gas;
 };
 
 /** The transaction and block data for execution. */
@@ -399,6 +397,16 @@ struct evmc_result;
  */
 typedef void (*evmc_release_result_fn)(const struct evmc_result* result);
 
+/** The state-gas counters of an execution (EIP-8037). */
+struct evmc_state_gas
+{
+    /** The amount of state gas left. */
+    int64_t left = 0;
+
+    /** The portion of the consumed state gas taken from evmc_result::gas_left. */
+    int64_t spilled = 0;
+};
+
 /** The EVM code execution result. */
 struct evmc_result
 {
@@ -420,6 +428,15 @@ struct evmc_result
      * If evmc_result::status_code is other than ::EVMC_SUCCESS the value MUST be 0.
      */
     int64_t gas_refund;
+
+    /**
+     * The state-gas counters after execution (EIP-8037).
+     *
+     * If evmc_result::status_code is other than ::EVMC_SUCCESS, evmc_state_gas::left MUST equal
+     * ::evmc_message::state_gas and evmc_state_gas::spilled MUST be 0. The VM returns the spill
+     * to evmc_result::gas_left for ::EVMC_REVERT; any other failure consumes it with gas_left.
+     */
+    struct evmc_state_gas state_gas;
 
     /**
      * The reference to output data.
@@ -462,23 +479,6 @@ struct evmc_result
      * function to the result itself allows VM composition.
      */
     evmc_release_result_fn release;
-
-    /**
-     * The amount of state gas left after execution (EIP-8037).
-     *
-     * Returned to the caller so it can restore its own state_gas tracking.
-     */
-    int64_t state_gas_left;
-
-    /**
-     * The portion of consumed state gas that spilled into gas_left (EIP-8037).
-     *
-     * Tracked so refunds and frame rollback restore gas in LIFO order: the
-     * spilled portion returns to gas_left, the rest to the reservoir
-     * (state_gas_left). On a successful child this accumulates into the
-     * caller; on revert/halt the frame refills itself before returning.
-     */
-    int64_t state_gas_spilled;
 };
 
 

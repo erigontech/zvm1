@@ -73,7 +73,7 @@ TransactionCost compute_tx_intrinsic_cost_amsterdam(const Transaction& tx) noexc
     // Recipient balance write plus the EIP-7708 transfer log performed by a value transfer.
     static constexpr int64_t TX_VALUE_COST = 6000;
     // EIP-8038: CREATE_ACCESS = ACCOUNT_WRITE + COLD_ACCOUNT_ACCESS (12000).
-    static constexpr int64_t CREATE_ACCESS = instr::create_access_cost_amsterdam;
+    static constexpr int64_t CREATE_ACCESS = instr::CREATE_ACCESS;
     static constexpr int64_t DATA_TOKEN_STANDARD = 4;
     static constexpr int64_t DATA_TOKEN_FLOOR = 16;
     static constexpr int64_t INITCODE_WORD_COST = 2;
@@ -82,16 +82,16 @@ TransactionCost compute_tx_intrinsic_cost_amsterdam(const Transaction& tx) noexc
     // EIP-8038: the access-list entries prepay the cold access minus the warm access still
     // charged when the transaction touches the prepaid address/slot.
     static constexpr int64_t ACCESS_LIST_ADDRESS_COST =
-        instr::cold_account_access_cost_amsterdam - instr::warm_storage_read_cost;
+        instr::COLD_ACCOUNT_ACCESS_AMSTERDAM - instr::WARM_ACCESS;
     static constexpr int64_t ACCESS_LIST_STORAGE_KEY_COST =
-        instr::cold_sload_cost - instr::warm_storage_read_cost;
+        instr::COLD_STORAGE_ACCESS - instr::WARM_ACCESS;
     static constexpr int64_t PRECOMPILE_ECRECOVER = 3000;
     static constexpr int64_t AUTH_TUPLE_BYTES = 101;  // chain_id 8 + addr 20 + nonce 8 + v/r/s 65.
     // EIP-8037: EXECUTION_PER_AUTH_BASE_COST = AUTH_TUPLE_BYTES × DATA_TOKEN_FLOOR
     //   + PRECOMPILE_ECRECOVER + COLD_ACCOUNT_ACCESS + 2 × WARM_ACCESS (7816).
     static constexpr int64_t EXECUTION_PER_AUTH_BASE_COST =
         AUTH_TUPLE_BYTES * DATA_TOKEN_FLOOR + PRECOMPILE_ECRECOVER +
-        instr::cold_account_access_cost_amsterdam + 2 * instr::warm_storage_read_cost;
+        instr::COLD_ACCOUNT_ACCESS_AMSTERDAM + 2 * instr::WARM_ACCESS;
 
     const auto is_create = !tx.to.has_value();
     const auto is_self_transfer = tx.to.has_value() && *tx.to == tx.sender;
@@ -112,7 +112,7 @@ TransactionCost compute_tx_intrinsic_cost_amsterdam(const Transaction& tx) noexc
     }
     else if (!is_self_transfer)
     {
-        recipient_regular = instr::cold_account_access_cost_amsterdam;
+        recipient_regular = instr::COLD_ACCOUNT_ACCESS_AMSTERDAM;
         if (has_value)
             recipient_regular += TX_VALUE_COST;
     }
@@ -263,7 +263,7 @@ AuthOutcome process_authorization_list(State& state, uint64_t chain_id,
     const address& sender, const std::optional<address>& value_recipient, int64_t& gas_left,
     StateGas& reservoir)
 {
-    static constexpr int64_t ACCOUNT_WRITE = instr::account_write_cost_amsterdam;  // EIP-8038.
+    static constexpr int64_t ACCOUNT_WRITE = instr::ACCOUNT_WRITE;  // EIP-8038.
     const auto amsterdam = rev >= EVMC_AMSTERDAM;
     const auto auth_base_state = STATE_BYTES_PER_AUTH_BASE * cpsb;
     const auto new_account_state = STATE_BYTES_PER_NEW_ACCOUNT * cpsb;
@@ -382,6 +382,7 @@ evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) n
         .flags = 0,
         .depth = 0,
         .gas = execution_gas_limit,
+        .state_gas = 0,  // Set by the caller for Amsterdam+.
         .recipient = recipient,
         .sender = tx.sender,
         .input_data = tx.data.data(),
@@ -390,7 +391,6 @@ evmc_message build_message(const Transaction& tx, int64_t execution_gas_limit) n
         .code_address = recipient,
         .code = nullptr,
         .code_size = 0,
-        .state_gas = 0,  // Set by the caller for Amsterdam+.
     };
 }
 }  // namespace
@@ -853,11 +853,7 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     max_total_fee += tx.value;
 
     if (tx.type == Transaction::Type::blob)
-    {
-        const auto total_blob_gas = tx.blob_gas_used();
-        // FIXME: Can overflow uint256.
-        max_total_fee += total_blob_gas * tx.max_blob_gas_price;
-    }
+        max_total_fee += umul(uint256{tx.blob_gas_used()}, tx.max_blob_gas_price);
     if (sender_acc.balance < max_total_fee)
         return make_error_code(INSUFFICIENT_ACCOUNT_FUNDS);
 
@@ -1065,7 +1061,7 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     // so the reservoir is returned whole — the halt consumes at most the regular budget
     // (EIP-8037 settlement of the EELS preparation snapshot).
     evmc::Result result{EVMC_OUT_OF_GAS, 0};
-    result.state_gas_left = reservoir_initial;
+    result.state_gas.left = reservoir_initial;
     if (!top_frame_halted)
         result = host.call(message);
 
@@ -1077,12 +1073,12 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     const auto exec_state_gas =
         top_frame_halted ?
             int64_t{0} :
-            auth.state_charge + std::max<int64_t>(0, message.state_gas - result.state_gas_left +
-                                                         result.state_gas_spilled);
+            auth.state_charge + std::max<int64_t>(0, message.state_gas - result.state_gas.left +
+                                                         result.state_gas.spilled);
 
     // EIP-8037: actual gas consumed = gas_limit - regular_unspent - reservoir_unspent,
     // pre-refund and pre-floor. Kept immutable: the receipt's gas_refund is derived from it.
-    const auto gas_used_b4_refund = tx.gas_limit - result.gas_left - result.state_gas_left;
+    const auto gas_used_b4_refund = tx.gas_limit - result.gas_left - result.state_gas.left;
     auto gas_used = gas_used_b4_refund;
 
     // EIP-7778: Block-level gas components for Amsterdam.
