@@ -76,6 +76,32 @@ void buf_zero_all(void)
     );
 }
 
+/// Zeroes the state bytes of buf[] from byte offset @p off (a multiple of 4, at most 200) by
+/// jumping into a run of word stores.
+///
+/// The delegation reads and writes buf[0..30], but only the 25 lanes of the state need a clean
+/// start: every round writes the six scratch lanes buf[25..30] before it reads them (the column
+/// XORs, then the column mix), and buf[31] is never touched. A short input leaves 16 to 43 words
+/// to clear; 1 store each beats the CSR MEMCOPY zeroing (4 instructions and a delegation per
+/// 32-byte chunk, plus a per-chunk loop and word stores up to the next 32-byte boundary).
+static inline __attribute__((always_inline)) void buf_zero_state_from(size_t off)
+{
+    uintptr_t t;
+    __asm__(
+        "lla %[t], 1f\n\t"
+        "add %[t], %[t], %[off]\n\t"
+        "jr %[t]\n"
+        "1:\n\t"
+        ".set .Lkz_off, 0\n\t"
+        ".rept 50\n\t"
+        "sw zero, .Lkz_off(%[b])\n\t"
+        ".set .Lkz_off, .Lkz_off + 4\n\t"
+        ".endr"
+        // The lanes' own type, so GCC keeps the later padding-bit OR into a lane after this.
+        : [t] "=&r"(t), "+m"(*(uint64_t(*)[25])buf)
+        : [off] "r"(off), [b] "r"(buf));
+}
+
 /// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting buf[] in place.
 /// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
 /// scans for exactly 649 contiguous csrrw instructions.
@@ -628,16 +654,17 @@ static inline ALWAYS_INLINE void keccak(
     if (size >= block_words * WORD_SIZE && ((uintptr_t)data & 3) == 0)
     {
         // The state starts at zero, so absorbing the first block is a copy: store the block and
-        // zero the rest of buf[], rather than zeroing everything (8 CSR MEMCOPY delegations) and
-        // then XOR-ing the block in, which reloads the zero state word by word.
+        // zero the rest of the state, rather than zeroing everything (8 CSR MEMCOPY delegations)
+        // and then XOR-ing the block in, which reloads the zero state word by word. The scratch
+        // lanes past the state need no clearing (see buf_zero_state_from()).
         const uint32_t* const s = (const uint32_t*)data;
         uint32_t* const d = (uint32_t*)buf;
         size_t i;
 #pragma GCC unroll 34
         for (i = 0; i < 2 * block_words; ++i)
             d[i] = s[i];
-#pragma GCC unroll 30
-        for (; i < 2 * 32; ++i)
+#pragma GCC unroll 32
+        for (; i < 2 * 25; ++i)
             d[i] = 0;
         keccak_permute_buf();
         // A block is a multiple of 8 bytes, so the rest of the input keeps its alignment.
@@ -724,28 +751,8 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
                 bufW += 2;
             }
 
-            // Zero remaining buf words up to buf[31] (256 bytes total).
-            // Use CSR MEMCOPY when 32-byte aligned, else word stores.
-            {
-                uint32_t* end = (uint32_t*)buf + 64;  // buf[32] uint64_t = 64 uint32_t
-                while (bufW < end)
-                {
-                    if (((uintptr_t)bufW & 31) == 0 && (end - bufW) >= 8)
-                    {
-                        // Inline CSR MEMCOPY (keccak.c has its own; csr_memcopy32 is in mem_builtins).
-                        register uintptr_t a0_ __asm__("x10") = (uintptr_t)bufW;
-                        register uintptr_t a1_ __asm__("x11") = (uintptr_t)keccak_zeros;
-                        register uint32_t  a2_ __asm__("x12") = 0x80;
-                        __asm__ __volatile__("csrrw x0, 0x7CA, x0"
-                            : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
-                        bufW += 8;
-                    }
-                    else
-                    {
-                        *bufW++ = 0;
-                    }
-                }
-            }
+            // Zero the rest of the state (the scratch lanes need no clearing).
+            buf_zero_state_from((size_t)((uintptr_t)bufW - (uintptr_t)buf));
 
             buf[16] |= 0x8000000000000000ULL;
 
