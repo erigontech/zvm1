@@ -16,6 +16,8 @@
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 namespace evmone
@@ -737,6 +739,8 @@ inline void addmod(StackTop stack) noexcept
         if (m >= x)  // TODO: untested.
             m -= x;
     }
+#elif defined(ZISK)
+    m = zisk::addmod256(x, y, m);
 #else
     m = intx::addmod(x, y, m);
 #endif
@@ -778,6 +782,8 @@ inline void mulmod(StackTop stack) noexcept
     r12 = 0x10;  // MUL_HIGH
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
     intx::internal::div32::mulmod_reduce(p, m);
+#elif defined(ZISK)
+    m = zisk::mulmod256(x, y, m);
 #else
     m = intx::mulmod(x, y, m);
 #endif
