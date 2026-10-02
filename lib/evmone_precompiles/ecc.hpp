@@ -5,11 +5,37 @@
 #pragma once
 
 #include "modarith.hpp"
+#include <new>
 #include <optional>
 #include <span>
 
 namespace evmone::crypto::ecc
 {
+
+#if defined(AIRBENDER) && defined(__riscv)
+/// Declares a FieldElement `name` as an uninitialized copy of `src`, using CSR MEMCOPY.
+/// Avoids the 8-word dead zero-init that FieldElement's copy ctor generates
+/// (uint<256>'s default ctor zero-inits words_[4]{} before the asm volatile MEMCOPY).
+/// MUST only be used when `name` will be fully overwritten by CSR MEMCOPY (always true here).
+/// CSR MEMCOPY moves exactly 256 bits, so wider field elements (e.g. Fq2 on the BN254 twist,
+/// which goes through the generic dbl()) are copy-constructed instead.
+#define DECL_FE_COPY(FE_TYPE, name, src) \
+    alignas(32) char name##_raw_[sizeof(FE_TYPE)]; \
+    auto& name = *reinterpret_cast<FE_TYPE*>(name##_raw_); \
+    do { \
+        if constexpr (sizeof(FE_TYPE) == 32) \
+        { \
+            register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&name); \
+            register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&(src)); \
+            register uint32_t a2_ asm("x12") = 0x80; \
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory"); \
+        } \
+        else \
+            ::new (static_cast<void*>(name##_raw_)) FE_TYPE(src); \
+    } while(0)
+#else
+#define DECL_FE_COPY(FE_TYPE, name, src) auto name = src
+#endif
 template <int N>
 struct Constant : std::integral_constant<int, N>
 {
@@ -34,7 +60,11 @@ class FieldElement
     static constexpr bool is_bn_accel = requires { Spec::BN_ACCELERATED; };
     static constexpr ModArith<uint_type, is_bn_accel> Fp{Spec::ORDER};
 
+#if defined(AIRBENDER) && defined(__riscv)
+    alignas(32) uint_type value_;
+#else
     uint_type value_;
+#endif
 
     /// Wraps a value into the Element type assuming it is already in the internal ModArith form.
     [[gnu::always_inline]] static constexpr FieldElement wrap(const uint_type& v) noexcept
@@ -49,6 +79,48 @@ public:
     static constexpr auto& ORDER = Spec::ORDER;
 
     FieldElement() = default;
+
+#if defined(AIRBENDER) && defined(__riscv)
+    /// CSR MEMCOPY-accelerated copy constructor.
+    /// Both source and destination value_ are alignas(32), so CSR MEMCOPY (4 insns)
+    /// replaces the default word-by-word copy (16 insns on rv32), saving 12 insns per copy.
+    /// Uses uninit_tag to skip the dead zero-init that uint<256>'s default ctor would emit;
+    /// CSR MEMCOPY fully overwrites value_ so the zero-init was always dead code.
+    /// In constexpr context, falls back to value-init + copy-assign (the optimizer removes the
+    /// dead zero-init at -O2 anyway since there's no asm volatile barrier).
+    __attribute__((always_inline)) constexpr FieldElement(const FieldElement& other) noexcept
+        : value_{std::is_constant_evaluated() ? uint_type{} : uint_type{typename uint_type::uninit_tag{}}}
+    {
+        if (!std::is_constant_evaluated())
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&value_);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&other.value_);
+            register uint32_t a2 asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+        else
+        {
+            value_ = other.value_;
+        }
+    }
+
+    /// CSR MEMCOPY-accelerated copy assignment.
+    __attribute__((always_inline)) constexpr FieldElement& operator=(const FieldElement& other) noexcept
+    {
+        if (!std::is_constant_evaluated())
+        {
+            register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&value_);
+            register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&other.value_);
+            register uint32_t a2 asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+        }
+        else
+        {
+            value_ = other.value_;
+        }
+        return *this;
+    }
+#endif
 
     constexpr explicit FieldElement(uint_type v) : value_{Fp.to_mont(v)} {}
 
@@ -85,47 +157,85 @@ public:
 
     friend constexpr bool operator==(const FieldElement& a, zero_t) noexcept { return !a.value_; }
 
-    friend constexpr auto operator*(const FieldElement& a, const FieldElement& b) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator*(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.mul(a.value_, b.value_));
     }
 
-    friend constexpr auto operator+(const FieldElement& a, const FieldElement& b) noexcept
+    FieldElement& __attribute__((always_inline)) operator*=(const FieldElement& b) noexcept
+    {
+#if defined(AIRBENDER) && defined(__riscv)
+        Fp.mul_assign(value_, b.value_);
+#else
+        value_ = Fp.mul(value_, b.value_);
+#endif
+        return *this;
+    }
+
+    friend constexpr auto __attribute__((always_inline)) operator+(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.add(a.value_, b.value_));
     }
 
-    FieldElement& operator+=(const FieldElement& b) noexcept
+    FieldElement& __attribute__((always_inline)) operator+=(const FieldElement& b) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        Fp.add_assign(value_, b.value_);
+#else
         value_ = Fp.add(value_, b.value_);
+#endif
         return *this;
     }
 
-    friend constexpr auto operator-(const FieldElement& a, const FieldElement& b) noexcept
+    FieldElement& __attribute__((always_inline)) operator-=(const FieldElement& b) noexcept
+    {
+#if defined(AIRBENDER) && defined(__riscv)
+        Fp.sub_assign(value_, b.value_);
+#else
+        value_ = Fp.sub(value_, b.value_);
+#endif
+        return *this;
+    }
+
+    friend constexpr auto __attribute__((always_inline)) operator-(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.sub(a.value_, b.value_));
     }
 
-    friend constexpr auto operator-(const FieldElement& a) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator-(const FieldElement& a) noexcept
     {
         return wrap(Fp.sub(0, a.value_));
     }
 
     /// Division returns 0 when the divisor is 0. See ModArith::inv().
-    friend constexpr auto operator/(one_t, const FieldElement& a) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator/(one_t, const FieldElement& a) noexcept
     {
         return wrap(Fp.inv(a.value_));
     }
 
     /// Division returns 0 when the divisor is 0. See ModArith::inv().
-    friend constexpr auto operator/(const FieldElement& a, const FieldElement& b) noexcept
+    friend constexpr auto __attribute__((always_inline)) operator/(const FieldElement& a, const FieldElement& b) noexcept
     {
         return wrap(Fp.mul(a.value_, Fp.inv(b.value_)));
     }
 
     /// Named 1/x inversion method. Needed in the pairing templates.
     /// Returns 0 when this element is 0. See ModArith::inv().
-    constexpr auto inv() const noexcept { return wrap(Fp.inv(value_)); }
+    constexpr auto __attribute__((always_inline)) inv() const noexcept { return wrap(Fp.inv(value_)); }
+
+    /// Repeated squaring: returns x^(2^n). Uses ModArith::square_n for CSR loop optimization.
+    constexpr auto __attribute__((always_inline)) square_n(unsigned n) const noexcept { return wrap(Fp.square_n(value_, n)); }
+
+#if defined(AIRBENDER) && defined(__riscv)
+    /// In-place repeated squaring: x = x^(2^n) mod p.
+    /// Avoids the wrap() overhead (zero-init + word copy + return copy) of the const version.
+    /// Saves ~20-24 instructions per call vs `*this = this->square_n(n)`.
+    auto& __attribute__((always_inline)) square_n_assign(unsigned n) noexcept
+    {
+        Fp.square_n_inplace(value_, n);
+        return *this;
+    }
+#endif
 
     /// Named one element. Needed in the pairing templates.
     static constexpr auto one() noexcept { return FieldElement{1}; }
@@ -155,6 +265,19 @@ struct AffinePoint
 
     friend constexpr bool operator==(const AffinePoint& p, zero_t) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        // Use FieldElement::operator==(zero_t) which has short-circuit on rv32
+        // (exits on first nonzero word). The old `p == AffinePoint{}` used the
+        // general XOR-fold comparison (~64 insns on rv32 vs ~8 insns short-circuit).
+        // In constexpr context, fall back to the general comparison (operator bool
+        // uses reinterpret_cast which isn't constexpr).
+        // Extension fields (Fq2 on the BN254 twist) have no such comparison.
+        if constexpr (requires(const FE& f) { f == 0; })
+        {
+            if (!std::is_constant_evaluated())
+                return p.x == 0 && p.y == 0;
+        }
+#endif
         return p == AffinePoint{};
     }
 
@@ -211,13 +334,16 @@ struct ProjPoint
 
 /// Converts a projected point to an affine point.
 template <typename Curve>
+__attribute__((flatten))
 AffinePoint<Curve> to_affine(const ProjPoint<Curve>& p) noexcept
 {
     // This works correctly for the point at infinity (z == 0) because then z_inv == 0.
-    const auto z_inv = 1 / p.z;
-    const auto zz_inv = z_inv * z_inv;
-    const auto zzz_inv = zz_inv * z_inv;
-    return {p.x * zz_inv, p.y * zzz_inv};
+    auto z_inv = 1 / p.z;
+    auto zz_inv = z_inv; zz_inv *= z_inv;  // z_inv^2 (copy+mul_assign saves 1 MEMCOPY)
+    z_inv *= zz_inv;            // z_inv now = zzz_inv = zz_inv * z_inv (in-place, saves 1 MEMCOPY)
+    auto rx = p.x; rx *= zz_inv;   // x/z^2 (copy+mul_assign saves 1 MEMCOPY)
+    auto ry = p.y; ry *= z_inv;    // y/z^3 (copy+mul_assign saves 1 MEMCOPY)
+    return {rx, ry};
 }
 
 /// Elliptic curve point addition in affine coordinates.
@@ -267,6 +393,7 @@ AffinePoint<Curve> add_affine(const AffinePoint<Curve>& p, const AffinePoint<Cur
 /// Computes P ⊕ Q for two points in Jacobian coordinates on the elliptic curve.
 /// This procedure handles all inputs (e.g. doubling or points at infinity).
 template <typename Curve>
+__attribute__((flatten))
 ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexcept
 {
     if (p == 0)
@@ -285,39 +412,41 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
     const auto& [x1, y1, z1] = p;
     const auto& [x2, y2, z2] = q;
 
-    const auto z1z1 = z1 * z1;
-    const auto z2z2 = z2 * z2;
-    const auto u1 = x1 * z2z2;
-    const auto u2 = x2 * z1z1;
-    const auto z1z1z1 = z1 * z1z1;
-    const auto z2z2z2 = z2 * z2z2;
-    const auto s1 = y1 * z2z2z2;
-    const auto s2 = y2 * z1z1z1;
-    const auto h = u2 - u1;
-    const auto r = s2 - s1;
+    using FE [[maybe_unused]] = typename Curve::Fp;
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;    // z1^2
+    DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;    // z2^2
+    DECL_FE_COPY(FE, u1, x1); u1 *= z2z2;     // x1*z2^2
+    DECL_FE_COPY(FE, u2, x2); u2 *= z1z1;     // x2*z1^2
+    z1z1 *= z1;                 // z1z1 now = z1^3
+    z2z2 *= z2;                 // z2z2 now = z2^3
+    z2z2 *= y1;                 // z2z2 now = s1 = y1*z2^3
+    z1z1 *= y2;                 // z1z1 now = s2 = y2*z1^3
+    u2 -= u1;                  // u2 now = h = u2 - u1
+    auto& h = u2;
+    z1z1 -= z2z2;              // z1z1 now = r = s2 - s1
+    auto& r = z1z1;
 
     // Handle point doubling in case p == q, i.e. when u1 == u2 and s1 == s2.
-    // TODO: Untested case of two points having the same y coordinate but different x.
-    //       The following assertion (r == 0) => (h == 0) should fail in that case.
     assert(r != 0 || h == 0);
     if (h == 0 && r == 0) [[unlikely]]
         return dbl(p);
 
-    const auto hh = h * h;
-    const auto hhh = h * hh;
-    const auto v = u1 * hh;
-    const auto t2 = r * r;
-    const auto t3 = v + v;
-    const auto t4 = t2 - hhh;
-    const auto x3 = t4 - t3;
-    const auto t5 = v - x3;
-    const auto t6 = s1 * hhh;
-    const auto t7 = r * t5;
-    const auto y3 = t7 - t6;
-    const auto t8 = z2 * h;
-    const auto z3 = z1 * t8;
+    DECL_FE_COPY(FE, hh, h); hh *= h;         // h^2
+    u1 *= hh;                  // u1 now = v = u1 * hh
+    auto& v = u1;
+    hh *= h;                    // hh now = hhh = h^3
+    DECL_FE_COPY(FE, x3, r); x3 *= r;         // r^2
+    x3 -= hh;                 // x3 -= hhh (in-place)
+    x3 -= v;                  // x3 -= v   (double-subtract replaces DECL_FE_COPY+add+sub)
+    x3 -= v;                  // x3 -= v   (x3 = r^2 - hhh - 2*v)
+    v -= x3;                   // v now = v - x3 (in-place, eliminates temporary t5)
+    hh *= z2z2;                // hh now = s1*hhh = t6 (saves 1 MEMCOPY; z2z2 holds s1)
+    r *= v;                    // r now = r*(v-x3) = t7 (saves 1 MEMCOPY)
+    r -= hh;                   // r now = y3 = t7 - t6  (in-place, saves 1 MEMCOPY)
+    h *= z2;                   // h now = z2*h = t8 (saves 1 MEMCOPY)
+    h *= z1;                   // h now = z3 = z1*t8 (saves 1 MEMCOPY)
 
-    return {x3, y3, z3};
+    return {x3, r, h};
 }
 
 /// Mixed addition of elliptic curve points.
@@ -325,6 +454,7 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const ProjPoint<Curve>& q) noexc
 /// Computes P ⊕ Q for a point P in Jacobian coordinates and a point Q in affine coordinates.
 /// This procedure handles all inputs (e.g. doubling or points at infinity).
 template <typename Curve>
+__attribute__((flatten))
 ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noexcept
 {
     if (q == 0)
@@ -340,69 +470,114 @@ ProjPoint<Curve> add(const ProjPoint<Curve>& p, const AffinePoint<Curve>& q) noe
     const auto& [x1, y1, z1] = p;
     const auto& [x2, y2] = q;
 
-    const auto z1z1 = z1 * z1;
-    const auto u2 = x2 * z1z1;
-    const auto z1z1z1 = z1 * z1z1;
-    const auto s2 = y2 * z1z1z1;
-    const auto h = u2 - x1;
-    const auto t1 = h + h;
-    const auto i = t1 * t1;
-    const auto j = h * i;
-    const auto t2 = s2 - y1;
+    using FE [[maybe_unused]] = typename Curve::Fp;
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;    // z1^2
+    DECL_FE_COPY(FE, u2, x2); u2 *= z1z1;     // x2*z1^2
+    z1z1 *= z1;                 // z1z1 now = z1^3
+    z1z1 *= y2;                 // z1z1 now = s2 = y2 * z1^3
+    u2 -= x1;                   // u2 now = h = u2 - x1
+    auto& h = u2;
+    DECL_FE_COPY(FE, t1, h);
+    t1 += h;                    // t1 = 2*h
+    DECL_FE_COPY(FE, i, t1); i *= t1;         // (2h)^2
+    z1z1 -= y1;                 // z1z1 now = t2 = s2 - y1
+    auto& t2 = z1z1;
 
     // Handle point doubling in case p == q.
-    // p == q (in jacobian coordinates) if and only if x1 == x2 * z1z1 and y1 = y2 * z1z1z1
     if (h == 0 && t2 == 0) [[unlikely]]
         return dbl(p);
 
-    const auto r = t2 + t2;
-    const auto v = x1 * i;
-    const auto t3 = r * r;
-    const auto t4 = v + v;
-    const auto t5 = t3 - j;
-    const auto x3 = t5 - t4;
-    const auto t6 = v - x3;
-    const auto t7 = y1 * j;
-    const auto t8 = t7 + t7;
-    const auto t9 = r * t6;
-    const auto y3 = t9 - t8;
-    const auto t10 = z1 * h;
-    const auto z3 = t10 + t10;
+    DECL_FE_COPY(FE, r, t2);
+    r += t2;                    // r = 2*t2
+    DECL_FE_COPY(FE, v, x1); v *= i;          // x1*i
+    i *= h;                     // i now = j = h * i
+    DECL_FE_COPY(FE, x3, r); x3 *= r;         // r^2
+    x3 -= i;                   // x3 -= j  (in-place)
+    x3 -= v;                   // x3 -= v  (double-subtract replaces DECL_FE_COPY+add+sub)
+    x3 -= v;                   // x3 -= v  (x3 = r^2 - j - 2*v)
+    v -= x3;                    // v now = v - x3 (in-place, eliminates temporary t6)
+    i *= y1;                    // i now = y1 * j = t7 (saves 1 MEMCOPY vs t7 = y1 * j)
+    r *= v;                     // r now = y3 = r * (v-x3) (saves 1 MEMCOPY)
+    r -= i;                     // r -= y1*j  (double-subtract replaces self-add+sub)
+    r -= i;                     // r -= y1*j  (y3 = r*(v-x3) - 2*y1*j)
+    h *= z1;                    // h now = z3 = z1 * h (saves 1 MEMCOPY vs z3 = z1 * h)
+    h += h;                     // z3 = 2*t10 (in-place, saves 1 MEMCOPY)
 
-    return {x3, y3, z3};
+    return {x3, r, h};
 }
 
 template <typename Curve>
+__attribute__((flatten))
 constexpr ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 {
     const auto& [x1, y1, z1] = p;
 
     if constexpr (Curve::A == 0)
     {
-        // Use the "dbl-2009-l" formula for a=0 curve in Jacobian coordinates.
-        // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#doubling-dbl-2009-l
+        using FE [[maybe_unused]] = typename Curve::Fp;
+        if constexpr (requires(FE a, const FE& b) {
+                          a *= b;
+                          a += b;
+                          a -= b;
+                      })
+        {
+            // Optimized doubling for a=0 curve in Jacobian coordinates.
+            // Computes S = 4*X*Y^2 directly (1M + 2A) instead of via the dbl-2009-l
+            // squaring trick (1M + 2S + 1A), saving 2 modular subtractions per doubling.
+            // Formula: S = 4*X*Y^2, M = 3*X^2, X' = M^2 - 2S, Y' = M(S-X') - 8Y^4, Z' = 2YZ.
+            // Cost: 7M + 9A + 3S = 7M + 12(A+S) vs original 7M + 9A + 5S = 7M + 14(A+S).
 
-        const auto xx = x1 * x1;
-        const auto yy = y1 * y1;
-        const auto yyyy = yy * yy;
-        const auto t0 = x1 + yy;
-        const auto t1 = t0 * t0;
-        const auto t2 = t1 - xx;
-        const auto t3 = t2 - yyyy;
-        const auto d = t3 + t3;
-        const auto e = xx + xx + xx;
-        const auto f = e * e;
-        const auto t4 = d + d;
-        const auto x3 = f - t4;
-        const auto t6 = d - x3;
-        const auto yyyy2 = yyyy + yyyy;
-        const auto yyyy4 = yyyy2 + yyyy2;
-        const auto yyyy8 = yyyy4 + yyyy4;
-        const auto t9 = e * t6;
-        const auto y3 = t9 - yyyy8;
-        const auto t10 = y1 * z1;
-        const auto z3 = t10 + t10;
-        return {x3, y3, z3};
+            DECL_FE_COPY(FE, xx, x1); xx *= x1;       // X^2 (uninit copy + mul_assign)
+            DECL_FE_COPY(FE, yy, y1); yy *= y1;       // Y^2
+            DECL_FE_COPY(FE, yyyy, yy); yyyy *= yy;   // Y^4
+            yy *= x1;              // yy now = s = X*Y^2 (saves 1 MEMCOPY vs s = x1 * yy)
+            yy += yy;              // s = 2*X*Y^2        (in-place, saves 1 MEMCOPY)
+            yy += yy;              // S = 4*X*Y^2        (in-place, saves 1 MEMCOPY)
+            DECL_FE_COPY(FE, m, xx);  // copy X^2
+            m += xx;                // 2*X^2             (in-place, saves 1 MEMCOPY vs m = xx + xx)
+            m += xx;                // M = 3*X^2         (in-place)
+            DECL_FE_COPY(FE, x3, m); x3 *= m;         // M^2 (uninit copy + mul_assign)
+            x3 -= yy;              // M^2 - S   (eliminates s2 copy: was `s2=yy; s2+=yy; x3-=s2`)
+            x3 -= yy;              // X' = M^2 - 2*S    (in-place)
+            yy -= x3;              // yy now = S - X'   (in-place, eliminates temporary t)
+            yyyy += yyyy;           // 2*Y^4             (in-place, saves 1 MEMCOPY)
+            yyyy += yyyy;           // 4*Y^4             (in-place, saves 1 MEMCOPY)
+            // 8*Y^4 via double-subtract: m -= 4Y^4 twice, avoids 1 self-add MEMCOPY.
+            m *= yy;                // m now = M*(S-X') (saves 1 MEMCOPY vs y3 = m * t)
+            m -= yyyy;             // m -= 4*Y^4
+            m -= yyyy;             // Y' = M*(S - X') - 8*Y^4  (double-subtract)
+            DECL_FE_COPY(FE, z3, y1); z3 += y1;       // 2*Y (non-self add, avoids self-add MEMCOPY)
+            z3 *= z1;              // Z' = 2*Y*Z        (mul_assign)
+            return {x3, m, z3};
+        }
+        else
+        {
+            // Extension fields without in-place operators (Fq2 on the BN254 twist).
+            // Use the "dbl-2009-l" formula for a=0 curve in Jacobian coordinates.
+            // https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#doubling-dbl-2009-l
+
+            const auto xx = x1 * x1;
+            const auto yy = y1 * y1;
+            const auto yyyy = yy * yy;
+            const auto t0 = x1 + yy;
+            const auto t1 = t0 * t0;
+            const auto t2 = t1 - xx;
+            const auto t3 = t2 - yyyy;
+            const auto d = t3 + t3;
+            const auto e = xx + xx + xx;
+            const auto f = e * e;
+            const auto t4 = d + d;
+            const auto x3 = f - t4;
+            const auto t6 = d - x3;
+            const auto yyyy2 = yyyy + yyyy;
+            const auto yyyy4 = yyyy2 + yyyy2;
+            const auto yyyy8 = yyyy4 + yyyy4;
+            const auto t9 = e * t6;
+            const auto y3 = t9 - yyyy8;
+            const auto t10 = y1 * z1;
+            const auto z3 = t10 + t10;
+            return {x3, y3, z3};
+        }
     }
     else if constexpr (Curve::A == Curve::FIELD_PRIME - 3)
     {
@@ -411,28 +586,31 @@ constexpr ProjPoint<Curve> dbl(const ProjPoint<Curve>& p) noexcept
 
         const auto zz = z1 * z1;
         const auto yy = y1 * y1;
-        const auto xyy = x1 * yy;
+        auto xyy = x1 * yy;
         const auto t0 = x1 - zz;
         const auto t1 = x1 + zz;
         const auto t2 = t0 * t1;
-        const auto alpha = t2 + t2 + t2;
-        const auto t3 = alpha * alpha;
-        const auto xyy2 = xyy + xyy;
-        const auto xyy4 = xyy2 + xyy2;
-        const auto xyy8 = xyy4 + xyy4;
-        const auto x3 = t3 - xyy8;
+        auto alpha = t2;
+        alpha += t2;               // 2*t2     (in-place)
+        alpha += t2;               // alpha = 3*t2 (in-place)
+        auto x3 = alpha * alpha;   // t3
+        xyy += xyy;               // xyy2     (in-place)
+        xyy += xyy;               // xyy4     (in-place)
+        auto xyy4_save = xyy;     // save for t9
+        xyy += xyy;               // xyy8     (in-place)
+        x3 -= xyy;               // x3 = t3 - xyy8 (in-place)
         const auto t5 = y1 + z1;
-        const auto t6 = t5 * t5;
-        const auto t7 = t6 - yy;
-        const auto z3 = t7 - zz;
-        const auto t9 = xyy4 - x3;
-        const auto yyyy = yy * yy;
-        const auto yyyy2 = yyyy + yyyy;
-        const auto yyyy4 = yyyy2 + yyyy2;
-        const auto yyyy8 = yyyy4 + yyyy4;
-        const auto t12 = alpha * t9;
-        const auto y3 = t12 - yyyy8;
-        return {x3, y3, z3};
+        auto z3 = t5 * t5;       // t6
+        z3 -= yy;                // t7       (in-place)
+        z3 -= zz;                // z3       (in-place)
+        xyy4_save -= x3;         // t9 = xyy4 - x3 (in-place)
+        auto yyyy = yy * yy;
+        yyyy += yyyy;             // yyyy2    (in-place)
+        yyyy += yyyy;             // yyyy4    (in-place)
+        yyyy += yyyy;             // yyyy8    (in-place)
+        alpha *= xyy4_save;          // alpha now = t12 (saves 1 MEMCOPY)
+        alpha -= yyyy;               // y3       (in-place)
+        return {x3, alpha, z3};
     }
     else
     {
@@ -589,13 +767,77 @@ std::array<SignedScalar<typename Curve::uint_type>, 2> decompose(
     // f(v₂) = 0
     static_assert((Curve::X2 + umul(Curve::Y2, Curve::LAMBDA)) % Curve::ORDER == 0);
 
+    // DET is the (v₁, v₂) matrix determinant.
+    static constexpr auto WIDE_DET =
+        umul(Curve::X1, Curve::Y2) + umul(Curve::X2, Curve::MINUS_Y1);
+    static_assert(WIDE_DET <= std::numeric_limits<UIntT>::max());
+    static constexpr auto DET = static_cast<UIntT>(WIDE_DET);
+    static constexpr auto HALF_DET = DET / 2;
+
+#if defined(AIRBENDER) && defined(__riscv)
+    // Barrett reduction constants for replacing expensive udivrem(uint512, uint256).
+    // M = floor(2^512 / DET) = 2^256 + M_LO, where M_LO = floor((2^256-DET)*2^256 / DET).
+    // Only usable when M_LO fits in 256 bits (i.e. DET has full 256-bit width).
+    static constexpr auto BARRETT_GAP = ~DET + UIntT{1};  // 2^256 - DET
+    static constexpr auto BARRETT_M_LO_WIDE =
+        (intx::uint<512>{BARRETT_GAP} << 256) / intx::uint<512>{DET};
+    static constexpr bool BARRETT_FITS =
+        BARRETT_M_LO_WIDE <= std::numeric_limits<UIntT>::max();
+    // Only define M_LO when it fits; otherwise Barrett path is disabled.
+    static constexpr auto BARRETT_M_LO = BARRETT_FITS
+        ? static_cast<UIntT>(BARRETT_M_LO_WIDE) : UIntT{};
+#endif
+
     static constexpr auto round_div = [](const auto& a) noexcept {
-        // DET is the (v₁, v₂) matrix determinant.
-        static constexpr auto WIDE_DET =
-            umul(Curve::X1, Curve::Y2) + umul(Curve::X2, Curve::MINUS_Y1);
-        static_assert(WIDE_DET <= std::numeric_limits<UIntT>::max());
-        static constexpr auto DET = static_cast<UIntT>(WIDE_DET);
-        static constexpr auto HALF_DET = DET / 2;
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (BARRETT_FITS)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                // Barrett reduction: replace expensive udivrem(uint512, uint256) with
+                // one CSR MUL_HIGH (for approximate quotient) + one umul (for correction).
+                //
+                // q_hat = a_hi + MUL_HIGH(a_hi, M_LO) is an approximate quotient
+                // satisfying q_hat <= q_true <= q_hat + 1.
+
+                // Extract upper and lower 256-bit halves of the 512-bit dividend.
+                const auto a_hi = static_cast<UIntT>(a >> 256);
+                const auto a_lo = static_cast<UIntT>(a);
+
+                // Step 1: q_hat = a_hi + MUL_HIGH(a_hi, M_LO)
+                alignas(32) UIntT buf_hi = a_hi;
+                alignas(32) UIntT m_lo_buf = BARRETT_M_LO;
+                {
+                    register uintptr_t r10 asm("x10") =
+                        reinterpret_cast<uintptr_t>(&buf_hi);
+                    register uintptr_t r11 asm("x11") =
+                        reinterpret_cast<uintptr_t>(&m_lo_buf);
+                    register uint32_t r12 asm("x12") = 0x10;  // MUL_HIGH
+                    asm volatile("csrrw x0, 0x7CA, x0"
+                        : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+                }
+                auto q_hat = a_hi + buf_hi;
+
+                // Step 2: Compute diff = a - q_hat * DET (at most 2*DET - 1).
+                // umul uses CSR MUL_LOW+MUL_HIGH on AIRBENDER.
+                const auto product = umul(q_hat, DET);
+                // 512-bit subtract (scalar on rv32im).
+                const auto diff = a - product;
+                auto diff_lo = static_cast<UIntT>(diff);
+
+                // Step 3: Correction. If diff >= DET, q_hat was 1 too low.
+                const bool needs_correction =
+                    static_cast<UIntT>(diff >> 256) != 0 || diff_lo >= DET;
+                if (needs_correction)
+                {
+                    diff_lo -= DET;
+                    q_hat += UIntT{1};
+                }
+
+                return q_hat + UIntT{diff_lo > HALF_DET};
+            }
+        }
+#endif
 
         const auto [wide_q, r] = udivrem(a, DET);
         // Division reduces the quotient enough to fit into a single uint.

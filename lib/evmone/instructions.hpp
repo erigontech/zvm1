@@ -63,6 +63,42 @@ struct TermResult : Result
 
 
 /// Swap two values.
+#if defined(AIRBENDER) && defined(__riscv)
+inline void fast_swap(uint256& x, uint256& y) noexcept
+{
+    // Use BigInt CSR MEMCOPY for 256-bit swap via temp buffer.
+    // 3 CSR calls vs ~32 rv32im instructions for manual word-by-word swap.
+    // Use uninitialized buffer: MEMCOPY overwrites immediately, skip zero-init.
+    // Requires x and y to be 32-byte aligned (stack slots always are).
+    alignas(32) char tmp_raw_[sizeof(uint256)];
+    const uintptr_t pTmp = reinterpret_cast<uintptr_t>(tmp_raw_);
+    const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+    const uintptr_t pY = reinterpret_cast<uintptr_t>(&y);
+
+    // Fused 3-way MEMCOPY swap in a single asm block.
+    // x12 must be re-set before each CSR call (CSR may modify x12).
+    asm volatile(
+        // Step 1: tmp = x
+        "mv x10, %[pTmp]\n\t"
+        "mv x11, %[pX]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // Step 2: x = y
+        "mv x10, %[pX]\n\t"
+        "mv x11, %[pY]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // Step 3: y = tmp
+        "mv x10, %[pY]\n\t"
+        "mv x11, %[pTmp]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [pTmp] "r"(pTmp), [pX] "r"(pX), [pY] "r"(pY)
+        : "x10", "x11", "x12", "memory"
+    );
+}
+#else
 constexpr void fast_swap(uint256& x, uint256& y) noexcept
 {
     // The simple std::swap(stack.top(), stack[N]) is not used to work around
@@ -79,6 +115,7 @@ constexpr void fast_swap(uint256& x, uint256& y) noexcept
     y[2] = t2;
     y[3] = t3;
 }
+#endif
 
 /// Decode DUPN/SWAPN immediate. Returns the stack depth n [17–235],
 /// or std::nullopt if the immediate is in the forbidden range [0x5b–0x7f].
@@ -110,7 +147,14 @@ constexpr auto word_size = 32;
 /// i.e. it rounds up the number bytes to number of words.
 constexpr int64_t num_words(uint64_t size_in_bytes) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // A 32-bit add and shift on rv32im. The sum would wrap only for sizes within 31 bytes of
+    // 4 GiB, and every caller passes a size whose memory check_memory() has already charged for,
+    // which the gas limit keeps orders of magnitude below that.
+    return static_cast<int64_t>(static_cast<uint32_t>(size_in_bytes + 31) >> 5);
+#else
     return static_cast<int64_t>((size_in_bytes + (word_size - 1)) / word_size);
+#endif
 }
 
 /// Computes gas cost of copying the given amount of bytes to/from EVM memory.
@@ -133,15 +177,22 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     // This implementation recomputes memory.size(). This value is already known to the caller
     // and can be passed as a parameter, but this makes no difference to the performance.
 
-    const auto new_words = num_words(new_size);
-    const auto current_words = static_cast<int64_t>(memory.size() / word_size);
-    const auto new_cost = 3 * new_words + new_words * new_words / 512;
-    const auto current_cost = 3 * current_words + current_words * current_words / 512;
-    const auto cost = new_cost - current_cost;
+    // Use unsigned arithmetic to avoid signed division overhead on rv32im.
+    // new_size is at most 2 * max_buffer_size, so the word counts stay below 2^28.
+    const auto new_words = static_cast<uint32_t>((new_size + (word_size - 1)) / word_size);
+    const auto current_words = static_cast<uint32_t>(memory.size() >> 5);  // / 32
+    // The square must be computed in 64 bits: it wraps uint32 once memory crosses
+    // 2MB (65536 words), which turns the cost delta negative-then-huge and OOGs the
+    // frame. On rv32im a 32x32->64 multiply is still a single mul/mulhu pair.
+    const auto new_cost =
+        3 * static_cast<uint64_t>(new_words) + (static_cast<uint64_t>(new_words) * new_words >> 9);  // / 512
+    const auto current_cost =
+        3 * static_cast<uint64_t>(current_words) + (static_cast<uint64_t>(current_words) * current_words >> 9);
+    const auto cost = static_cast<int64_t>(new_cost - current_cost);
 
     gas_left -= cost;
     if (gas_left >= 0) [[likely]]
-        memory.grow(static_cast<size_t>(new_words * word_size));
+        memory.grow(static_cast<size_t>(new_words) * word_size);
     return gas_left;
 }
 
@@ -149,6 +200,26 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
 inline bool check_memory(
     int64_t& gas_left, Memory& memory, const uint256& offset, uint64_t size) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks to avoid 64-bit OR decomposition overhead.
+    // Check that all uint32 words above word[0] are zero (offset fits in 32 bits).
+    const auto* w = reinterpret_cast<const uint32_t*>(&offset);
+    if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
+        return false;
+
+    // offset fits in 32 bits. On rv32, size_t is 32-bit and memory.size() < 2^32.
+    // size is at most max_buffer_size (32-bit). new_size may need 33 bits in theory,
+    // but EVM gas limits keep real memory under ~8MB, so 32-bit is safe in practice.
+    // Use uint64_t for new_size to avoid any theoretical overflow.
+    const auto new_size = static_cast<uint64_t>(w[0]) + size;
+    if (new_size > memory.size())
+    {
+        gas_left = grow_memory(gas_left, memory, new_size);
+        if (gas_left < 0) [[unlikely]]
+            return false;
+    }
+    return true;
+#else
     // TODO: This should be done in intx.
     // There is "branchless" variant of this using | instead of ||, but benchmarks difference
     // is within noise. This should be decided when moving the implementation to intx.
@@ -164,6 +235,7 @@ inline bool check_memory(
     }
 
     return true;
+#endif
 }
 
 /// Check memory requirements for "copy" instructions.
@@ -173,11 +245,18 @@ inline bool check_memory(
     if (size == 0)  // Copy of size 0 is always valid (even if offset is huge).
         return true;
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks to avoid 64-bit OR decomposition overhead.
+    const auto* sw = reinterpret_cast<const uint32_t*>(&size);
+    if ((sw[1] | sw[2] | sw[3] | sw[4] | sw[5] | sw[6] | sw[7]) != 0)
+        return false;
+#else
     // This check has 3 same word checks with the check above.
     // However, compilers do decent although not perfect job unifying common instructions.
     // TODO: This should be done in intx.
     if (((size[3] | size[2] | size[1]) != 0) || (size[0] > max_buffer_size))
         return false;
+#endif
 
     return check_memory(gas_left, memory, offset, static_cast<uint64_t>(size));
 }
@@ -208,23 +287,74 @@ inline constexpr auto invalid = stop_impl<EVMC_INVALID_INSTRUCTION>;
 
 inline void add(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // CSR ADD: *x10 += *x11, result at *x10.
+    // stack[0] = top, stack[1] = below. Result goes into stack[1] (new top after dispatch -1).
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x01;  // ADD
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack.top() += stack.pop();
+#endif
 }
 
 inline void mul(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // CSR MUL_LOW: *x10 = low256(*x10 * *x11), result at *x10.
+    // EVM MUL is mod 2^256 = low word. x10 != x11 (adjacent stack slots).
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x08;  // MUL_LOW
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack.top() *= stack.pop();
+#endif
 }
 
 inline void sub(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // EVM SUB: stack[1] = stack[0] - stack[1].
+    // CSR SUB_AND_NEGATE (0x04): *x10 = *x11 - *x10 (reverse subtraction).
+    // x10 = &stack[1], x11 = &stack[0] → stack[1] = stack[0] - stack[1].
+    // Single CSR call vs previous SUB + MEMCOPY (saves 4 instructions).
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x04;  // SUB_AND_NEGATE
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack[1] = stack[0] - stack[1];
+#endif
 }
 
 inline void div(StackTop stack) noexcept
 {
     auto& v = stack[1];
-    v = v != 0 ? stack[0] / v : 0;
+    if (v == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    // Fast path: if divisor fits in a single 64-bit word (top 3 words are zero),
+    // we can avoid the expensive multi-word Knuth division.
+    if ((v[3] | v[2] | v[1]) == 0)
+    {
+        const auto d = v[0];
+        // Power-of-2 fast path: shift instead of divide.
+        if ((d & (d - 1)) == 0)
+        {
+            const auto shift = static_cast<unsigned>(__builtin_ctzll(d));
+            v = stack[0] >> shift;
+            return;
+        }
+        v = stack[0] / v;
+    }
+    else
+    {
+        v = stack[0] / v;
+    }
 }
 
 inline void sdiv(StackTop stack) noexcept
@@ -236,7 +366,26 @@ inline void sdiv(StackTop stack) noexcept
 inline void mod(StackTop stack) noexcept
 {
     auto& v = stack[1];
-    v = v != 0 ? stack[0] % v : 0;
+    if (v == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    // Fast path: power-of-2 modulus uses bitwise AND.
+    if ((v[3] | v[2] | v[1]) == 0)
+    {
+        const auto d = v[0];
+        if ((d & (d - 1)) == 0)
+        {
+            v = stack[0];
+            v[0] &= (d - 1);
+            v[1] = 0;
+            v[2] = 0;
+            v[3] = 0;
+            return;
+        }
+    }
+    v = stack[0] % v;
 }
 
 inline void smod(StackTop stack) noexcept
@@ -315,7 +464,73 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     if ((gas_left -= additional_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv)
+    // CSR-accelerated binary exponentiation.
+    // We keep result and tmp as fixed aligned buffers and use CSR MUL_LOW + MEMCOPY
+    // to avoid the per-multiply copy overhead of intx::operator*.
+    // Each square: 1 MEMCOPY + 1 MUL_LOW (vs 4 memcpy + 1 MUL_LOW in generic path).
+    // Each multiply-by-base: 1 MUL_LOW (vs 3 memcpy + 1 MUL_LOW in generic path).
+
+    // Handle base == 2 fast path (shift, no CSR benefit).
+    if (base == 2)
+    {
+        exponent = uint256{1} << exponent;
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    // Copy exponent before overwriting with result.
+    alignas(32) uint256 exp_copy = exponent;
+    const auto bw = intx::bit_width(exp_copy);
+
+    if (bw == 0)
+    {
+        // exponent == 0 => result = 1.
+        exponent = 1;
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    // result lives at &exponent (stack top), starts as 1.
+    // base_buf holds the base for multiply steps.
+    alignas(32) uint256 base_buf = base;
+    // Use uninitialized buffer for tmp: MEMCOPY overwrites before any read.
+    alignas(32) char tmp_raw_exp_[sizeof(uint256)];
+    auto& tmp = *reinterpret_cast<uint256*>(tmp_raw_exp_);
+
+    // Initialize result = 1 at &exponent.
+    exponent = 1;
+
+    register uintptr_t r10 asm("x10");
+    register uintptr_t r11 asm("x11");
+    register uint32_t r12 asm("x12");
+
+    for (size_t i = bw; i > 0; --i)
+    {
+        // Square: result = result * result.
+        // Step 1: MEMCOPY tmp = result.
+        r10 = reinterpret_cast<uintptr_t>(&tmp);
+        r11 = reinterpret_cast<uintptr_t>(&exponent);
+        r12 = 0x80;  // MEMCOPY
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+
+        // Step 2: MUL_LOW result = result * tmp.
+        r10 = reinterpret_cast<uintptr_t>(&exponent);
+        r11 = reinterpret_cast<uintptr_t>(&tmp);
+        r12 = 0x08;  // MUL_LOW
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+
+        // Conditional multiply by base.
+        if (intx::bit_test(exp_copy, i - 1))
+        {
+            // MUL_LOW result = result * base_buf.
+            r10 = reinterpret_cast<uintptr_t>(&exponent);
+            r11 = reinterpret_cast<uintptr_t>(&base_buf);
+            r12 = 0x08;  // MUL_LOW
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+        }
+    }
+#else
     exponent = intx::exp(base, exponent);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -324,7 +539,13 @@ inline void signextend(StackTop stack) noexcept
     const auto& ext = stack.pop();
     auto& x = stack.top();
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, check ext < 31 using 32-bit words to avoid constructing uint256{31}.
+    const auto* ew = reinterpret_cast<const uint32_t*>(&ext);
+    if ((ew[1] | ew[2] | ew[3] | ew[4] | ew[5] | ew[6] | ew[7]) == 0 && ew[0] < 31)
+#else
     if (ext < 31)  // For 31 we also don't need to do anything.
+#endif
     {
         const auto e = ext[0];  // uint256 -> uint64.
         const auto sign_word_index =
@@ -354,14 +575,38 @@ inline void signextend(StackTop stack) noexcept
 
 inline void lt(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // LT: is old_top < new_top?
+    // CSR SUB(&old_top, &new_top) → borrow = (old_top < new_top).
+    // old_top is the popped slot (scratch OK). Result → new_top (stack[0] after pop).
+    auto& x = stack.pop();  // non-const: we allow CSR to modify the popped slot.
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&x);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uint32_t r12 asm("x12") = 0x02;  // SUB
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    stack[0] = uint64_t{r12 != 0};  // borrow != 0 means x < stack[0]
+#else
     const auto& x = stack.pop();
     stack[0] = uint64_t{x < stack[0]};
+#endif
 }
 
 inline void gt(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // GT: is new_top < old_top?  (arguments swapped in EVM spec)
+    // CSR SUB(&new_top, &old_top) → borrow = (new_top < old_top).
+    // The popped slot (old_top) is preserved as x11. new_top (stack[0]) is clobbered then overwritten.
+    auto& x = stack.pop();
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&x);
+    register uint32_t r12 asm("x12") = 0x02;  // SUB
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    stack[0] = uint64_t{r12 != 0};  // borrow != 0 means stack[0] < x
+#else
     const auto& x = stack.pop();
     stack[0] = uint64_t{stack[0] < x};  // Arguments are swapped and < is used.
+#endif
 }
 
 inline void slt(StackTop stack) noexcept
@@ -378,32 +623,93 @@ inline void sgt(StackTop stack) noexcept
 
 inline void eq(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    // Stack items are 32-byte aligned — use BigInt CSR EQ directly, no copies.
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[1]);
+    register uint32_t r12 asm("x12") = 0x20;  // EQ
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    stack[1] = uint64_t{r12 != 0};
+#else
     stack[1] = uint64_t{stack[0] == stack[1]};
+#endif
 }
 
 inline void iszero(StackTop stack) noexcept
 {
-    stack.top() = uint64_t{stack.top() == 0};
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks with early exit for the common case.
+    // Most EVM values tested for zero (booleans, counters, addresses) have non-zero
+    // low bits, so checking the low 32-bit word first avoids loading all 8 words.
+    auto& x = stack.top();
+    const auto* w = reinterpret_cast<const uint32_t*>(&x);
+    // Fast path: if any of the low 2 words (first uint64_t) are non-zero,
+    // value is not zero → result is 0.
+    if ((w[0] | w[1]) != 0)
+    {
+        x = 0;
+        return;
+    }
+    // Slow path: low 64 bits are zero, check remaining.
+    const uint32_t upper = w[2] | w[3] | w[4] | w[5] | w[6] | w[7];
+    x = uint64_t{upper == 0};
+#else
+    // Direct word check avoids constructing a uint256{0} for comparison.
+    auto& x = stack.top();
+    x = uint64_t{(x[0] | x[1] | x[2] | x[3]) == 0};
+#endif
 }
 
 inline void and_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // In-place 32-bit word ops: 32 insns vs ~48 for temp+copy via operator&=.
+    auto& y = stack.pop();
+    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
+    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    xw[0] &= yw[0]; xw[1] &= yw[1]; xw[2] &= yw[2]; xw[3] &= yw[3];
+    xw[4] &= yw[4]; xw[5] &= yw[5]; xw[6] &= yw[6]; xw[7] &= yw[7];
+#else
     stack.top() &= stack.pop();
+#endif
 }
 
 inline void or_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    auto& y = stack.pop();
+    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
+    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    xw[0] |= yw[0]; xw[1] |= yw[1]; xw[2] |= yw[2]; xw[3] |= yw[3];
+    xw[4] |= yw[4]; xw[5] |= yw[5]; xw[6] |= yw[6]; xw[7] |= yw[7];
+#else
     stack.top() |= stack.pop();
+#endif
 }
 
 inline void xor_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    auto& y = stack.pop();
+    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
+    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    xw[0] ^= yw[0]; xw[1] ^= yw[1]; xw[2] ^= yw[2]; xw[3] ^= yw[3];
+    xw[4] ^= yw[4]; xw[5] ^= yw[5]; xw[6] ^= yw[6]; xw[7] ^= yw[7];
+#else
     stack.top() ^= stack.pop();
+#endif
 }
 
 inline void not_(StackTop stack) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // In-place inversion: 24 insns vs ~32 for operator~ + assign.
+    auto* w = reinterpret_cast<uint32_t*>(&stack.top());
+    w[0] = ~w[0]; w[1] = ~w[1]; w[2] = ~w[2]; w[3] = ~w[3];
+    w[4] = ~w[4]; w[5] = ~w[5]; w[6] = ~w[6]; w[7] = ~w[7];
+#else
     stack.top() = ~stack.top();
+#endif
 }
 
 inline void byte(StackTop stack) noexcept
@@ -411,7 +717,15 @@ inline void byte(StackTop stack) noexcept
     const auto& n = stack.pop();
     auto& x = stack.top();
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, check if n < 32 using 32-bit words to avoid constructing uint256{32}.
+    // n < 32 iff upper words are all zero and low word < 32.
+    const auto* nw = reinterpret_cast<const uint32_t*>(&n);
+    const bool n_valid =
+        (nw[1] | nw[2] | nw[3] | nw[4] | nw[5] | nw[6] | nw[7]) == 0 && nw[0] < 32;
+#else
     const bool n_valid = n < 32;
+#endif
     const uint64_t byte_mask = (n_valid ? 0xff : 0);
 
     const auto index = 31 - static_cast<unsigned>(n[0] % 32);
@@ -508,18 +822,34 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
+    // if index overflows 32 bits (any high word non-zero → index > any size_t value).
+    const auto* iw = reinterpret_cast<const uint32_t*>(&index);
+    const bool index_overflows_32bit =
+        (iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0;
+    if (index_overflows_32bit || state.msg->input_size <= iw[0])
+#else
     if (state.msg->input_size < index)
+#endif
         index = 0;
     else
     {
         const auto begin = static_cast<size_t>(index);
         const auto end = std::min(begin + 32, state.msg->input_size);
+        const auto len = end - begin;
 
-        uint8_t data[32] = {};
-        for (size_t i = 0; i < (end - begin); ++i)
-            data[i] = state.msg->input_data[begin + i];
-
-        index = intx::be::load<uint256>(data);
+        if (len == 32) [[likely]]
+        {
+            // Fast path: full 32-byte load, skip temporary buffer.
+            index = intx::be::unsafe::load<uint256>(state.msg->input_data + begin);
+        }
+        else
+        {
+            uint8_t data[32] = {};
+            std::memcpy(data, state.msg->input_data + begin, len);
+            index = intx::be::load<uint256>(data);
+        }
     }
 }
 
@@ -817,14 +1147,25 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 /// Internal jump implementation for JUMP/JUMPI instructions.
 inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, use 32-bit word checks: dst must fit in word[0] (32-bit code offsets).
+    const auto* w = reinterpret_cast<const uint32_t*>(&dst);
+    const auto hi_part_is_nonzero = (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0;
+    if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(w[0])) [[unlikely]]
+#else
     const auto hi_part_is_nonzero = (dst[3] | dst[2] | dst[1]) != 0;
     if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(dst[0])) [[unlikely]]
+#endif
     {
         state.status = EVMC_BAD_JUMP_DESTINATION;
         return nullptr;
     }
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    return &state.analysis.baseline->code()[w[0]];
+#else
     return &state.analysis.baseline->code()[static_cast<size_t>(dst[0])];
+#endif
 }
 
 /// JUMP instruction implementation using baseline::CodeAnalysis.
@@ -958,7 +1299,19 @@ template <int N>
 inline void dup(StackTop stack) noexcept
 {
     static_assert(N >= 1 && N <= 16);
+#if defined(AIRBENDER) && defined(__riscv)
+    // Use BigInt CSR MEMCOPY for single-cycle 256-bit copy.
+    // Destination: stack.end() = m_end (the next free slot on the stack).
+    // Source: stack[N-1] = m_end[-N].
+    // Both are 32-byte aligned and in RAM.
+    // The dispatch loop adjusts stack_end separately via stack_height_change (+1 for DUP).
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(stack.end());
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[N - 1]);
+    register uint32_t r12 asm("x12") = 0x80;  // MEMCOPY
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
     stack.push(stack[N - 1]);
+#endif
 }
 
 /// SWAP instruction implementation.

@@ -185,7 +185,7 @@ inline constexpr uint64_t fnv1a_by64(uint64_t h, uint64_t x) noexcept
 /// The "equal to" comparison operator for the evmc::address type.
 inline constexpr bool operator==(const address& a, const address& b) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
     using W = uint32_t;
     const auto aw = reinterpret_cast<const W*>(&a);
     const auto bw = reinterpret_cast<const W*>(&b);
@@ -238,7 +238,7 @@ inline constexpr bool operator>=(const address& a, const address& b) noexcept
 /// The "equal to" comparison operator for the evmc::bytes32 type.
 inline constexpr bool operator==(const bytes32& a, const bytes32& b) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
     using W = size_t;
     const auto aw = reinterpret_cast<const W*>(&a);
     const auto bw = reinterpret_cast<const W*>(&b);
@@ -264,6 +264,16 @@ inline constexpr bool operator!=(const bytes32& a, const bytes32& b) noexcept
 /// The "less than" comparison operator for the evmc::bytes32 type.
 inline constexpr bool operator<(const bytes32& a, const bytes32& b) noexcept
 {
+#if defined(AIRBENDER)
+    // Use 32-bit loads to avoid 64-bit emulation overhead on RV32IM.
+    for (unsigned i = 0; i < 32; i += 4) {
+        const auto aw = load32be(&a.bytes[i]);
+        const auto bw = load32be(&b.bytes[i]);
+        if (aw != bw)
+            return aw < bw;
+    }
+    return false;
+#else
     return load64be(&a.bytes[0]) < load64be(&b.bytes[0]) ||
            (load64be(&a.bytes[0]) == load64be(&b.bytes[0]) &&
             (load64be(&a.bytes[8]) < load64be(&b.bytes[8]) ||
@@ -271,6 +281,7 @@ inline constexpr bool operator<(const bytes32& a, const bytes32& b) noexcept
               (load64be(&a.bytes[16]) < load64be(&b.bytes[16]) ||
                (load64be(&a.bytes[16]) == load64be(&b.bytes[16]) &&
                 load64be(&a.bytes[24]) < load64be(&b.bytes[24]))))));
+#endif
 }
 
 /// The "greater than" comparison operator for the evmc::bytes32 type.
@@ -970,7 +981,12 @@ struct hash<evmc::address>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::address& s) const noexcept
     {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(AIRBENDER)
+        // Use the last uint32_t word directly: keccak-derived addresses have full entropy in any
+        // 32-bit slice, and small ones (precompiles, system contracts) differ in their low bytes.
+        // Saves 4 loads + 5 multiplies.
+        return *reinterpret_cast<const uint32_t*>(&s.bytes[16]);
+#elif defined(SP1TURBO) || defined(SP1)
         using W = uint32_t;
         const auto sw = reinterpret_cast<const W*>(&s);
 
@@ -995,7 +1011,12 @@ struct hash<evmc::bytes32>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::bytes32& s) const noexcept
     {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(AIRBENDER)
+        // Use the last uint32_t word directly: keccak outputs have full entropy in any 32-bit
+        // slice, and small storage keys (slots 0, 1, 2, ...) differ in their low bytes, which
+        // the first word would map to a single bucket. Saves 7 loads + 8 multiplies per lookup.
+        return *reinterpret_cast<const uint32_t*>(&s.bytes[28]);
+#elif defined(SP1TURBO) || defined(SP1)
         using W = size_t;
         const auto sw = reinterpret_cast<const W*>(&s);
 
