@@ -37,6 +37,18 @@ namespace
 ///
 /// @tparam         Op            Instruction opcode.
 /// @param          cost_table    Table of base gas costs.
+/// The stack overflow limit, StackSpace::limit items above stack_bottom. On rv32 the 32 KiB
+/// offset takes lui + add, which GCC rematerializes at every overflow check instead of keeping the
+/// pointer in a register; hiding its value behind an empty asm makes it compute the limit once.
+[[gnu::always_inline]] inline const uint256* stack_limit_of(const uint256* stack_bottom) noexcept
+{
+    const uint256* limit = stack_bottom + StackSpace::limit;
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    asm("" : "+r"(limit));
+#endif
+    return limit;
+}
+
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
@@ -45,7 +57,7 @@ namespace
 ///          or EVMC_SUCCESS if everything is fine.
 template <Opcode Op>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
-    const uint256* stack_top, const uint256* stack_bottom) noexcept
+    const uint256* stack_top, const uint256* stack_bottom, const uint256* stack_limit) noexcept
 {
     static_assert(
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
@@ -76,7 +88,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     {
         static_assert(instr::traits[Op].stack_height_change == 1,
             "unexpected instruction with multiple results");
-        if (INTX_UNLIKELY(stack_top == stack_bottom + StackSpace::limit))
+        if (INTX_UNLIKELY(stack_top == stack_limit))
             return EVMC_STACK_OVERFLOW;
     }
     if constexpr (instr::traits[Op].stack_height_required > 0)
@@ -168,10 +180,11 @@ struct Position
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
-    Position pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position pos, int64_t& gas, ExecutionState& state) noexcept
 {
     // auto starting_gas = gas;
-    const auto status = check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom);
+    const auto status =
+        check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom, stack_limit);
     if (status != EVMC_SUCCESS)
     {
         // if constexpr (TracingEnabled)
@@ -210,6 +223,7 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
     const uint8_t* code, Tracer* tracer = nullptr) noexcept
 {
     const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_limit = stack_limit_of(stack_bottom);
 
     // Code iterator and stack top pointer for interpreter loop.
     Position position{code, stack_bottom};
@@ -234,7 +248,8 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
     case OPCODE:                                                                                \
         ASM_COMMENT(OPCODE);                                                                    \
         if (const auto next =                                                                   \
-                invoke<OPCODE, TracingEnabled>(cost_table, stack_bottom, position, gas, state); \
+                invoke<OPCODE, TracingEnabled>(                                                 \
+                    cost_table, stack_bottom, stack_limit, position, gas, state);               \
             next.code_it == nullptr)                                                            \
         {                                                                                       \
             return gas;                                                                         \
@@ -276,6 +291,7 @@ int64_t dispatch_cgoto(
     // static_assert(std::size(cgoto_table) == 256);
 
     const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_limit = stack_limit_of(stack_bottom);
 
     // Code iterator and stack top pointer for interpreter loop.
     Position position{code, stack_bottom};
@@ -284,7 +300,8 @@ int64_t dispatch_cgoto(
 
 #define ON_OPCODE(OPCODE)                                                                        \
     TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
-    if (const auto next = invoke<OPCODE, false>(cost_table, stack_bottom, position, gas, state); \
+    if (const auto next =                                                                        \
+            invoke<OPCODE, false>(cost_table, stack_bottom, stack_limit, position, gas, state);  \
         next.code_it == nullptr)                                                                 \
     {                                                                                            \
         return gas;                                                                              \
