@@ -842,7 +842,11 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         if (len == 32) [[likely]]
         {
             // Fast path: full 32-byte load, skip temporary buffer.
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+            intx::be::unsafe::load_into(index, state.msg->input_data + begin);
+#else
             index = intx::be::unsafe::load<uint256>(state.msg->input_data + begin);
+#endif
         }
         else
         {
@@ -1112,7 +1116,12 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Reverse the bytes straight into the stack slot.
+    intx::be::unsafe::load_into(index, &state.memory[static_cast<size_t>(index)]);
+#else
     index = intx::be::unsafe::load<uint256>(&state.memory[static_cast<size_t>(index)]);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
