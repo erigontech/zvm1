@@ -29,7 +29,7 @@ struct Curve
         /// The field prime number (P).
         static constexpr auto ORDER =
             0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47_u256;
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1) || defined(SP1TURBO) || defined(ZISK)
         static constexpr bool BN_ACCELERATED = true;
 #endif
     };
