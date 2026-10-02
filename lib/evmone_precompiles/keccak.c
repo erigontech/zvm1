@@ -17,6 +17,102 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     register uint64_t a1 asm("a1") = 0;
     asm volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
+#elif defined(AIRBENDER)
+// File-level static buffer for keccak CSR delegation (256-byte aligned).
+// Shared between syscall_keccak_permute and direct-access optimized paths.
+static uint64_t __attribute__((aligned(256))) buf[32];
+
+// 32-byte-aligned zero source for CSR 0x7CA MEMCOPY-based bulk zeroing.
+// Each MEMCOPY(dst, zeros, 0x80) clears 32 bytes (= 4 uint64_t) in 4 insns,
+// replacing 8 sw-zero stores that the scalar loop emits.
+// Not const: must be in RAM (.bss), not .rodata (ROM), because CSR requires x11 in RAM.
+static uint64_t __attribute__((aligned(32))) keccak_zeros[4] = {0, 0, 0, 0};
+
+/// Zero buf[0..31] (256 bytes) via 8 CSR MEMCOPY calls from keccak_zeros.
+/// Replaces scalar loop (~82 insns: 62 sw + 20 loop overhead) with ~40 insns.
+/// Single asm block keeps x11 (source) pinned across all 8 calls; x10 (dest) advances.
+static inline __attribute__((always_inline))
+void buf_zero_all(void)
+{
+    const unsigned long src = (unsigned long)keccak_zeros;
+    const unsigned long dst = (unsigned long)buf;
+    __asm__ __volatile__(
+        "mv x11, %[src]\n\t"
+        // chunk 0: buf[0..3]
+        "mv x10, %[dst]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 1: buf[4..7]
+        "addi x10, %[dst], 32\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 2: buf[8..11]
+        "addi x10, %[dst], 64\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 3: buf[12..15]
+        "addi x10, %[dst], 96\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 4: buf[16..19]
+        "addi x10, %[dst], 128\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 5: buf[20..23]
+        "addi x10, %[dst], 160\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 6: buf[24..27]
+        "addi x10, %[dst], 192\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        // chunk 7: buf[28..31]
+        "addi x10, %[dst], 224\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [src] "r"(src), [dst] "r"(dst)
+        : "x10", "x11", "x12", "memory"
+    );
+}
+
+/// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting buf[] in place.
+/// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
+/// scans for exactly 649 contiguous csrrw instructions.
+static inline __attribute__((always_inline)) void keccak_permute_buf(void)
+{
+    register uint32_t ctrl __asm__("x10") = 0;
+    register void*    sptr __asm__("x11") = (void*)buf;
+    __asm__ __volatile__(
+        ".rept 649\n"
+        "  csrrw x0, 0x7CB, x0\n"
+        ".endr\n"
+        : "+r"(ctrl)
+        : "r"(sptr)
+        : "memory"
+    );
+}
+
+/// Keccak-f[1600] on any state. keccak() keeps its state in buf[] itself, so once inlined there
+/// the copies fold away; any other state goes through buf[].
+static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_t state[25])
+{
+    int i;
+    if (state != buf)
+    {
+        // Zero buf[25..30] before copying state in.
+        for (i = 25; i < 31; i++)
+            buf[i] = 0;
+        for (i = 0; i < 25; i++)
+            buf[i] = state[i];
+    }
+    keccak_permute_buf();
+    if (state != buf)
+    {
+        for (i = 0; i < 25; i++)
+            state[i] = buf[i];
+    }
+}
 #endif
 
 // Provide __has_attribute macro if not defined.
@@ -111,6 +207,23 @@ static inline ALWAYS_INLINE uint64_t load_le_word(const uint8_t* data)
     __builtin_memcpy(&word, data, sizeof(word));
     return to_le64(word);
 }
+
+#if defined(AIRBENDER)
+/// Loads a 64-bit little-endian integer from any address. load_le_word() may assume 8-byte
+/// alignment on RISC-V; here 4-byte aligned inputs take two word loads (~4 insns), anything
+/// else falls back to the copy, which -mstrict-align lowers byte by byte.
+static inline ALWAYS_INLINE uint64_t load_le_any(const uint8_t* data)
+{
+    if (__builtin_expect(((uintptr_t)data & 3) == 0, 1))
+    {
+        const uint32_t* w = (const uint32_t*)data;
+        return to_le64((uint64_t)w[0] | ((uint64_t)w[1] << 32));
+    }
+    uint64_t word;
+    __builtin_memcpy(&word, data, sizeof(word));
+    return to_le64(word);
+}
+#endif
 
 #if KECCAK_INLINE_STATE_CLEAR
 /// Clears the state with 25 stores.
@@ -433,7 +546,7 @@ static void keccakf1600_generic(uint64_t state[25])
 
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
 /// Not a pointer: GCC will not inline the syscall through one, leaving a call and a return
 /// around the four instructions of the ecall. Nothing selects another implementation here.
 #define keccakf1600_best syscall_keccak_permute
@@ -508,7 +621,12 @@ static inline ALWAYS_INLINE void keccak(
     const size_t hash_size = bits / 8;
     const size_t block_words = (1600 - bits * 2) / 8 / WORD_SIZE;
 
-#if KECCAK_INLINE_STATE_CLEAR
+#if defined(AIRBENDER)
+    // The state is the CSR-aligned static buf[], so every permutation runs in place, without the
+    // state→buf→state copies around the delegation.
+    uint64_t* const state = buf;
+    buf_zero_all();
+#elif KECCAK_INLINE_STATE_CLEAR
     uint64_t state[25];
     clear_state(state);
 #else
@@ -534,6 +652,92 @@ static inline ALWAYS_INLINE void keccak(
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 {
     union ethash_hash256 hash;
+#if defined(AIRBENDER)
+    // For keccak-256: block_size = (1600 - 256*2) / 8 = 136 bytes.
+    // Most EVM inputs are < 136 bytes (single block). Specialize.
+    if (size < 136)
+    {
+        // Direct copy to CSR-aligned buf: skip buf_zero_all() + XOR loop since
+        // XOR-with-zero is identity. Copy data via uint32_t when aligned (~2x faster
+        // than load_le + XOR), then zero only the remaining buf words.
+        {
+            int i;
+            uint32_t* bufW = (uint32_t*)buf;
+            const uint8_t* d = data;
+            size_t remaining = size;
+
+            // Fast path: copy full 4-byte words when data is 4-byte aligned.
+            if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
+            {
+                const uint32_t* dW = (const uint32_t*)d;
+                size_t full_words = remaining / 4;
+                for (size_t j = 0; j < full_words; ++j)
+                    bufW[j] = dW[j];
+                d += full_words * 4;
+                bufW += full_words;
+                remaining -= full_words * 4;
+            }
+            else
+            {
+                // Unaligned: use load_le for full uint64_t chunks.
+                uint64_t* buf_iter = buf;
+                while (remaining >= 8)
+                {
+                    *buf_iter++ = load_le_any(d);
+                    d += 8;
+                    remaining -= 8;
+                }
+                bufW = (uint32_t*)buf_iter;
+            }
+
+            // Handle remaining bytes + padding byte 0x01.
+            uint64_t last_word = 0;
+            uint8_t* lw = (uint8_t*)&last_word;
+            for (i = 0; i < (int)remaining; ++i)
+                lw[i] = d[i];
+            lw[remaining] = 0x01;
+            {
+                // Write last_word at current position (may be uint32_t-misaligned).
+                uint32_t* lwd = (uint32_t*)&last_word;
+                bufW[0] = lwd[0];
+                bufW[1] = lwd[1];
+                bufW += 2;
+            }
+
+            // Zero remaining buf words up to buf[31] (256 bytes total).
+            // Use CSR MEMCOPY when 32-byte aligned, else word stores.
+            {
+                uint32_t* end = (uint32_t*)buf + 64;  // buf[32] uint64_t = 64 uint32_t
+                while (bufW < end)
+                {
+                    if (((uintptr_t)bufW & 31) == 0 && (end - bufW) >= 8)
+                    {
+                        // Inline CSR MEMCOPY (keccak.c has its own; csr_memcopy32 is in mem_builtins).
+                        register uintptr_t a0_ __asm__("x10") = (uintptr_t)bufW;
+                        register uintptr_t a1_ __asm__("x11") = (uintptr_t)keccak_zeros;
+                        register uint32_t  a2_ __asm__("x12") = 0x80;
+                        __asm__ __volatile__("csrrw x0, 0x7CA, x0"
+                            : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+                        bufW += 8;
+                    }
+                    else
+                    {
+                        *bufW++ = 0;
+                    }
+                }
+            }
+
+            buf[16] |= 0x8000000000000000ULL;
+
+            keccak_permute_buf();
+            hash.word64s[0] = to_le64(buf[0]);
+            hash.word64s[1] = to_le64(buf[1]);
+            hash.word64s[2] = to_le64(buf[2]);
+            hash.word64s[3] = to_le64(buf[3]);
+            return hash;
+        }
+    }
+#endif
     keccak(hash.word64s, 256, data, size);
     return hash;
 }
@@ -541,6 +745,28 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
 {
     union ethash_hash256 hash;
+#if defined(AIRBENDER)
+    // Write directly to the CSR-aligned static buffer — skip the state→buf→state copies.
+    {
+        // Bulk-zero buf via CSR MEMCOPY (32 insns) then write data + padding.
+        // Replaces scalar loops (~60 sw + overhead) with 8 CSR calls.
+        buf_zero_all();
+        buf[0] = load_le_any(data);
+        buf[1] = load_le_any(data + 8);
+        buf[2] = load_le_any(data + 16);
+        buf[3] = load_le_any(data + 24);
+        buf[4] = 0x0000000000000001ULL;
+        buf[16] = 0x8000000000000000ULL;
+
+        keccak_permute_buf();
+        hash.word64s[0] = to_le64(buf[0]);
+        hash.word64s[1] = to_le64(buf[1]);
+        hash.word64s[2] = to_le64(buf[2]);
+        hash.word64s[3] = to_le64(buf[3]);
+        return hash;
+    }
+#else
     keccak(hash.word64s, 256, data, 32);
     return hash;
+#endif
 }
