@@ -12,6 +12,8 @@
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 using namespace intx;
@@ -672,6 +674,51 @@ void modexp_sp1(std::span<const uint8_t> base_bytes, std::span<const uint8_t> ex
     const auto offset = 32 - mod_bytes.size();
     std::copy_n(&tmp[offset], mod_bytes.size(), output);
 }
+#elif defined(ZISK)
+void modexp_zisk(std::span<const uint8_t> base_bytes, const Exponent& exp,
+    std::span<const uint8_t> mod_bytes, uint8_t* output) noexcept
+{
+    auto load_u256 = [](std::span<const uint8_t> data) noexcept -> uint256 {
+        uint8_t tmp[32]{};
+        std::ranges::copy(data, &tmp[32 - data.size()]);
+        return intx::be::load<uint256>(tmp);
+    };
+
+    const auto base = load_u256(base_bytes);
+    const auto mod = load_u256(mod_bytes);
+
+    // Precompile outputs must not alias inputs.
+    uint256 r[2];
+    auto* acc = &r[0];
+    auto* tmp = &r[1];
+    const auto mulmod_into = [&mod](const uint256& x, const uint256& y, uint256& out) noexcept {
+        zisk::arith256_mod(&x[0], &y[0], &zisk::kZero256[0], &mod[0], &out[0]);
+    };
+
+    if (mod > 1) [[likely]]
+    {
+        if (exp.empty())
+            *acc = 1;
+        else
+        {
+            *acc = zisk::arith256_mod(base, zisk::kOne256, zisk::kZero256, mod);
+            for (auto i = exp.bit_width() - 1; i != 0; --i)
+            {
+                mulmod_into(*acc, *acc, *tmp);
+                std::swap(acc, tmp);
+                if (exp[i - 1])
+                {
+                    mulmod_into(*acc, base, *tmp);
+                    std::swap(acc, tmp);
+                }
+            }
+        }
+    }
+
+    uint8_t out[32];
+    intx::be::store(out, *acc);
+    std::copy_n(&out[32 - mod_bytes.size()], mod_bytes.size(), output);
+}
 #endif
 }  // namespace
 
@@ -684,6 +731,12 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
     if (std::max(mod_bytes.size(), base_bytes.size()) <= 32)
     {
         modexp_sp1(base_bytes, exp_bytes, mod_bytes, output);
+        return;
+    }
+#elif defined(ZISK)
+    if (std::max(mod_bytes.size(), base_bytes.size()) <= 32)
+    {
+        modexp_zisk(base_bytes, exp, mod_bytes, output);
         return;
     }
 #endif
