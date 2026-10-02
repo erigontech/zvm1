@@ -89,8 +89,22 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
 
     if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
     {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+        // On rv32 the int64 subtract-and-test is 6 instructions. gas_cost is a non-negative
+        // 16-bit table value here, so when the low word of gas_left covers it nothing borrows
+        // from the high word: subtracting from the low word alone is the exact 64-bit result,
+        // which stays non-negative. Only a would-be borrow takes the full 64-bit path.
+        const auto g = static_cast<uint64_t>(gas_left);
+        const auto lo = static_cast<uint32_t>(g);
+        const auto cost = static_cast<uint32_t>(gas_cost);
+        if (lo >= cost) [[likely]]
+            gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | (lo - cost));
+        else if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
+            return EVMC_OUT_OF_GAS;
+#else
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
+#endif
     }
 
     return EVMC_SUCCESS;
