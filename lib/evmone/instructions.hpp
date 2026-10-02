@@ -145,10 +145,16 @@ constexpr auto word_size = 32;
 
 /// Returns number of words what would fit to provided number of bytes,
 /// i.e. it rounds up the number bytes to number of words.
-/// Uses uint32_t shift for rv32im efficiency (sizes are bounded by max_buffer_size).
 constexpr int64_t num_words(uint64_t size_in_bytes) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // A 32-bit add and shift on rv32im. The sum would wrap only for sizes within 31 bytes of
+    // 4 GiB, and every caller passes a size whose memory check_memory() has already charged for,
+    // which the gas limit keeps orders of magnitude below that.
     return static_cast<int64_t>(static_cast<uint32_t>(size_in_bytes + 31) >> 5);
+#else
+    return static_cast<int64_t>((size_in_bytes + (word_size - 1)) / word_size);
+#endif
 }
 
 /// Computes gas cost of copying the given amount of bytes to/from EVM memory.
@@ -172,12 +178,11 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     // and can be passed as a parameter, but this makes no difference to the performance.
 
     // Use unsigned arithmetic to avoid signed division overhead on rv32im.
-    // Memory word counts are always non-negative and bounded by ~8MB/32 < 2^18.
+    // new_size is at most 2 * max_buffer_size, so the word counts stay below 2^28.
     const auto new_words = static_cast<uint32_t>((new_size + (word_size - 1)) / word_size);
     const auto current_words = static_cast<uint32_t>(memory.size() >> 5);  // / 32
-    // The square must be computed in 64 bits: word counts reach 2^18, so the
-    // square reaches 2^36 and wraps uint32 once memory crosses 2MB (65536
-    // words), which turns the cost delta negative-then-huge and OOGs the
+    // The square must be computed in 64 bits: it wraps uint32 once memory crosses
+    // 2MB (65536 words), which turns the cost delta negative-then-huge and OOGs the
     // frame. On rv32im a 32x32->64 multiply is still a single mul/mulhu pair.
     const auto new_cost =
         3 * static_cast<uint64_t>(new_words) + (static_cast<uint64_t>(new_words) * new_words >> 9);  // / 512
