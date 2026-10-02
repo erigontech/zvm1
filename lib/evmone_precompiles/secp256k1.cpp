@@ -17,14 +17,277 @@ constexpr auto B = Curve::Fp{7};
 
 constexpr AffinePoint G{0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256,
     0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8_u256};
+
+/// Precomputed window-8 table: G_TABLE[i] = (i+1)*G for i=0..254.
+/// 255 consteval AffinePoints = 16KB in .rodata.
+/// Window-8 is the sweet spot: ~30 G-additions vs ~128 binary.
+/// Larger windows (12, 15) cause memory access overhead that offsets savings.
+constexpr int G_TABLE_SIZE = 255;
+constexpr unsigned G_WINDOW = 8;
+constexpr unsigned G_WINDOW_MASK = 0xFF;
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint G_TABLE[G_TABLE_SIZE] = {
+#include "secp256k1_g_table_w8.inc"
+};
+
+/// Window-8 MSM using precomputed G-table: computes u*G + v*R.
+ecc::ProjPoint<Curve> msm_with_g_table(
+    const uint256& u, const uint256& v, const AffinePoint& R) noexcept
+{
+    ecc::ProjPoint<Curve> result;
+
+    const auto bit_width = intx::bit_width(u | v);
+    if (bit_width == 0)
+        return result;
+
+    const auto aligned_width =
+        ((bit_width + G_WINDOW - 1) / G_WINDOW) * G_WINDOW;
+
+    for (auto i = aligned_width; i != 0; --i)
+    {
+        result = ecc::dbl(result);
+
+        if (i <= bit_width && intx::bit_test(v, i - 1))
+            result = ecc::add(result, R);
+
+        if (((i - 1) % G_WINDOW) == 0 && i <= bit_width)
+        {
+            const auto shift = i - 1;
+            const auto u_win = static_cast<unsigned>((u >> shift) & G_WINDOW_MASK);
+            if (u_win != 0)
+                result = ecc::add(result, G_TABLE[u_win - 1]);
+        }
+    }
+
+    return result;
+}
+
+/// Precomputed phi(G) = (BETA * G.x, G.y) for GLV endomorphism.
+/// phi(P) = (BETA*P.x, P.y) satisfies phi(P) = [LAMBDA]*P on secp256k1.
+constexpr auto make_phi_g() noexcept
+{
+    const auto beta = Curve::Fp{Curve::BETA};
+    return AffinePoint{beta * G.x, G.y};
+}
+constexpr AffinePoint PHI_G = make_phi_g();
+
+/// Precomputed window-8 table: PHI_G_TABLE[i] = (i+1)*phi(G) for i=0..254.
+/// 255 consteval AffinePoints = 16KB in .rodata.
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint PHI_G_TABLE[G_TABLE_SIZE] = {
+#include "secp256k1_phig_table_w8.inc"
+};
+
+/// Hybrid GLV MSM: computes u1*G + u2*R using precomputed tables for G and phi(G).
+///
+/// Decomposes each 256-bit scalar into two ~128-bit half-scalars via the GLV lattice.
+/// For the G component (u1a*G + u1b*phi(G)), uses precomputed window-8 tables (zero inversions).
+/// For the R component (u2a*R + u2b*phi(R)), uses 2-way Shamir with a 3-entry table (1 inversion).
+/// This saves ~2 field inversions and ~30 field muls vs the previous 15-entry combined table.
+ecc::ProjPoint<Curve> ecrecover_msm_glv(
+    const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
+{
+    using FE = Curve::Fp;
+
+    // 1. Decompose scalars: u1 = k1a + k1b*lambda, u2 = k2a + k2b*lambda
+    auto [sk1a, sk1b] = ecc::decompose<Curve>(u1);
+    auto [sk2a, sk2b] = ecc::decompose<Curve>(u2);
+
+    // 2. Build R-Shamir table for NAF-based Shamir.
+    // Apply signs from decomposition to get P_a = +/-R, P_b = +/-phi(R).
+    const AffinePoint phi_R{FE{Curve::BETA} * R.x, R.y};
+    const AffinePoint P_a = sk2a.sign ? -R : R;
+    const AffinePoint P_b = sk2b.sign ? -phi_R : phi_R;
+    const AffinePoint neg_P_a = -P_a;
+    const AffinePoint neg_P_b = -P_b;
+    // P_a+P_b and P_a-P_b in Jacobian (no inversions needed).
+    const auto P_sum = ecc::add(ecc::ProjPoint<Curve>(P_a), P_b);     // P_a + P_b
+    const auto P_diff = ecc::add(ecc::ProjPoint<Curve>(P_a), neg_P_b);   // P_a - P_b
+    // Precompute negations to avoid constructing temporaries in the hot loop.
+    const auto neg_P_sum = -P_sum;
+    const auto neg_P_diff = -P_diff;
+
+    // 3. Signs for G/phi(G) table lookups -- negation applied per-lookup
+    const bool g_neg = sk1a.sign;
+    const bool phig_neg = sk1b.sign;
+
+    const auto& k1a = sk1a.value;
+    const auto& k1b = sk1b.value;
+    const auto& k2a = sk2a.value;
+    const auto& k2b = sk2b.value;
+
+    // 4. Compute NAF for k2a and k2b, then build joint index array.
+    // NAF digits are in {-1, 0, 1}, encoded as signed int8_t.
+    // Joint index encodes (digit_a, digit_b) as a single byte:
+    //   high nibble = digit_b + 1, low nibble = digit_a + 1
+    //   so 0x00 = (-1,-1), 0x11 = (0,0), 0x22 = (1,1), etc.
+    // But for speed, we use a flat encoding: 3*da + db (shifted by +4 to avoid negatives)
+    // index = (da+1)*3 + (db+1) gives values 0..8 for the 9 combinations.
+    // 0=(−1,−1) 1=(−1,0) 2=(−1,1) 3=(0,−1) 4=(0,0) 5=(0,1) 6=(1,−1) 7=(1,0) 8=(1,1)
+
+    const auto bw = intx::bit_width(k1a | k1b | k2a | k2b);
+    if (bw == 0)
+        return {};
+
+    // Compute NAF for k2a and k2b and build joint index array.
+    // NAF digit rule: if scalar is odd, digit = 2 - (scalar % 4), then scalar -= digit.
+    // Then scalar >>= 1. Uses 32-bit word-level operations for efficiency on RV32.
+    uint8_t r_naf_idx[130];
+    unsigned naf_len = 0;
+    {
+        // Work with 32-bit words directly for 128-bit scalars.
+        uint32_t aw[4], bww[4];
+        {
+            const auto* ka = reinterpret_cast<const uint32_t*>(&k2a);
+            const auto* kb = reinterpret_cast<const uint32_t*>(&k2b);
+            for (int j = 0; j < 4; ++j) { aw[j] = ka[j]; bww[j] = kb[j]; }
+        }
+
+        auto is_zero4 = [](const uint32_t* w) {
+            return (w[0] | w[1] | w[2] | w[3]) == 0;
+        };
+        auto shr1 = [](uint32_t* w) {
+            w[0] = (w[0] >> 1) | (w[1] << 31);
+            w[1] = (w[1] >> 1) | (w[2] << 31);
+            w[2] = (w[2] >> 1) | (w[3] << 31);
+            w[3] = w[3] >> 1;
+        };
+        // Add/sub a small value d to a 128-bit number (d is 1 or 2).
+        // Native 32-bit arithmetic — avoids 64-bit emulation on rv32im.
+        auto add_small = [](uint32_t* w, uint32_t d) {
+            uint32_t sum = w[0] + d;
+            uint32_t c = (sum < w[0]) ? 1u : 0u;
+            w[0] = sum;
+            for (int j = 1; j < 4 && c; ++j) {
+                sum = w[j] + c;
+                c = (sum < w[j]) ? 1u : 0u;
+                w[j] = sum;
+            }
+        };
+        auto sub_small = [](uint32_t* w, uint32_t d) {
+            uint32_t c = (w[0] < d) ? 1u : 0u;
+            w[0] -= d;
+            for (int j = 1; j < 4 && c; ++j) {
+                uint32_t prev = w[j];
+                w[j] -= c;
+                c = (prev < c) ? 1u : 0u;
+            }
+        };
+
+        while (!is_zero4(aw) || !is_zero4(bww))
+        {
+            int8_t da = 0, db = 0;
+            if (aw[0] & 1)
+            {
+                da = static_cast<int8_t>(2 - static_cast<int>(aw[0] & 3));
+                if (da > 0) sub_small(aw, static_cast<uint32_t>(da));
+                else add_small(aw, static_cast<uint32_t>(-da));
+            }
+            if (bww[0] & 1)
+            {
+                db = static_cast<int8_t>(2 - static_cast<int>(bww[0] & 3));
+                if (db > 0) sub_small(bww, static_cast<uint32_t>(db));
+                else add_small(bww, static_cast<uint32_t>(-db));
+            }
+            r_naf_idx[naf_len] = static_cast<uint8_t>((da + 1) * 3 + (db + 1));
+            ++naf_len;
+            shr1(aw);
+            shr1(bww);
+        }
+    }
+
+    // Precompute G-table window values (8-bit windows from k1a and k1b).
+    uint8_t g_wins[32];
+    {
+        const auto* k1a_bytes = reinterpret_cast<const uint8_t*>(&k1a);
+        const auto* k1b_bytes = reinterpret_cast<const uint8_t*>(&k1b);
+        for (unsigned w = 0; w < 16; ++w)
+        {
+            g_wins[w] = k1a_bytes[w];
+            g_wins[w + 16] = k1b_bytes[w];
+        }
+    }
+
+    ecc::ProjPoint<Curve> result;
+
+    // Determine the effective bit width including NAF extension.
+    // Start from effective_bw (not aligned_bw) to skip wasted identity doublings.
+    // The G-window lookups still fire at the right positions: (i-1) % 8 == 0.
+    const auto effective_bw = std::max(static_cast<unsigned>(bw), naf_len);
+
+    for (auto i = effective_bw; i != 0; --i)
+    {
+        result = ecc::dbl(result);
+
+        // R-component: NAF-based Shamir with signed digits.
+        // Note: (i-1) < naf_len implies i <= naf_len <= effective_bw.
+        if ((i - 1) < naf_len)
+        {
+            const auto idx = r_naf_idx[i - 1];
+            // idx encodes (da+1)*3 + (db+1); 4 = (0,0) = no-op
+            // We decode da and db and use the lookup table.
+            // idx: 0=(-1,-1) 1=(-1,0) 2=(-1,1) 3=(0,-1) 4=(0,0) 5=(0,1) 6=(1,-1) 7=(1,0) 8=(1,1)
+            switch (idx)
+            {
+            case 4: break;  // (0,0): no addition
+            case 7: result = ecc::add(result, P_a); break;       // (1,0): +P_a
+            case 1: result = ecc::add(result, neg_P_a); break;   // (-1,0): -P_a
+            case 5: result = ecc::add(result, P_b); break;       // (0,1): +P_b
+            case 3: result = ecc::add(result, neg_P_b); break;   // (0,-1): -P_b
+            case 8: result = ecc::add(result, P_sum); break;     // (1,1): +P_sum (Jac+Jac)
+            case 0: result = ecc::add(result, neg_P_sum); break;   // (-1,-1): -P_sum
+            case 6: result = ecc::add(result, P_diff); break;    // (1,-1): +P_diff (Jac+Jac)
+            case 2: result = ecc::add(result, neg_P_diff); break; // (-1,1): -P_diff
+            }
+        }
+
+        // G-component: window-8 lookup (every 8th bit, for 128-bit scalars = 16 windows).
+        if (((i - 1) & (G_WINDOW - 1)) == 0 && i <= 128)
+        {
+            const auto win_idx = (i - 1) >> 3;  // (i - 1) / 8
+
+            // u1a window -> G_TABLE
+            {
+                const auto u1a_win = static_cast<unsigned>(g_wins[win_idx]);
+                if (u1a_win != 0)
+                {
+                    const auto& pt = G_TABLE[u1a_win - 1];
+                    if (g_neg)
+                        result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                    else
+                        result = ecc::add(result, pt);
+                }
+            }
+
+            // u1b window -> PHI_G_TABLE
+            {
+                const auto u1b_win = static_cast<unsigned>(g_wins[win_idx + 16]);
+                if (u1b_win != 0)
+                {
+                    const auto& pt = PHI_G_TABLE[u1b_win - 1];
+                    if (phig_neg)
+                        result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                    else
+                        result = ecc::add(result, pt);
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 }  // namespace
 
 // FIXME: Change to "uncompress_point".
+__attribute__((flatten))
 std::optional<Curve::Fp> calculate_y(const Curve::Fp& x, bool y_parity) noexcept
 {
     // Calculate y = √(x³ + 7).
-    const auto xxx = x * x * x;
-    const auto opt_y = field_sqrt(xxx + B);
+    auto xxx = x; xxx *= x;    // x^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
+    xxx *= x;                   // x^3 (in-place, saves 1 MEMCOPY vs x * x * x)
+    xxx += B;                   // x^3 + B (in-place, saves 1 MEMCOPY)
+    const auto opt_y = field_sqrt(xxx);
     if (!opt_y.has_value())
         return std::nullopt;
 
@@ -449,8 +712,13 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
         return std::nullopt;
 
     // 6. Calculate public key point Q = u1×G + u2×R.
-    const auto R = AffinePoint{r_mont, *y};
-    const auto Q = msm(u1.value(), G, u2.value(), R);
+    const auto Rpt = AffinePoint{r_mont, *y};
+#if defined(AIRBENDER) && defined(__riscv)
+    // Use GLV endomorphism for 4-way MSM over ~128-bit scalars
+    const auto Q = ecrecover_msm_glv(u1.value(), u2.value(), Rpt);
+#else
+    const auto Q = msm(u1.value(), G, u2.value(), Rpt);
+#endif
 
     // The public key mustn't be the point at infinity. This check is cheaper on a non-affine point.
     if (Q == 0) [[unlikely]]
@@ -556,116 +824,157 @@ std::optional<Curve::Fp> field_sqrt(const Curve::Fp& x) noexcept
     // return     ((x223 << 23 + x22) << 6 + _11) << 2
 
     // Allocate Temporaries.
+#if defined(AIRBENDER) && defined(__riscv)
+    // Uninit buffers avoid dead zero-init of 5 FieldElement vars (40 sw zero).
+    DECL_UNINIT_BUF(Curve::Fp, z);
+    DECL_UNINIT_BUF(Curve::Fp, t0);
+    DECL_UNINIT_BUF(Curve::Fp, t1);
+    DECL_UNINIT_BUF(Curve::Fp, t2);
+    DECL_UNINIT_BUF(Curve::Fp, t3);
+#else
     Curve::Fp z;
     Curve::Fp t0;
     Curve::Fp t1;
     Curve::Fp t2;
     Curve::Fp t3;
+#endif
 
 
     // Step 1: z = x^0x2
-    z = x * x;
+    z = x; z *= x;                 // copy+mul_assign saves 1 MEMCOPY vs operator*
 
     // Step 2: z = x^0x3
-    z = x * z;
+    z *= x;
 
-    // Step 4: t0 = x^0xc
-    t0 = z * z;
-    for (int i = 1; i < 2; ++i)
-        t0 = t0 * t0;
+    // Step 4: t0 = x^0xc  (2 squarings of z)
+#if defined(AIRBENDER) && defined(__riscv)
+    // square_n_assign avoids wrap() overhead (~20 insns/call): no zero-init, no word copy, no return copy.
+    t0 = z; t0.square_n_assign(2);
+#else
+    t0 = z.square_n(2);
+#endif
 
     // Step 5: t0 = x^0xf
-    t0 = z * t0;
+    t0 *= z;
 
     // Step 6: t1 = x^0x1e
-    t1 = t0 * t0;
+    t1 = t0; t1 *= t0;            // copy+mul_assign saves 1 MEMCOPY vs operator*
 
     // Step 7: t2 = x^0x1f
-    t2 = x * t1;
+    t2 = t1; t2 *= x;             // copy+mul_assign saves 1 MEMCOPY vs operator*
 
-    // Step 9: t1 = x^0x7c
-    t1 = t2 * t2;
-    for (int i = 1; i < 2; ++i)
-        t1 = t1 * t1;
+    // Step 9: t1 = x^0x7c  (2 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t1 = t2; t1.square_n_assign(2);
+#else
+    t1 = t2.square_n(2);
+#endif
 
     // Step 10: t1 = x^0x7f
-    t1 = z * t1;
+    t1 *= z;
 
-    // Step 14: t3 = x^0x7f0
-    t3 = t1 * t1;
-    for (int i = 1; i < 4; ++i)
-        t3 = t3 * t3;
+    // Step 14: t3 = x^0x7f0  (4 squarings of t1)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t1; t3.square_n_assign(4);
+#else
+    t3 = t1.square_n(4);
+#endif
 
     // Step 15: t0 = x^0x7ff
-    t0 = t0 * t3;
+    t0 *= t3;
 
-    // Step 26: t3 = x^0x3ff800
-    t3 = t0 * t0;
-    for (int i = 1; i < 11; ++i)
-        t3 = t3 * t3;
+    // Step 26: t3 = x^0x3ff800  (11 squarings of t0)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t0; t3.square_n_assign(11);
+#else
+    t3 = t0.square_n(11);
+#endif
 
     // Step 27: t0 = x^0x3fffff
-    t0 = t0 * t3;
+    t0 *= t3;
 
-    // Step 32: t3 = x^0x7ffffe0
-    t3 = t0 * t0;
-    for (int i = 1; i < 5; ++i)
-        t3 = t3 * t3;
+    // Step 32: t3 = x^0x7ffffe0  (5 squarings of t0)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t0; t3.square_n_assign(5);
+#else
+    t3 = t0.square_n(5);
+#endif
 
     // Step 33: t2 = x^0x7ffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
-    // Step 60: t3 = x^0x3ffffff8000000
-    t3 = t2 * t2;
-    for (int i = 1; i < 27; ++i)
-        t3 = t3 * t3;
+    // Step 60: t3 = x^0x3ffffff8000000  (27 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t2; t3.square_n_assign(27);
+#else
+    t3 = t2.square_n(27);
+#endif
 
     // Step 61: t2 = x^0x3fffffffffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
-    // Step 115: t3 = x^0xfffffffffffffc0000000000000
-    t3 = t2 * t2;
-    for (int i = 1; i < 54; ++i)
-        t3 = t3 * t3;
+    // Step 115: t3 = (54 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t2; t3.square_n_assign(54);
+#else
+    t3 = t2.square_n(54);
+#endif
 
     // Step 116: t2 = x^0xfffffffffffffffffffffffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
-    // Step 224: t3 = x^0xfffffffffffffffffffffffffff000000000000000000000000000
-    t3 = t2 * t2;
-    for (int i = 1; i < 108; ++i)
-        t3 = t3 * t3;
+    // Step 224: t3 = (108 squarings of t2)
+#if defined(AIRBENDER) && defined(__riscv)
+    t3 = t2; t3.square_n_assign(108);
+#else
+    t3 = t2.square_n(108);
+#endif
 
     // Step 225: t2 = x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    t2 = t2 * t3;
+    t2 *= t3;
 
-    // Step 232: t2 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffff80
-    for (int i = 0; i < 7; ++i)
-        t2 = t2 * t2;
+    // Step 232: t2 = (7 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    t2.square_n_assign(7);
+#else
+    t2 = t2.square_n(7);
+#endif
 
     // Step 233: t1 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    t1 = t1 * t2;
+    t1 *= t2;
 
-    // Step 256: t1 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffff800000
-    for (int i = 0; i < 23; ++i)
-        t1 = t1 * t1;
+    // Step 256: t1 = (23 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    t1.square_n_assign(23);
+#else
+    t1 = t1.square_n(23);
+#endif
 
     // Step 257: t0 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
-    t0 = t0 * t1;
+    t0 *= t1;
 
-    // Step 263: t0 = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc0
-    for (int i = 0; i < 6; ++i)
-        t0 = t0 * t0;
+    // Step 263: t0 = (6 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    t0.square_n_assign(6);
+#else
+    t0 = t0.square_n(6);
+#endif
 
     // Step 264: z = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
-    z = z * t0;
+    z *= t0;
 
-    // Step 266: z = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
-    for (int i = 0; i < 2; ++i)
-        z = z * z;
+    // Step 266: z = (2 squarings)
+#if defined(AIRBENDER) && defined(__riscv)
+    z.square_n_assign(2);
+#else
+    z = z.square_n(2);
+#endif
 
-    if (z * z != x)
-        return std::nullopt;  // Computed value is not the square root.
+    {
+        auto zz = z; zz *= z;     // z^2 (copy+mul_assign saves 1 MEMCOPY vs operator*)
+        if (zz != x)
+            return std::nullopt;  // Computed value is not the square root.
+    }
 
     return z;
 }
