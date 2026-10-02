@@ -13,6 +13,8 @@
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 namespace evmone
@@ -274,6 +276,8 @@ inline void addmod(StackTop stack) noexcept
         if (m >= x)  // TODO: untested.
             m -= x;
     }
+#elif defined(ZISK)
+    m = zisk::addmod256(x, y, m);
 #else
     m = intx::addmod(x, y, m);
 #endif
@@ -298,6 +302,8 @@ inline void mulmod(StackTop stack) noexcept
     std::swap(x, m);
     // The result will be in the &m position (now containing x) as expected by EVM.
     sp1::mulmod(m, std::span<const uint256, 2>{&y, 2});
+#elif defined(ZISK)
+    m = zisk::mulmod256(x, y, m);
 #else
     m = intx::mulmod(x, y, m);
 #endif
