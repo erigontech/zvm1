@@ -9,6 +9,8 @@
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 namespace evmone::crypto
@@ -512,7 +514,7 @@ class ModArith
 public:
     constexpr explicit ModArith(const UintT& mod) noexcept
       : mod_{mod},
-#if defined SP1 || defined SP1TURBO
+#if defined SP1 || defined SP1TURBO || defined ZISK
         r_squared_{BN ? 1 : compute_r_squared(mod)},
         mod_inv_{BN ? 0 : compute_mont_mod_inv(mod)}
 #else
@@ -530,7 +532,7 @@ public:
     /// what gives aR²R⁻¹ % mod = aR % mod.
     constexpr UintT to_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO
+#if defined SP1 || defined SP1TURBO || defined ZISK
         if constexpr (BN)
             return x;
         else
@@ -544,7 +546,7 @@ public:
     /// Montgomery multiplication mul(x, 1) what gives aRR⁻¹ % mod = a % mod.
     constexpr UintT from_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO
+#if defined SP1 || defined SP1TURBO || defined ZISK
         if constexpr (BN)
             return x;
         else
@@ -567,6 +569,9 @@ public:
                 reinterpret_cast<size_t*>(&res), reinterpret_cast<const size_t*>(&y));
             return res;
         }
+#elif defined(ZISK)
+        if constexpr (BN)
+            return zisk::mulmod256(x, y, mod_);
 #endif
 
 
