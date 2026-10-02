@@ -18,6 +18,8 @@
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 #if defined(__x86_64__)  // NOLINT(readability-use-concise-preprocessor-directives)
@@ -194,6 +196,10 @@ static bool calc_chunk(uint8_t chunk[CHUNK_SIZE], struct BufferState* state)
         syscall_sha256_compress(w, h_sp1);
         for (j = 0; j < 8; j++)
             h[j] = static_cast<uint32_t>(h_sp1[j]);
+#elif defined(ZISK)
+        zisk::sha256f(h, p);
+        (void)i;
+        (void)j;
 #else
 
         uint32_t ah[8];
