@@ -7,6 +7,8 @@
 
 #if defined(SP1TURBO) || defined(SP1)
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 namespace evmone::crypto::secp256k1
@@ -226,6 +228,18 @@ std::optional<uint256> decompress(const uint256& x, bool y_parity) noexcept
     else
         return sp1_submod(uint256{0}, *y);  // Return (0 - y) mod p
 }
+#elif defined(ZISK)
+
+/// Decompress via a checked sqrt hint; x < p.
+std::optional<uint256> decompress(const uint256& x, bool y_parity) noexcept
+{
+    constexpr auto& P = Curve::FIELD_PRIME;
+    const auto y_squared = zisk::arith256_mod(zisk::mulmod256(x, x, P), x, uint256{7}, P);
+    uint256 y;
+    if (!zisk::secp256k1_fp_sqrt(y_squared, y_parity, y))
+        return std::nullopt;
+    return y;
+}
 #endif
 
 
@@ -236,7 +250,7 @@ evmc::address to_address(const AffinePoint& pt) noexcept
     return to_address(serialized);
 }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
 namespace
 {
 constexpr auto Gx_val = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256;
@@ -463,7 +477,23 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
     RecoveryMode mode) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
+#if defined(ZISK)
+    // Plain-form scalars, checked fcall inverse.
+    constexpr auto& N = Curve::ORDER;
+    const auto r_val = intx::be::unsafe::load<uint256>(r_bytes.data());
+    if (r_val == 0 || r_val >= N)
+        return std::nullopt;
+    const auto s_val = intx::be::unsafe::load<uint256>(s_bytes.data());
+    const auto s_limit = mode == RecoveryMode::strict ? N / 2 + 1 : N;
+    if (s_val == 0 || s_val >= s_limit)
+        return std::nullopt;
+
+    const auto r_inv = zisk::secp256k1_fn_inv(r_val);
+    const auto zr = zisk::mulmod256(intx::be::unsafe::load<uint256>(hash.data()), r_inv, N);
+    const auto u1 = zr == 0 ? zr : N - zr;
+    const auto u2 = zisk::mulmod256(s_val, r_inv, N);
+#else
     // Validate r and s.
     const auto opt_r = Curve::Fr::from_bytes(r_bytes);
     if (!opt_r.has_value() || *opt_r == 0)
@@ -484,6 +514,7 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     assert(u2 != 0);
 
     const auto r_val = r_fr.value();
+#endif
 
     // Point decompression and SP1 point operations.
 #ifdef SP1TURBO
