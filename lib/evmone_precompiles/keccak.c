@@ -17,6 +17,11 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     register uint64_t a1 asm("a1") = 0;
     asm volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
+#elif defined(ZISK)
+static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_t state[25])
+{
+    asm volatile("csrs 0x800, %0" : : "r"(state) : "memory");
+}
 #endif
 
 // Provide __has_attribute macro if not defined.
@@ -433,7 +438,7 @@ static void keccakf1600_generic(uint64_t state[25])
 
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
 /// Not a pointer: GCC will not inline the syscall through one, leaving a call and a return
 /// around the four instructions of the ecall. Nothing selects another implementation here.
 #define keccakf1600_best syscall_keccak_permute
