@@ -1258,6 +1258,46 @@ inline uint64_t load_partial_push_data<4>(code_iterator pos) noexcept
     return intx::be::unsafe::load<uint32_t>(pos);
 }
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Word K (K = 0 is the least significant) of a Len-byte big-endian immediate at d, assembled from
+/// byte loads: code offsets are unaligned, and rv32 has no byte-reverse instruction.
+///
+/// The empty asm keeps GCC's bswap pass from recognising the byte assembly as "unaligned load +
+/// byte swap", which it would then expand back into a longer shift-and-mask sequence (rv32 has no
+/// rev8): 3 instructions per extra byte this way.
+template <size_t Len, size_t K>
+[[gnu::always_inline]] inline uint32_t push_data_word(const uint8_t* d) noexcept
+{
+    constexpr int hi = static_cast<int>(Len) - 4 * static_cast<int>(K) - 1;  // least significant byte
+    constexpr int lo = hi - 3 < 0 ? 0 : hi - 3;
+    uint32_t v = d[lo];
+#pragma GCC unroll 4
+    for (int i = lo + 1; i <= hi; ++i)
+    {
+        asm("" : "+r"(v));
+        v = (v << 8) | d[i];
+    }
+    return v;
+}
+
+/// PUSH instruction implementation for rv32: the generic version below assembles 64-bit words
+/// with byte swaps and 64-bit shifts, all emulated on rv32, after zeroing the whole slot. Here
+/// every 32-bit word of the new slot is stored exactly once.
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    static constexpr size_t NUM_DATA_WORDS = (Len + 3) / 4;
+    auto* const w = reinterpret_cast<uint32_t*>(stack.end());
+    const uint8_t* const d = pos + 1;  // Skip the opcode.
+    [&]<size_t... K>(std::index_sequence<K...>) noexcept {
+        ((w[K] = push_data_word<Len, K>(d)), ...);
+    }(std::make_index_sequence<NUM_DATA_WORDS>{});
+#pragma GCC unroll 8
+    for (size_t k = NUM_DATA_WORDS; k < 8; ++k)
+        w[k] = 0;
+    return d + Len;
+}
+#else
 /// PUSH instruction implementation.
 /// @tparam Len The number of push data bytes, e.g. PUSH3 is push<3>.
 ///
@@ -1292,6 +1332,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
 
     return pos;
 }
+#endif
 
 /// DUP instruction implementation.
 /// @tparam N  The number as in the instruction definition, e.g. DUP3 is dup<3>.
