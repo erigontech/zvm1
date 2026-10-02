@@ -903,6 +903,69 @@ unsigned wnaf5(int8_t* naf, const uint32_t* w) noexcept
     return len;
 }
 
+/// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
+constexpr auto FP_ONE = Curve::Fp::one();
+
+/// p = 2p in place: ecc::dbl()'s a = 0 formula written into p's own coordinates as each one
+/// dies (x after S, z right away as Z' = 2YZ), skipping the copies into the returned point and
+/// back (3 CSR MEMCOPY each way).
+__attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
+{
+    using FE = Curve::Fp;
+    auto& [x1, y1, z1] = p;
+    DECL_FE_COPY(FE, xx, x1); xx *= x1;          // X^2
+    DECL_FE_COPY(FE, yy, y1); yy *= y1;          // Y^2
+    z1 *= y1; z1 += z1;                          // Z' = 2YZ
+    DECL_FE_COPY(FE, yyyy, yy); yyyy *= yy;      // Y^4
+    yy *= x1; yy += yy; yy += yy;                // S = 4XY^2
+    DECL_FE_COPY(FE, m, xx); m += xx; m += xx;   // M = 3X^2
+    x1 = m; x1 *= m;                             // M^2
+    x1 -= yy; x1 -= yy;                          // X' = M^2 - 2S
+    yy -= x1;                                    // S - X'
+    yyyy += yyyy; yyyy += yyyy;                  // 4Y^4
+    y1 = m; y1 *= yy;                            // M(S - X')
+    y1 -= yyyy; y1 -= yyyy;                      // Y' = M(S - X') - 8Y^4
+}
+
+/// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
+/// written into p's own coordinates as each one dies, skipping the copies through the returned
+/// point. Taking the coordinates apart lets a negated table point pass only its new y.
+__attribute__((flatten)) void madd_inplace(
+    ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
+{
+    using FE = Curve::Fp;
+    auto& [x1, y1, z1] = p;
+    if (p == 0)
+    {
+        x1 = x2;
+        y1 = y2;
+        z1 = FP_ONE;
+        return;
+    }
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
+    DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
+    z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
+    h -= x1;                                     // h = u2 - x1
+    DECL_FE_COPY(FE, t1, h); t1 += h;            // 2h
+    DECL_FE_COPY(FE, i, t1); i *= t1;            // i = (2h)^2
+    z1z1 -= y1;                                  // t2 = s2 - y1
+    if (h == 0 && z1z1 == 0) [[unlikely]]
+    {
+        dbl_inplace(p);
+        return;
+    }
+    DECL_FE_COPY(FE, r, z1z1); r += z1z1;        // r = 2 t2
+    DECL_FE_COPY(FE, v, x1); v *= i;             // v = x1 i
+    i *= h;                                      // j = h i
+    x1 = r; x1 *= r;                             // r^2
+    x1 -= i; x1 -= v; x1 -= v;                   // x3 = r^2 - j - 2v
+    v -= x1;                                     // v - x3
+    i *= y1;                                     // y1 j
+    y1 = r; y1 *= v;                             // r (v - x3)
+    y1 -= i; y1 -= i;                            // y3 = r (v - x3) - 2 y1 j
+    z1 *= h; z1 += z1;                           // z3 = 2 z1 h
+}
+
 /// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves).
 /// The G half is ecrecover_msm_glv()'s: window-8 lookups in G_TABLE and PHI_G_TABLE. The R half
 /// adds from the width-5 NAFs of k2a and k2b: ta[0..7] and ta[8..15] hold (2j+1)*P_a and its
@@ -916,21 +979,23 @@ ecc::ProjPoint<Curve> msm_wnaf(const ecc::SignedScalar<uint256>& k1a,
     const auto* const ga = reinterpret_cast<const uint8_t*>(&k1a.value);
     const auto* const gb = reinterpret_cast<const uint8_t*>(&k1b.value);
 
-    ecc::ProjPoint<Curve> result;
-    bool started = false;  // Doubling the point at infinity is a wasted doubling.
+    ecc::ProjPoint<Curve> result;  // The point at infinity.
+    bool started = false;          // Doubling the point at infinity is a wasted doubling.
     for (auto i = top; i-- != 0;)
     {
         if (started)
-            result = ecc::dbl(result);
+            dbl_inplace(result);
 
         if (const int d = naf_a[i]; d != 0)
         {
-            result = ecc::add(result, d > 0 ? ta[d >> 1] : ta[R_TABLE_SIZE + ((-d) >> 1)]);
+            const auto& pt = d > 0 ? ta[d >> 1] : ta[R_TABLE_SIZE + ((-d) >> 1)];
+            madd_inplace(result, pt.x, pt.y);
             started = true;
         }
         if (const int d = naf_b[i]; d != 0)
         {
-            result = ecc::add(result, d > 0 ? tb[d >> 1] : tb[R_TABLE_SIZE + ((-d) >> 1)]);
+            const auto& pt = d > 0 ? tb[d >> 1] : tb[R_TABLE_SIZE + ((-d) >> 1)];
+            madd_inplace(result, pt.x, pt.y);
             started = true;
         }
 
@@ -940,18 +1005,18 @@ ecc::ProjPoint<Curve> msm_wnaf(const ecc::SignedScalar<uint256>& k1a,
             {
                 const auto& pt = G_TABLE[wa - 1];
                 if (k1a.sign)
-                    result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                    madd_inplace(result, pt.x, -pt.y);
                 else
-                    result = ecc::add(result, pt);
+                    madd_inplace(result, pt.x, pt.y);
                 started = true;
             }
             if (const unsigned wb = gb[i / G_WINDOW]; wb != 0)
             {
                 const auto& pt = PHI_G_TABLE[wb - 1];
                 if (k1b.sign)
-                    result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                    madd_inplace(result, pt.x, -pt.y);
                 else
-                    result = ecc::add(result, pt);
+                    madd_inplace(result, pt.x, pt.y);
                 started = true;
             }
         }
@@ -1052,14 +1117,18 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         y2 -= ry[i];  // lambda (x - x2) - y
         two_r[i] = AffinePoint{x2, y2};
 
-        auto p = ecc::add(ecc::ProjPoint<Curve>(AffinePoint{rx[i], ry[i]}), two_r[i]);
+        auto& p = odd[i * M];
+        p.x = rx[i];
+        p.y = ry[i];
+        p.z = FP_ONE;
         for (size_t j = 0;; ++j)
         {
-            odd[i * M + j] = p;
-            odd_z[i * M + j] = p.z;
+            auto& p_j = odd[i * M + j];
+            madd_inplace(p_j, two_r[i].x, two_r[i].y);
+            odd_z[i * M + j] = p_j.z;
             if (j + 1 == M)
                 break;
-            p = ecc::add(p, two_r[i]);
+            odd[i * M + j + 1] = p_j;
         }
     }
     batch_invert(odd_z, odd_prefix, odd_live.get(), n * M);
