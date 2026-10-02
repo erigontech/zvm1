@@ -102,17 +102,26 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
     {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-        // On rv32 the int64 subtract-and-test is 6 instructions. gas_cost is a non-negative
-        // 16-bit table value here, so when the low word of gas_left covers it nothing borrows
-        // from the high word: subtracting from the low word alone is the exact 64-bit result,
-        // which stays non-negative. Only a would-be borrow takes the full 64-bit path.
+        // On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and
+        // test its sign: 2 instructions. gas_cost is a non-negative 16-bit table value here, so
+        // a borrow always leaves the low word negative (at least 2^32 - 2^15). A non-negative
+        // low word therefore borrowed nothing and is the exact 64-bit result, still
+        // non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes the full
+        // 64-bit path, which recovers the borrow from the new low word alone.
         const auto g = static_cast<uint64_t>(gas_left);
-        const auto lo = static_cast<uint32_t>(g);
         const auto cost = static_cast<uint32_t>(gas_cost);
-        if (lo >= cost) [[likely]]
-            gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | (lo - cost));
-        else if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
-            return EVMC_OUT_OF_GAS;
+        auto lo = static_cast<uint32_t>(g) - cost;
+        asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
+        if (static_cast<int32_t>(lo) >= 0) [[likely]]
+            gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
+        else
+        {
+            const auto borrow = static_cast<uint32_t>(lo + cost < cost);
+            const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
+            gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
+            if (INTX_UNLIKELY(gas_left < 0))
+                return EVMC_OUT_OF_GAS;
+        }
 #else
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
