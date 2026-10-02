@@ -866,15 +866,27 @@ void batch_invert(AlignedArray<FE>& v, AlignedArray<FE>& prefix, const uint8_t* 
 /// 1R, 3R, ..., 15R.
 constexpr unsigned R_WNAF_W = 5;
 constexpr size_t R_TABLE_SIZE = size_t{1} << (R_WNAF_W - 2);
-/// Digits of a width-5 NAF of a scalar below 2^128: the carry may add one more.
+/// The signed digit width for the G half: the precomputed odd multiples (2j+1)G and (2j+1)phi(G)
+/// for j < 1024, so 128/13 additions per 128-bit half where window-8 lookups take 16.
+constexpr unsigned G_WNAF_W = 12;
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint G_ODD[size_t{1} << (G_WNAF_W - 2)] = {
+#include "secp256k1_g_odd_w12.inc"
+};
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint PHI_G_ODD[size_t{1} << (G_WNAF_W - 2)] = {
+#include "secp256k1_phig_odd_w12.inc"
+};
+/// Digits of a width-W NAF of a scalar below 2^128: the carry may add one more.
 constexpr unsigned WNAF_LEN = 129;
 
-/// Writes the width-5 NAF of the scalar below 2^128 with 32-bit words w[0..3]: naf[i] is the
-/// digit of 2^i, 0 or odd in [-15, 15], and at least 4 zeros follow each non-zero one, so a
-/// 128-bit scalar has 128/6 non-zero digits on average where its plain NAF has 128/3.
-/// naf must be zeroed (WNAF_LEN digits). Returns the index past the top non-zero digit.
+/// Writes the width-W NAF of the scalar below 2^128 with 32-bit words w[0..3]: naf[i] is the
+/// digit of 2^i, 0 or odd with |naf[i]| < 2^(W-1), and at least W-1 zeros follow each non-zero
+/// one, so a 128-bit scalar has 128/(W+1) non-zero digits on average where its plain NAF has
+/// 128/3. naf must be zeroed (WNAF_LEN digits). Returns the index past the top non-zero digit.
 /// This is libsecp256k1's secp256k1_ecmult_wnaf().
-unsigned wnaf5(int8_t* naf, const uint32_t* w) noexcept
+template <unsigned W, typename Digit>
+unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
 {
     const uint32_t x[6] = {w[0], w[1], w[2], w[3], 0, 0};
     const auto get_bits = [&x](unsigned pos, unsigned count) noexcept {
@@ -893,10 +905,10 @@ unsigned wnaf5(int8_t* naf, const uint32_t* w) noexcept
             ++bit;
             continue;
         }
-        const unsigned now = std::min(R_WNAF_W, WNAF_LEN - bit);
+        const unsigned now = std::min(W, WNAF_LEN - bit);
         const auto word = get_bits(bit, now) + carry;
-        carry = (word >> (R_WNAF_W - 1)) & 1;
-        naf[bit] = static_cast<int8_t>(static_cast<int>(word) - static_cast<int>(carry << R_WNAF_W));
+        carry = (word >> (W - 1)) & 1;
+        naf[bit] = static_cast<Digit>(static_cast<int>(word) - static_cast<int>(carry << W));
         len = bit + 1;
         bit += now;
     }
@@ -966,18 +978,16 @@ __attribute__((flatten)) void madd_inplace(
     z1 *= h; z1 += z1;                           // z3 = 2 z1 h
 }
 
-/// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves).
-/// The G half is ecrecover_msm_glv()'s: window-8 lookups in G_TABLE and PHI_G_TABLE. The R half
-/// adds from the width-5 NAFs of k2a and k2b: ta[0..7] and ta[8..15] hold (2j+1)*P_a and its
-/// negation, P_a = +/-R by the sign of k2a; tb likewise for P_b = +/-phi(R).
-ecc::ProjPoint<Curve> msm_wnaf(const ecc::SignedScalar<uint256>& k1a,
-    const ecc::SignedScalar<uint256>& k1b, const int8_t* naf_a, const int8_t* naf_b,
-    unsigned naf_len, const AffinePoint* ta, const AffinePoint* tb) noexcept
+/// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves), from the
+/// NAFs of the halves: width-12 ones of k1a and k1b (naf_ga, naf_gb) over G_ODD and PHI_G_ODD,
+/// negated by the sign of the half, and width-5 ones of k2a and k2b over ta and tb: ta[0..7] and
+/// ta[8..15] hold (2j+1)*P_a and its negation, P_a = +/-R by the sign of k2a; tb likewise for
+/// P_b = +/-phi(R). naf_len is past the top non-zero digit of all four.
+ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
+    const int16_t* naf_gb, const int8_t* naf_a, const int8_t* naf_b, unsigned naf_len,
+    const AffinePoint* ta, const AffinePoint* tb) noexcept
 {
-    const auto g_bits = static_cast<unsigned>(intx::bit_width(k1a.value | k1b.value));
-    const auto top = std::max(naf_len, g_bits);
-    const auto* const ga = reinterpret_cast<const uint8_t*>(&k1a.value);
-    const auto* const gb = reinterpret_cast<const uint8_t*>(&k1b.value);
+    const auto top = naf_len;
 
     ecc::ProjPoint<Curve> result;  // The point at infinity.
     bool started = false;          // Doubling the point at infinity is a wasted doubling.
@@ -999,26 +1009,23 @@ ecc::ProjPoint<Curve> msm_wnaf(const ecc::SignedScalar<uint256>& k1a,
             started = true;
         }
 
-        if ((i % G_WINDOW) == 0 && i < 128)
+        if (const int d = naf_ga[i]; d != 0)
         {
-            if (const unsigned wa = ga[i / G_WINDOW]; wa != 0)
-            {
-                const auto& pt = G_TABLE[wa - 1];
-                if (k1a.sign)
-                    madd_inplace(result, pt.x, -pt.y);
-                else
-                    madd_inplace(result, pt.x, pt.y);
-                started = true;
-            }
-            if (const unsigned wb = gb[i / G_WINDOW]; wb != 0)
-            {
-                const auto& pt = PHI_G_TABLE[wb - 1];
-                if (k1b.sign)
-                    madd_inplace(result, pt.x, -pt.y);
-                else
-                    madd_inplace(result, pt.x, pt.y);
-                started = true;
-            }
+            const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != neg_ga)
+                madd_inplace(result, pt.x, -pt.y);
+            else
+                madd_inplace(result, pt.x, pt.y);
+            started = true;
+        }
+        if (const int d = naf_gb[i]; d != 0)
+        {
+            const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != neg_gb)
+                madd_inplace(result, pt.x, -pt.y);
+            else
+                madd_inplace(result, pt.x, pt.y);
+            started = true;
         }
     }
     return result;
@@ -1172,12 +1179,15 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
 
         alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
         alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
-        const auto len_a = wnaf5(naf_a, reinterpret_cast<const uint32_t*>(&k2a[i]));
-        const auto len_b = wnaf5(naf_b, reinterpret_cast<const uint32_t*>(&k2b[i]));
+        alignas(4) int16_t naf_ga[WNAF_LEN + 1]{};
+        alignas(4) int16_t naf_gb[WNAF_LEN + 1]{};
+        const auto len_a = wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const uint32_t*>(&k2a[i]));
+        const auto len_b = wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const uint32_t*>(&k2b[i]));
+        const auto len_ga = wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const uint32_t*>(&k1a[i]));
+        const auto len_gb = wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&k1b[i]));
 
-        const ecc::SignedScalar<uint256> s1a{static_cast<bool>(signs[i] & 1), k1a[i]};
-        const ecc::SignedScalar<uint256> s1b{static_cast<bool>((signs[i] >> 1) & 1), k1b[i]};
-        q[i] = msm_wnaf(s1a, s1b, naf_a, naf_b, std::max(len_a, len_b), ta, tb);
+        q[i] = msm_wnaf(signs[i] & 1, (signs[i] >> 1) & 1, naf_ga, naf_gb, naf_a, naf_b,
+            std::max(std::max(len_a, len_b), std::max(len_ga, len_gb)), ta, tb);
         if (q[i] == 0) [[unlikely]]  // The public key mustn't be the point at infinity.
         {
             live[i] = 0;
