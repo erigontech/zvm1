@@ -625,7 +625,27 @@ static inline ALWAYS_INLINE void keccak(
     // The state is the CSR-aligned static buf[], so every permutation runs in place, without the
     // state→buf→state copies around the delegation.
     uint64_t* const state = buf;
-    buf_zero_all();
+    if (size >= block_words * WORD_SIZE && ((uintptr_t)data & 3) == 0)
+    {
+        // The state starts at zero, so absorbing the first block is a copy: store the block and
+        // zero the rest of buf[], rather than zeroing everything (8 CSR MEMCOPY delegations) and
+        // then XOR-ing the block in, which reloads the zero state word by word.
+        const uint32_t* const s = (const uint32_t*)data;
+        uint32_t* const d = (uint32_t*)buf;
+        size_t i;
+#pragma GCC unroll 34
+        for (i = 0; i < 2 * block_words; ++i)
+            d[i] = s[i];
+#pragma GCC unroll 30
+        for (; i < 2 * 32; ++i)
+            d[i] = 0;
+        keccak_permute_buf();
+        // A block is a multiple of 8 bytes, so the rest of the input keeps its alignment.
+        data += block_words * WORD_SIZE;
+        size -= block_words * WORD_SIZE;
+    }
+    else
+        buf_zero_all();
 #elif KECCAK_INLINE_STATE_CLEAR
     uint64_t state[25];
     clear_state(state);
