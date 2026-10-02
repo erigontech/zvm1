@@ -61,7 +61,16 @@ intx::uint256 compute_blob_gas_price(
             // Ensure the multiplication won't overflow 256 bits.
             if (const auto p = intx::umul(numerator_accum, numerator256);
                 p <= std::numeric_limits<intx::uint256>::max())
-                numerator_accum = intx::uint256(p) / (denominator * i);
+            {
+                // denominator * i in 64 bits avoids a uint256 multiplication and division. It is
+                // exact while both fit in 32 bits: EIP-4844 update fractions are ~2^23 and i stays
+                // small.
+                if (denominator <= std::numeric_limits<uint32_t>::max() &&
+                    i <= std::numeric_limits<uint32_t>::max())
+                    numerator_accum = intx::uint256(p) / (static_cast<uint64_t>(i) * denominator);
+                else
+                    numerator_accum = intx::uint256(p) / (denominator * i);
+            }
             else
                 return std::numeric_limits<intx::uint256>::max();
             i += 1;
