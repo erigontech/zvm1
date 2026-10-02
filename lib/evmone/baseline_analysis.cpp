@@ -32,6 +32,37 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
     // executed instruction is a proven cycle. clang needs one more: llvm/llvm-project#217273.
     const auto* const base = reinterpret_cast<const int8_t*>(code.data());
     const auto* const end = base + code.size();
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Test 4 opcodes per bound check: a plain opcode then costs its load and one branch, where
+    // the loop above spends 4 instructions on each. The reads run up to 3 bytes past the end,
+    // into the zero padding of the analysis copy (see analyze_legacy()), and a 0 (STOP) is
+    // neither PUSH nor JUMPDEST, so it only steps the walk past the end.
+    const auto* p = base;
+    // Handle the PUSH or JUMPDEST..PUSH0 opcode op at p + K and step past it (and PUSH data).
+    const auto special = [&]<std::ptrdiff_t K>(int8_t op) noexcept {
+        if (op >= OP_PUSH1)
+            p += std::ptrdiff_t{op} - OP_PUSH1 + 2 + K;
+        else
+        {
+            if (op == OP_JUMPDEST)
+                map.set(static_cast<size_t>(p + K - base));
+            p += K + 1;
+        }
+    };
+    while (p < end)
+    {
+        if (const auto op = p[0]; op >= OP_JUMPDEST)
+            special.operator()<0>(op);
+        else if (const auto op1 = p[1]; op1 >= OP_JUMPDEST)
+            special.operator()<1>(op1);
+        else if (const auto op2 = p[2]; op2 >= OP_JUMPDEST)
+            special.operator()<2>(op2);
+        else if (const auto op3 = p[3]; op3 >= OP_JUMPDEST)
+            special.operator()<3>(op3);
+        else
+            p += 4;
+    }
+#else
     for (const auto* p = base; p < end;)
     {
         const auto op = *p;
@@ -49,6 +80,7 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
         }
         ++p;
     }
+#endif
 }
 
 CodeAnalysis analyze_legacy(bytes_view code)
