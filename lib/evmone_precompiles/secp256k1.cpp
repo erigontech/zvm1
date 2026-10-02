@@ -21,6 +21,8 @@
 
 #if defined(SP1TURBO) || defined(SP1)
 #include <sp1_syscalls.hpp>
+#elif defined(ZISK)
+#include <zisk_precompiles.hpp>
 #endif
 
 namespace evmone::crypto::secp256k1
@@ -486,6 +488,18 @@ std::optional<uint256> decompress(const uint256& x, bool y_parity) noexcept
     else
         return sp1_submod(uint256{0}, *y);  // Return (0 - y) mod p
 }
+#elif defined(ZISK)
+
+/// Decompress via a checked sqrt hint; x < p.
+std::optional<uint256> decompress(const uint256& x, bool y_parity) noexcept
+{
+    constexpr auto& P = Curve::FIELD_PRIME;
+    const auto y_squared = zisk::arith256_mod(zisk::mulmod256(x, x, P), x, uint256{7}, P);
+    uint256 y;
+    if (!zisk::secp256k1_fp_sqrt(y_squared, y_parity, y))
+        return std::nullopt;
+    return y;
+}
 #endif
 
 
@@ -496,7 +510,7 @@ evmc::address to_address(const AffinePoint& pt) noexcept
     return to_address(serialized);
 }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
 namespace
 {
 constexpr auto Gx_val = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256;
@@ -665,7 +679,9 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     }
 }
 
-#ifndef SP1TURBO
+// GLV/SP1-only machinery below: sp1_mulmod (Sp1MulMod) is SP1-only, so exclude ZisK, which
+// reuses the shared sp1_msm point ops but inverts scalars on its own fn_inv fcall.
+#if defined(SP1) && !defined(SP1TURBO)
 // GLV endomorphism: phi(x, y) = (BETA * x, y) = LAMBDA * (x, y). A scalar splits as
 // k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (see GLV_G1), so u*G + v*Q becomes four
 // half-length scalars sharing one run of 128 doublings.
@@ -1055,7 +1071,43 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
     RecoveryMode mode) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(ZISK)
+    // Plain-form scalars, checked fcall inverse.
+    constexpr auto& N = Curve::ORDER;
+    const auto r_val = intx::be::unsafe::load<uint256>(r_bytes.data());
+    if (r_val == 0 || r_val >= N)
+        return std::nullopt;
+    const auto s_val = intx::be::unsafe::load<uint256>(s_bytes.data());
+    const auto s_limit = mode == RecoveryMode::strict ? N / 2 + 1 : N;
+    if (s_val == 0 || s_val >= s_limit)
+        return std::nullopt;
+
+    const auto r_inv = zisk::secp256k1_fn_inv(r_val);
+    const auto zr = zisk::mulmod256(intx::be::unsafe::load<uint256>(hash.data()), r_inv, N);
+    const auto u1 = zr == 0 ? zr : N - zr;
+    const auto u2 = zisk::mulmod256(s_val, r_inv, N);
+
+    // Point decompression and ZisK point operations (SP1-shaped shims).
+    const auto y = decompress(r_val, parity);
+    if (!y.has_value())
+        return std::nullopt;
+    uint8_t sp1_Rbytes[64]{};
+    intx::be::unsafe::store(&sp1_Rbytes[0], r_val);
+    intx::be::unsafe::store(&sp1_Rbytes[32], *y);
+    sp1_AffinePoint sp1_R;
+    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
+
+    // Shamir's trick: compute u1*G + u2*R in a single pass
+    sp1_AffinePoint sp1_Q;
+    sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
+
+    if (is_zero(sp1_Q)) [[unlikely]]
+        return std::nullopt;
+
+    uint8_t serialized[64];
+    sp1_point_to_bytes(serialized, sp1_Q);
+    return to_address(serialized);
+#elif defined(SP1TURBO) || defined(SP1)
     uint256 r, s;
     if (!parse_signature(r_bytes, s_bytes, mode, r, s))
         return std::nullopt;
