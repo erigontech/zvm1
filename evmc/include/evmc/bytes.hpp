@@ -26,7 +26,10 @@ struct byte_traits : std::char_traits<char>
     /// Assigns value to each byte in [ptr, ptr+count).
     static constexpr char_type* assign(char_type* ptr, std::size_t count, char_type value)
     {
-        std::fill_n(ptr, count, value);
+        if (__builtin_is_constant_evaluated())
+            std::fill_n(ptr, count, value);
+        else
+            std::memset(ptr, static_cast<int>(value), count);
         return ptr;
     }
 
@@ -39,31 +42,48 @@ struct byte_traits : std::char_traits<char>
     /// Copies count bytes from src to dest. Performs correctly even if ranges overlap.
     static constexpr char_type* move(char_type* dest, const char_type* src, std::size_t count)
     {
-        if (dest < src)
-            std::copy_n(src, count, dest);
-        else if (src < dest)
-            std::copy_backward(src, src + count, dest + count);
+        if (__builtin_is_constant_evaluated())
+        {
+            if (dest < src)
+                std::copy_n(src, count, dest);
+            else if (src < dest)
+                std::copy_backward(src, src + count, dest + count);
+        }
+        else
+        {
+            std::memmove(dest, src, count);
+        }
         return dest;
     }
 
     /// Copies count bytes from src to dest. The ranges must not overlap.
     static constexpr char_type* copy(char_type* dest, const char_type* src, std::size_t count)
     {
-        std::copy_n(src, count, dest);
+        if (__builtin_is_constant_evaluated())
+            std::copy_n(src, count, dest);
+        else
+            std::memcpy(dest, src, count);
         return dest;
     }
 
     /// Compares lexicographically the bytes in two ranges of equal length.
     static constexpr int compare(const char_type* a, const char_type* b, std::size_t count)
     {
-        for (; count != 0; --count, ++a, ++b)
+        if (__builtin_is_constant_evaluated())
         {
-            if (lt(*a, *b))
-                return -1;
-            if (lt(*b, *a))
-                return 1;
+            for (; count != 0; --count, ++a, ++b)
+            {
+                if (lt(*a, *b))
+                    return -1;
+                if (lt(*b, *a))
+                    return 1;
+            }
+            return 0;
         }
-        return 0;
+        else
+        {
+            return std::memcmp(a, b, count);
+        }
     }
 
     /// Returns the length of a null-terminated byte string.
