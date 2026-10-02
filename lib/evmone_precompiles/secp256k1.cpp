@@ -861,6 +861,103 @@ void batch_invert(AlignedArray<FE>& v, AlignedArray<FE>& prefix, const uint8_t* 
         i = j;
     }
 }
+
+/// The signed digit width for the R half of the batched MSM, and its table of odd multiples
+/// 1R, 3R, ..., 15R.
+constexpr unsigned R_WNAF_W = 5;
+constexpr size_t R_TABLE_SIZE = size_t{1} << (R_WNAF_W - 2);
+/// Digits of a width-5 NAF of a scalar below 2^128: the carry may add one more.
+constexpr unsigned WNAF_LEN = 129;
+
+/// Writes the width-5 NAF of the scalar below 2^128 with 32-bit words w[0..3]: naf[i] is the
+/// digit of 2^i, 0 or odd in [-15, 15], and at least 4 zeros follow each non-zero one, so a
+/// 128-bit scalar has 128/6 non-zero digits on average where its plain NAF has 128/3.
+/// naf must be zeroed (WNAF_LEN digits). Returns the index past the top non-zero digit.
+/// This is libsecp256k1's secp256k1_ecmult_wnaf().
+unsigned wnaf5(int8_t* naf, const uint32_t* w) noexcept
+{
+    const uint32_t x[6] = {w[0], w[1], w[2], w[3], 0, 0};
+    const auto get_bits = [&x](unsigned pos, unsigned count) noexcept {
+        const unsigned wi = pos / 32;
+        const unsigned sh = pos % 32;
+        const uint64_t v = (uint64_t{x[wi + 1]} << 32 | x[wi]) >> sh;
+        return static_cast<uint32_t>(v) & ((uint32_t{1} << count) - 1);
+    };
+    unsigned bit = 0;
+    unsigned len = 0;
+    uint32_t carry = 0;
+    while (bit < WNAF_LEN)
+    {
+        if (((x[bit / 32] >> (bit % 32)) & 1) == carry)
+        {
+            ++bit;
+            continue;
+        }
+        const unsigned now = std::min(R_WNAF_W, WNAF_LEN - bit);
+        const auto word = get_bits(bit, now) + carry;
+        carry = (word >> (R_WNAF_W - 1)) & 1;
+        naf[bit] = static_cast<int8_t>(static_cast<int>(word) - static_cast<int>(carry << R_WNAF_W));
+        len = bit + 1;
+        bit += now;
+    }
+    return len;
+}
+
+/// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves).
+/// The G half is ecrecover_msm_glv()'s: window-8 lookups in G_TABLE and PHI_G_TABLE. The R half
+/// adds from the width-5 NAFs of k2a and k2b: ta[0..7] and ta[8..15] hold (2j+1)*P_a and its
+/// negation, P_a = +/-R by the sign of k2a; tb likewise for P_b = +/-phi(R).
+ecc::ProjPoint<Curve> msm_wnaf(const ecc::SignedScalar<uint256>& k1a,
+    const ecc::SignedScalar<uint256>& k1b, const int8_t* naf_a, const int8_t* naf_b,
+    unsigned naf_len, const AffinePoint* ta, const AffinePoint* tb) noexcept
+{
+    const auto g_bits = static_cast<unsigned>(intx::bit_width(k1a.value | k1b.value));
+    const auto top = std::max(naf_len, g_bits);
+    const auto* const ga = reinterpret_cast<const uint8_t*>(&k1a.value);
+    const auto* const gb = reinterpret_cast<const uint8_t*>(&k1b.value);
+
+    ecc::ProjPoint<Curve> result;
+    bool started = false;  // Doubling the point at infinity is a wasted doubling.
+    for (auto i = top; i-- != 0;)
+    {
+        if (started)
+            result = ecc::dbl(result);
+
+        if (const int d = naf_a[i]; d != 0)
+        {
+            result = ecc::add(result, d > 0 ? ta[d >> 1] : ta[R_TABLE_SIZE + ((-d) >> 1)]);
+            started = true;
+        }
+        if (const int d = naf_b[i]; d != 0)
+        {
+            result = ecc::add(result, d > 0 ? tb[d >> 1] : tb[R_TABLE_SIZE + ((-d) >> 1)]);
+            started = true;
+        }
+
+        if ((i % G_WINDOW) == 0 && i < 128)
+        {
+            if (const unsigned wa = ga[i / G_WINDOW]; wa != 0)
+            {
+                const auto& pt = G_TABLE[wa - 1];
+                if (k1a.sign)
+                    result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                else
+                    result = ecc::add(result, pt);
+                started = true;
+            }
+            if (const unsigned wb = gb[i / G_WINDOW]; wb != 0)
+            {
+                const auto& pt = PHI_G_TABLE[wb - 1];
+                if (k1b.sign)
+                    result = ecc::add(result, AffinePoint{pt.x, -pt.y});
+                else
+                    result = ecc::add(result, pt);
+                started = true;
+            }
+        }
+    }
+    return result;
+}
 }  // namespace
 #endif
 
@@ -902,13 +999,116 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
 
     batch_invert(r_inv, fr_prefix, live.get(), n);  // r is in [1, n) and n is prime.
 
+    // Split u1 and u2 by the endomorphism, and start on 2R in affine: lambda = 3x^2 / 2y needs
+    // 1/(2y), batched (y != 0: secp256k1 has no point of order 2).
+    AlignedArray<uint256> k1a(n), k1b(n), k2a(n), k2b(n);
+    const std::unique_ptr<uint8_t[]> signs{new uint8_t[n]};
+    AlignedArray<Fp> t(n);
     for (size_t i = 0; i < n; ++i)
     {
         if (!live[i])
             continue;
         const auto u1 = -z[i] * r_inv[i];
         const auto u2 = s[i] * r_inv[i];
-        q[i] = ecrecover_msm_glv(u1.value(), u2.value(), AffinePoint{rx[i], ry[i]});
+        const auto [a1, b1] = ecc::decompose<Curve>(u1.value());
+        const auto [a2, b2] = ecc::decompose<Curve>(u2.value());
+        k1a[i] = a1.value;
+        k1b[i] = b1.value;
+        k2a[i] = a2.value;
+        k2b[i] = b2.value;
+        signs[i] = static_cast<uint8_t>(a1.sign | b1.sign << 1 | a2.sign << 2 | b2.sign << 3);
+        t[i] = ry[i];
+        t[i] += ry[i];
+    }
+    batch_invert(t, fp_prefix, live.get(), n);
+
+    // The odd multiples 3R..15R: 2R in affine, then 7 mixed additions in Jacobian coordinates,
+    // their z batched into one inversion for the whole block. No addition can hit P == +/-Q:
+    // that needs (j +/- 2)R = 0 for some j <= 13, below the (prime) group order.
+    constexpr size_t M = R_TABLE_SIZE - 1;
+    AlignedArray<AffinePoint> two_r(n);
+    AlignedArray<ecc::ProjPoint<Curve>> odd(n * M);
+    AlignedArray<Fp> odd_z(n * M), odd_prefix(n * M);
+    const std::unique_ptr<uint8_t[]> odd_live{new uint8_t[n * M]};
+    for (size_t i = 0; i < n; ++i)
+    {
+        for (size_t j = 0; j < M; ++j)
+            odd_live[i * M + j] = live[i];
+        if (!live[i])
+            continue;
+        auto lambda = rx[i];
+        lambda *= rx[i];
+        const auto xx = lambda;
+        lambda += xx;
+        lambda += xx;
+        lambda *= t[i];  // 3x^2 / 2y
+        auto x2 = lambda;
+        x2 *= lambda;
+        x2 -= rx[i];
+        x2 -= rx[i];  // lambda^2 - 2x
+        auto y2 = rx[i];
+        y2 -= x2;
+        y2 *= lambda;
+        y2 -= ry[i];  // lambda (x - x2) - y
+        two_r[i] = AffinePoint{x2, y2};
+
+        auto p = ecc::add(ecc::ProjPoint<Curve>(AffinePoint{rx[i], ry[i]}), two_r[i]);
+        for (size_t j = 0;; ++j)
+        {
+            odd[i * M + j] = p;
+            odd_z[i * M + j] = p.z;
+            if (j + 1 == M)
+                break;
+            p = ecc::add(p, two_r[i]);
+        }
+    }
+    batch_invert(odd_z, odd_prefix, odd_live.get(), n * M);
+
+    const auto beta = Fp{Curve::BETA};
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        // ta: (2j+1)*P_a then the negations, P_a = +/-R; tb likewise for P_b = +/-phi(R).
+        alignas(32) std::byte ta_raw[2 * R_TABLE_SIZE * sizeof(AffinePoint)];
+        alignas(32) std::byte tb_raw[2 * R_TABLE_SIZE * sizeof(AffinePoint)];
+        auto* const ta = reinterpret_cast<AffinePoint*>(ta_raw);
+        auto* const tb = reinterpret_cast<AffinePoint*>(tb_raw);
+        const bool neg_a = (signs[i] >> 2) & 1;
+        const bool neg_b = (signs[i] >> 3) & 1;
+        const auto put = [&](size_t j, const Fp& x, const Fp& y) noexcept {
+            const auto ny = -y;
+            auto bx = x;
+            bx *= beta;
+            new (&ta[j]) AffinePoint{x, neg_a ? ny : y};
+            new (&ta[R_TABLE_SIZE + j]) AffinePoint{x, neg_a ? y : ny};
+            new (&tb[j]) AffinePoint{bx, neg_b ? ny : y};
+            new (&tb[R_TABLE_SIZE + j]) AffinePoint{bx, neg_b ? y : ny};
+        };
+        put(0, rx[i], ry[i]);
+        for (size_t j = 1; j < R_TABLE_SIZE; ++j)
+        {
+            // to_affine() with the batched z_inv.
+            const auto& q_j = odd[i * M + j - 1];
+            const auto& z_inv = odd_z[i * M + j - 1];
+            auto zz_inv = z_inv;
+            zz_inv *= z_inv;
+            auto x = q_j.x;
+            x *= zz_inv;
+            zz_inv *= z_inv;
+            auto y = q_j.y;
+            y *= zz_inv;
+            put(j, x, y);
+        }
+
+        alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
+        alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
+        const auto len_a = wnaf5(naf_a, reinterpret_cast<const uint32_t*>(&k2a[i]));
+        const auto len_b = wnaf5(naf_b, reinterpret_cast<const uint32_t*>(&k2b[i]));
+
+        const ecc::SignedScalar<uint256> s1a{static_cast<bool>(signs[i] & 1), k1a[i]};
+        const ecc::SignedScalar<uint256> s1b{static_cast<bool>((signs[i] >> 1) & 1), k1b[i]};
+        q[i] = msm_wnaf(s1a, s1b, naf_a, naf_b, std::max(len_a, len_b), ta, tb);
         if (q[i] == 0) [[unlikely]]  // The public key mustn't be the point at infinity.
         {
             live[i] = 0;
