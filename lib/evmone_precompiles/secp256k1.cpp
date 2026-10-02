@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "secp256k1.hpp"
 #include "keccak.hpp"
+#include <memory>
+#include <new>
+#include <type_traits>
 
 #if defined(SP1TURBO) || defined(SP1)
 #include <sp1_syscalls.hpp>
@@ -790,6 +793,150 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
         return std::nullopt;
 
     return to_address(*pubkey);
+#endif
+}
+
+#if defined(AIRBENDER) && defined(__riscv)
+namespace
+{
+/// n default-constructed elements in 32-byte aligned storage: the BigInt CSR paths of the field
+/// arithmetic need aligned operands, and the guest's allocator only guarantees 8 bytes.
+template <typename T>
+class AlignedArray
+{
+    static_assert(std::is_trivially_destructible_v<T>);
+    std::unique_ptr<std::byte[]> raw_;
+    T* p_;
+
+public:
+    explicit AlignedArray(size_t n) : raw_{new std::byte[n * sizeof(T) + 32]}
+    {
+        p_ = reinterpret_cast<T*>(
+            (reinterpret_cast<uintptr_t>(raw_.get()) + 31) & ~static_cast<uintptr_t>(31));
+        for (size_t i = 0; i < n; ++i)
+            new (&p_[i]) T{};
+    }
+    T& operator[](size_t i) noexcept { return p_[i]; }
+};
+
+/// Replaces v[i] by its inverse for every i with live[i], using one field inversion
+/// (Montgomery's trick). The live elements must be non-zero; prefix is scratch of the same size.
+template <typename FE>
+void batch_invert(AlignedArray<FE>& v, AlignedArray<FE>& prefix, const uint8_t* live, size_t n)
+{
+    size_t last = n;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        prefix[i] = v[i];
+        if (last != n)
+            prefix[i] *= prefix[last];
+        last = i;
+    }
+    if (last == n)
+        return;
+    auto inv = 1 / prefix[last];  // The inverse of the product of all live elements.
+    for (size_t i = last;;)
+    {
+        size_t j = i;
+        bool has_prev = false;
+        while (j != 0)
+        {
+            if (live[--j])
+            {
+                has_prev = true;
+                break;
+            }
+        }
+        if (!has_prev)
+        {
+            v[i] = inv;
+            return;
+        }
+        const auto vi = v[i];
+        v[i] = inv;
+        v[i] *= prefix[j];  // (v_0..v_i)^-1 * (v_0..v_j) = v_i^-1
+        inv *= vi;          // Now (v_0..v_j)^-1.
+        i = j;
+    }
+}
+}  // namespace
+#endif
+
+void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional<evmc::address>> out,
+    RecoveryMode mode) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    // The steps of secp256k1_ecdsa_recover() per signature, with its two inversions batched.
+    using Fr = Curve::Fr;
+    using Fp = Curve::Fp;
+    const size_t n = in.size();
+    AlignedArray<Fr> r_inv(n), fr_prefix(n), s(n), z(n);
+    AlignedArray<Fp> rx(n), ry(n), qz(n), fp_prefix(n);
+    AlignedArray<ecc::ProjPoint<Curve>> q(n);
+    const std::unique_ptr<uint8_t[]> live{new uint8_t[n]};
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        out[i] = std::nullopt;
+        live[i] = 0;
+        const auto opt_r = Fr::from_bytes(in[i].r);
+        if (!opt_r.has_value() || *opt_r == 0) [[unlikely]]
+            continue;
+        const auto opt_s = mode == RecoveryMode::strict ? Fr::from_bytes<Fr::Range::half>(in[i].s) :
+                                                          Fr::from_bytes<Fr::Range::full>(in[i].s);
+        if (!opt_s.has_value() || *opt_s == 0) [[unlikely]]
+            continue;
+        const auto r_mont = Fp{opt_r->value()};
+        const auto y = calculate_y(r_mont, in[i].parity);
+        if (!y.has_value()) [[unlikely]]
+            continue;
+        r_inv[i] = *opt_r;
+        s[i] = *opt_s;
+        z[i] = Fr{intx::be::unsafe::load<uint256>(in[i].hash.data())};
+        rx[i] = r_mont;
+        ry[i] = *y;
+        live[i] = 1;
+    }
+
+    batch_invert(r_inv, fr_prefix, live.get(), n);  // r is in [1, n) and n is prime.
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        const auto u1 = -z[i] * r_inv[i];
+        const auto u2 = s[i] * r_inv[i];
+        q[i] = ecrecover_msm_glv(u1.value(), u2.value(), AffinePoint{rx[i], ry[i]});
+        if (q[i] == 0) [[unlikely]]  // The public key mustn't be the point at infinity.
+        {
+            live[i] = 0;
+            continue;
+        }
+        qz[i] = q[i].z;
+    }
+
+    batch_invert(qz, fp_prefix, live.get(), n);  // Z != 0 for every remaining point.
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        // to_affine() with the batched z_inv.
+        auto zz_inv = qz[i];
+        zz_inv *= qz[i];
+        auto zzz_inv = zz_inv;
+        zzz_inv *= qz[i];
+        auto x = q[i].x;
+        x *= zz_inv;
+        auto y = q[i].y;
+        y *= zzz_inv;
+        out[i] = to_address(AffinePoint{x, y});
+    }
+#else
+    for (size_t i = 0; i < in.size(); ++i)
+        out[i] = ecrecover(in[i].hash, in[i].r, in[i].s, in[i].parity, mode);
 #endif
 }
 

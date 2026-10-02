@@ -7,6 +7,7 @@
 #include "hash_types.h"
 #include <evmc/evmc.hpp>
 #include <optional>
+#include <span>
 
 namespace evmone::crypto::secp256k1
 {
@@ -95,6 +96,22 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
 /// TODO: Make strict mode the default.
 std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
+    RecoveryMode mode = RecoveryMode::malleable) noexcept;
+
+/// One signature of an ecrecover_batch() call.
+struct EcrecoverInput
+{
+    std::span<const uint8_t, 32> hash;
+    std::span<const uint8_t, 32> r;
+    std::span<const uint8_t, 32> s;
+    bool parity;
+};
+
+/// Sets out[i] to ecrecover() of in[i]. On AIRBENDER the two field inversions each signature
+/// needs (r^-1 mod n, and the projective Z^-1 mod p of the recovered point) are shared by the
+/// whole batch with Montgomery's trick: one Fermat inversion per field plus 3 multiplications
+/// per signature. Elsewhere this calls ecrecover() for each signature.
+void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional<evmc::address>> out,
     RecoveryMode mode = RecoveryMode::malleable) noexcept;
 
 }  // namespace evmone::crypto::secp256k1
