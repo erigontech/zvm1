@@ -117,7 +117,25 @@ public:
 
             allocate_capacity();
         }
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+        // Every size is a multiple of 32 and m_data comes from the 8-aligned allocator, so the new
+        // extent is whole, word-aligned 32-byte words: store them inline, rather than calling
+        // memset for the usual 1 to 3 of them.
+        auto* w = reinterpret_cast<uint32_t*>(&m_data[m_size]);
+        auto* const end = reinterpret_cast<uint32_t*>(&m_data[new_size]);
+        // Not unrolled further: the growth is one 32-byte word 72% of the time, and GCC's 8-way
+        // unrolling of this loop spent 8 instructions per call picking the remainder's entry.
+#pragma GCC unroll 1
+        do
+        {
+#pragma GCC unroll 8
+            for (size_t i = 0; i < 8; ++i)
+                w[i] = 0;
+            w += 8;
+        } while (w != end);
+#else
         std::memset(&m_data[m_size], 0, new_size - m_size);
+#endif
         m_size = new_size;
     }
 
@@ -192,7 +210,10 @@ public:
         status = EVMC_SUCCESS;
         output_offset = 0;
         output_size = 0;
-        m_tx = {};
+        // get_tx_context() refetches the whole context once block_timestamp is 0, and nothing
+        // else reads m_tx: resetting that field invalidates it, where zeroing all 240 bytes was
+        // a memset per message.
+        m_tx.block_timestamp = 0;
     }
 
     [[nodiscard]] bool in_static_mode() const { return (msg->flags & EVMC_STATIC) != 0; }

@@ -104,6 +104,11 @@ public:
 
     /// Returns the pointer to the account at the address if the account exists. Null otherwise.
     Account* find(const address& addr) noexcept;
+    /// The part of find() past a loaded entry in m_modified: the lazy load of an access-list
+    /// placeholder, or the fetch from the initial state. Out of line so that find() itself,
+    /// 3.4M calls per 200 mainnet blocks, carries no frame for the Account it may build.
+    [[gnu::noinline]] Account* find_slow(
+        const address& addr, std::unordered_map<address, Account>::iterator it) noexcept;
 
     /// Looks up an account only in the locally modified set. Does NOT query the
     /// underlying StateView, so it won't surface a cold read to trackers/hooks.

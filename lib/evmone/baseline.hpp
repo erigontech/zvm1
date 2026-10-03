@@ -8,6 +8,15 @@
 #include <evmc/utils.h>
 #include <memory>
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// JUMPDEST analysis on demand: the scan runs up to the highest jump target checked so far
+/// instead of over the whole code up front (10.7% of the analyzed bytes on mainnet lie past
+/// every target). EVMONE_RV32_DISPATCH_TEST builds it on the host for testing.
+#define EVMONE_LAZY_JUMPDESTS 1
+#else
+#define EVMONE_LAZY_JUMPDESTS 0
+#endif
+
 namespace evmone
 {
 using evmc::bytes_view;
@@ -60,6 +69,13 @@ private:
 
 namespace baseline
 {
+/// Classifies the code positions in [from, limit) (and the ones a PUSH's data carries the scan
+/// past), setting the JUMPDEST bits in map, and returns the first position left unclassified.
+/// The code must be the padded copy: the scan reads up to 7 bytes past limit. With limit at the
+/// code size this is the whole analysis.
+EVMC_EXPORT size_t scan_jumpdests(
+    BitsetSpan map, const uint8_t* code, size_t from, size_t limit) noexcept;
+
 class CodeAnalysis
 {
 private:
@@ -70,6 +86,9 @@ private:
     std::unique_ptr<uint8_t[]> m_padded_code;
 
     BitsetSpan m_jumpdest_bitset{nullptr};
+#if EVMONE_LAZY_JUMPDESTS
+    mutable size_t m_scanned = 0;  ///< Positions below this are classified in the bitset.
+#endif
 
 public:
     /// Constructor for legacy code.
@@ -77,6 +96,12 @@ public:
       : m_code{padded_code.get(), code_size},
         m_padded_code{std::move(padded_code)},
         m_jumpdest_bitset{map}
+    {}
+
+    /// Constructor for legacy code whose padded copy starts inside the owned storage.
+    CodeAnalysis(std::unique_ptr<uint8_t[]> storage, const uint8_t* padded_code,
+        size_t code_size, BitsetSpan map)
+      : m_code{padded_code, code_size}, m_padded_code{std::move(storage)}, m_jumpdest_bitset{map}
     {}
 
     /// The executable code. This is where the interpreter should start execution.
@@ -93,6 +118,11 @@ public:
     {
         if (position >= m_code.size())
             return false;
+#if EVMONE_LAZY_JUMPDESTS
+        if (position >= m_scanned) [[unlikely]]
+            m_scanned = scan_jumpdests(
+                m_jumpdest_bitset, m_code.data(), m_scanned, static_cast<size_t>(position) + 1);
+#endif
         return m_jumpdest_bitset.test(static_cast<size_t>(position));
     }
 };

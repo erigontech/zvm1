@@ -181,6 +181,26 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     // new_size is at most 2 * max_buffer_size, so the word counts stay below 2^28.
     const auto new_words = static_cast<uint32_t>((new_size + (word_size - 1)) / word_size);
     const auto current_words = static_cast<uint32_t>(memory.size() >> 5);  // / 32
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if (new_words < 65536) [[likely]]
+    {
+        // Below 2 MB of memory both squares fit 32 bits, so the cost does: on rv32 this is one
+        // mul per cost instead of a mul/mulhu pair and 64-bit adds and shifts, and the gas
+        // deduction is a 32-bit subtract with a borrow instead of a 64-bit one. Every growth on
+        // the 200-block corpus is below this (72% of them are by a single word).
+        const auto new_cost = 3 * new_words + (new_words * new_words >> 9);
+        const auto current_cost = 3 * current_words + (current_words * current_words >> 9);
+        const auto cost = new_cost - current_cost;  // new_words > current_words.
+        const auto g = static_cast<uint64_t>(gas_left);
+        const auto lo = static_cast<uint32_t>(g);
+        const auto borrow = static_cast<uint32_t>(lo < cost);
+        gas_left = static_cast<int64_t>(
+            (uint64_t{static_cast<uint32_t>(g >> 32) - borrow} << 32) | (lo - cost));
+        if (gas_left >= 0) [[likely]]
+            memory.grow(static_cast<size_t>(new_words) * word_size);
+        return gas_left;
+    }
+#endif
     // The square must be computed in 64 bits: it wraps uint32 once memory crosses
     // 2MB (65536 words), which turns the cost delta negative-then-huge and OOGs the
     // frame. On rv32im a 32x32->64 multiply is still a single mul/mulhu pair.
@@ -842,7 +862,11 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         if (len == 32) [[likely]]
         {
             // Fast path: full 32-byte load, skip temporary buffer.
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+            intx::be::unsafe::load_into(index, state.msg->input_data + begin);
+#else
             index = intx::be::unsafe::load<uint256>(state.msg->input_data + begin);
+#endif
         }
         else
         {
@@ -1112,7 +1136,12 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Reverse the bytes straight into the stack slot.
+    intx::be::unsafe::load_into(index, &state.memory[static_cast<size_t>(index)]);
+#else
     index = intx::be::unsafe::load<uint256>(&state.memory[static_cast<size_t>(index)]);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -1258,6 +1287,73 @@ inline uint64_t load_partial_push_data<4>(code_iterator pos) noexcept
     return intx::be::unsafe::load<uint32_t>(pos);
 }
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Word K (K = 0 is the least significant) of a Len-byte big-endian immediate at d, assembled from
+/// byte loads: code offsets are unaligned, and rv32 has no byte-reverse instruction.
+///
+/// The empty asm keeps GCC's bswap pass from recognising the byte assembly as "unaligned load +
+/// byte swap", which it would then expand back into a longer shift-and-mask sequence (rv32 has no
+/// rev8): 3 instructions per extra byte this way.
+template <size_t Len, size_t K>
+[[gnu::always_inline]] inline uint32_t push_data_word(const uint8_t* d) noexcept
+{
+    constexpr int hi = static_cast<int>(Len) - 4 * static_cast<int>(K) - 1;  // least significant byte
+    constexpr int lo = hi - 3 < 0 ? 0 : hi - 3;
+    uint32_t v = d[lo];
+#pragma GCC unroll 4
+    for (int i = lo + 1; i <= hi; ++i)
+    {
+        asm("" : "+r"(v));
+        v = (v << 8) | d[i];
+    }
+    return v;
+}
+
+/// PUSH instruction implementation for rv32: the generic version below assembles 64-bit words
+/// with byte swaps and 64-bit shifts, all emulated on rv32, after zeroing the whole slot. Here
+/// every 32-bit word of the new slot is stored exactly once.
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    static constexpr size_t NUM_DATA_WORDS = (Len + 3) / 4;
+    auto* const w = reinterpret_cast<uint32_t*>(stack.end());
+    const uint8_t* const d = pos + 1;  // Skip the opcode.
+    if constexpr (Len == 32)
+    {
+        // Byte loads and stores reverse a whole word in 8 instructions where building it takes
+        // 11 (see intx::internal::bswap256_bytes()); one asm block each for the two common long
+        // pushes (constants and masks, addresses) keeps it to a single scratch register.
+        intx::internal::bswap256_bytes(w, d);
+    }
+    else if constexpr (Len == 20)
+    {
+        using Bytes = uint8_t[20];
+        uint32_t t;
+#define EVMONE_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
+        asm(EVMONE_RB(19, 0) EVMONE_RB(18, 1) EVMONE_RB(17, 2) EVMONE_RB(16, 3)
+            EVMONE_RB(15, 4) EVMONE_RB(14, 5) EVMONE_RB(13, 6) EVMONE_RB(12, 7)
+            EVMONE_RB(11, 8) EVMONE_RB(10, 9) EVMONE_RB(9, 10) EVMONE_RB(8, 11)
+            EVMONE_RB(7, 12) EVMONE_RB(6, 13) EVMONE_RB(5, 14) EVMONE_RB(4, 15)
+            EVMONE_RB(3, 16) EVMONE_RB(2, 17) EVMONE_RB(1, 18) EVMONE_RB(0, 19)
+            : [t] "=&r"(t), "=m"(*reinterpret_cast<Bytes*>(w))
+            : [d] "r"(w), [s] "r"(d), "m"(*reinterpret_cast<const Bytes*>(d)));
+#undef EVMONE_RB
+        w[5] = 0;
+        w[6] = 0;
+        w[7] = 0;
+    }
+    else
+    {
+        [&]<size_t... K>(std::index_sequence<K...>) noexcept {
+            ((w[K] = push_data_word<Len, K>(d)), ...);
+        }(std::make_index_sequence<NUM_DATA_WORDS>{});
+#pragma GCC unroll 8
+        for (size_t k = NUM_DATA_WORDS; k < 8; ++k)
+            w[k] = 0;
+    }
+    return d + Len;
+}
+#else
 /// PUSH instruction implementation.
 /// @tparam Len The number of push data bytes, e.g. PUSH3 is push<3>.
 ///
@@ -1292,6 +1388,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
 
     return pos;
 }
+#endif
 
 /// DUP instruction implementation.
 /// @tparam N  The number as in the instruction definition, e.g. DUP3 is dup<3>.

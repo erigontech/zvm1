@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "secp256k1.hpp"
 #include "keccak.hpp"
+#include <memory>
+#include <new>
+#include <type_traits>
 
 #if defined(SP1TURBO) || defined(SP1)
 #include <sp1_syscalls.hpp>
@@ -672,6 +675,14 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
 #endif
 
 
+#if defined(AIRBENDER) && defined(__riscv)
+namespace
+{
+ecc::ProjPoint<Curve> ecrecover_msm_single(
+    const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept;
+}  // namespace
+#endif
+
 std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
     RecoveryMode mode) noexcept
@@ -714,8 +725,9 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     // 6. Calculate public key point Q = u1×G + u2×R.
     const auto Rpt = AffinePoint{r_mont, *y};
 #if defined(AIRBENDER) && defined(__riscv)
-    // Use GLV endomorphism for 4-way MSM over ~128-bit scalars
-    const auto Q = ecrecover_msm_glv(u1.value(), u2.value(), Rpt);
+    // GLV halves: width-12 NAFs over the precomputed odd multiples of G and phi(G), width-5 NAFs
+    // over odd multiples of R and phi(R) in Jacobian coordinates.
+    const auto Q = ecrecover_msm_single(u1.value(), u2.value(), Rpt);
 #else
     const auto Q = msm(u1.value(), G, u2.value(), Rpt);
 #endif
@@ -790,6 +802,603 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
         return std::nullopt;
 
     return to_address(*pubkey);
+#endif
+}
+
+#if defined(AIRBENDER) && defined(__riscv)
+namespace
+{
+/// n default-constructed elements in 32-byte aligned storage: the BigInt CSR paths of the field
+/// arithmetic need aligned operands, and the guest's allocator only guarantees 8 bytes.
+template <typename T>
+class AlignedArray
+{
+    static_assert(std::is_trivially_destructible_v<T>);
+    std::unique_ptr<std::byte[]> raw_;
+    T* p_;
+
+public:
+    explicit AlignedArray(size_t n) : raw_{new std::byte[n * sizeof(T) + 32]}
+    {
+        p_ = reinterpret_cast<T*>(
+            (reinterpret_cast<uintptr_t>(raw_.get()) + 31) & ~static_cast<uintptr_t>(31));
+        for (size_t i = 0; i < n; ++i)
+            new (&p_[i]) T{};
+    }
+    T& operator[](size_t i) noexcept { return p_[i]; }
+};
+
+/// Replaces v[i] by its inverse for every i with live[i], using one field inversion
+/// (Montgomery's trick). The live elements must be non-zero; prefix is scratch of the same size.
+template <typename FE>
+void batch_invert(AlignedArray<FE>& v, AlignedArray<FE>& prefix, const uint8_t* live, size_t n)
+{
+    size_t last = n;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        prefix[i] = v[i];
+        if (last != n)
+            prefix[i] *= prefix[last];
+        last = i;
+    }
+    if (last == n)
+        return;
+    auto inv = 1 / prefix[last];  // The inverse of the product of all live elements.
+    for (size_t i = last;;)
+    {
+        size_t j = i;
+        bool has_prev = false;
+        while (j != 0)
+        {
+            if (live[--j])
+            {
+                has_prev = true;
+                break;
+            }
+        }
+        if (!has_prev)
+        {
+            v[i] = inv;
+            return;
+        }
+        const auto vi = v[i];
+        v[i] = inv;
+        v[i] *= prefix[j];  // (v_0..v_i)^-1 * (v_0..v_j) = v_i^-1
+        inv *= vi;          // Now (v_0..v_j)^-1.
+        i = j;
+    }
+}
+
+/// The signed digit width for the R half of the batched MSM, and its table of odd multiples
+/// 1R, 3R, ..., 15R.
+constexpr unsigned R_WNAF_W = 5;
+constexpr size_t R_TABLE_SIZE = size_t{1} << (R_WNAF_W - 2);
+/// The signed digit width for the G half: the precomputed odd multiples (2j+1)G and (2j+1)phi(G)
+/// for j < 1024, so 128/13 additions per 128-bit half where window-8 lookups take 16.
+constexpr unsigned G_WNAF_W = 12;
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint G_ODD[size_t{1} << (G_WNAF_W - 2)] = {
+#include "secp256k1_g_odd_w12.inc"
+};
+// NOLINTNEXTLINE(*-avoid-c-arrays)
+constexpr AffinePoint PHI_G_ODD[size_t{1} << (G_WNAF_W - 2)] = {
+#include "secp256k1_phig_odd_w12.inc"
+};
+/// Digits of a width-W NAF of a scalar below 2^128: the carry may add one more.
+constexpr unsigned WNAF_LEN = 129;
+
+/// Writes the width-W NAF of the scalar below 2^128 with 32-bit words w[0..3]: naf[i] is the
+/// digit of 2^i, 0 or odd with |naf[i]| < 2^(W-1), and at least W-1 zeros follow each non-zero
+/// one, so a 128-bit scalar has 128/(W+1) non-zero digits on average where its plain NAF has
+/// 128/3. naf must be zeroed (WNAF_LEN digits). Returns the index past the top non-zero digit.
+/// This is libsecp256k1's secp256k1_ecmult_wnaf().
+template <unsigned W, typename Digit>
+unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
+{
+    const uint32_t x[6] = {w[0], w[1], w[2], w[3], 0, 0};
+    // Trailing zeros of a non-zero word: rv32im has no ctz, so a de Bruijn lookup (5 instructions).
+    static constexpr uint8_t DEBRUIJN[32] = {0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17,
+        4, 8, 31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9};
+    const auto ctz = [](uint32_t v) noexcept {
+        return static_cast<unsigned>(DEBRUIJN[((v & (0u - v)) * 0x077CB531u) >> 27]);
+    };
+    // The `count` bits at `pos`, from at most two adjacent words.
+    const auto get_bits = [&x](unsigned pos, unsigned count) noexcept {
+        const unsigned wi = pos / 32;
+        const unsigned sh = pos % 32;
+        uint32_t v = x[wi] >> sh;
+        if (sh != 0)
+            v |= x[wi + 1] << (32 - sh);
+        return v & ((uint32_t{1} << count) - 1);
+    };
+    unsigned bit = 0;
+    unsigned len = 0;
+    uint32_t carry = 0;
+    while (bit < WNAF_LEN)
+    {
+        // The next bit that differs from the carry, found a word at a time rather than bit by
+        // bit: the bits equal to the carry are cleared and the lowest remaining one located.
+        const unsigned wi = bit / 32;
+        const uint32_t differing = (x[wi] ^ (0u - carry)) >> (bit % 32);
+        if (differing == 0)
+        {
+            bit = (wi + 1) * 32;
+            continue;
+        }
+        bit += ctz(differing);
+        if (bit >= WNAF_LEN)
+            break;
+        const unsigned now = std::min(W, WNAF_LEN - bit);
+        const auto word = get_bits(bit, now) + carry;
+        carry = (word >> (W - 1)) & 1;
+        naf[bit] = static_cast<Digit>(static_cast<int>(word) - static_cast<int>(carry << W));
+        len = bit + 1;
+        bit += now;
+    }
+    return len;
+}
+
+/// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
+constexpr auto FP_ONE = Curve::Fp::one();
+
+/// p = 2p in place: ecc::dbl()'s a = 0 formula written into p's own coordinates as each one
+/// dies (x after S, z right away as Z' = 2YZ), skipping the copies into the returned point and
+/// back (3 CSR MEMCOPY each way).
+__attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
+{
+    using FE = Curve::Fp;
+    auto& [x1, y1, z1] = p;
+    DECL_FE_COPY(FE, xx, x1); xx *= x1;          // X^2
+    DECL_FE_COPY(FE, yy, y1); yy *= y1;          // Y^2
+    z1 *= y1; z1 += z1;                          // Z' = 2YZ
+    DECL_FE_COPY(FE, yyyy, yy); yyyy *= yy;      // Y^4
+    yy *= x1; yy += yy; yy += yy;                // S = 4XY^2
+    DECL_FE_COPY(FE, m, xx); m += xx; m += xx;   // M = 3X^2
+    x1 = m; x1 *= m;                             // M^2
+    x1 -= yy; x1 -= yy;                          // X' = M^2 - 2S
+    yy -= x1;                                    // S - X'
+    yyyy += yyyy; yyyy += yyyy;                  // 4Y^4
+    y1 = m; y1 *= yy;                            // M(S - X')
+    y1 -= yyyy; y1 -= yyyy;                      // Y' = M(S - X') - 8Y^4
+}
+
+/// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
+/// written into p's own coordinates as each one dies, skipping the copies through the returned
+/// point. Taking the coordinates apart lets a negated table point pass only its new y. With Live
+/// the caller knows p is not infinity either, which saves the 8-word test of z.
+template <bool Live = false>
+__attribute__((flatten)) void madd_inplace(
+    ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
+{
+    using FE = Curve::Fp;
+    auto& [x1, y1, z1] = p;
+    if constexpr (!Live)
+    {
+        if (p == 0)
+        {
+            x1 = x2;
+            y1 = y2;
+            z1 = FP_ONE;
+            return;
+        }
+    }
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
+    DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
+    z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
+    h -= x1;                                     // h = u2 - x1
+    DECL_FE_COPY(FE, t1, h); t1 += h;            // 2h
+    DECL_FE_COPY(FE, i, t1); i *= t1;            // i = (2h)^2
+    z1z1 -= y1;                                  // t2 = s2 - y1
+    if (h == 0 && z1z1 == 0) [[unlikely]]
+    {
+        dbl_inplace(p);
+        return;
+    }
+    DECL_FE_COPY(FE, r, z1z1); r += z1z1;        // r = 2 t2
+    DECL_FE_COPY(FE, v, x1); v *= i;             // v = x1 i
+    i *= h;                                      // j = h i
+    x1 = r; x1 *= r;                             // r^2
+    x1 -= i; x1 -= v; x1 -= v;                   // x3 = r^2 - j - 2v
+    v -= x1;                                     // v - x3
+    i *= y1;                                     // y1 j
+    y1 = r; y1 *= v;                             // r (v - x3)
+    y1 -= i; y1 -= i;                            // y3 = r (v - x3) - 2 y1 j
+    z1 *= h; z1 += z1;                           // z3 = 2 z1 h
+}
+
+/// p += (x2 : y2 : z2), a Jacobian point other than infinity, in place: ecc::add()'s
+/// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
+template <bool Live = false>
+__attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
+    const Curve::Fp& y2, const Curve::Fp& z2) noexcept
+{
+    using FE = Curve::Fp;
+    auto& [x1, y1, z1] = p;
+    if constexpr (!Live)
+    {
+        if (p == 0)
+        {
+            x1 = x2;
+            y1 = y2;
+            z1 = z2;
+            return;
+        }
+    }
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
+    DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;      // z2^2
+    DECL_FE_COPY(FE, u1, x1); u1 *= z2z2;        // u1 = x1 z2^2
+    DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
+    z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
+    z2z2 *= z2; z2z2 *= y1;                      // s1 = y1 z2^3
+    h -= u1;                                     // h = u2 - u1
+    z1z1 -= z2z2;                                // r = s2 - s1
+    if (h == 0 && z1z1 == 0) [[unlikely]]
+    {
+        dbl_inplace(p);
+        return;
+    }
+    DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
+    u1 *= hh;                                    // v = u1 h^2
+    hh *= h;                                     // h^3
+    x1 = z1z1; x1 *= z1z1;                       // r^2
+    x1 -= hh; x1 -= u1; x1 -= u1;                // x3 = r^2 - h^3 - 2v
+    u1 -= x1;                                    // v - x3
+    hh *= z2z2;                                  // s1 h^3
+    y1 = z1z1; y1 *= u1;                         // r (v - x3)
+    y1 -= hh;                                    // y3 = r (v - x3) - s1 h^3
+    z1 *= z2; z1 *= h;                           // z3 = z1 z2 h
+}
+
+/// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves), from the
+/// NAFs of the halves: width-12 ones of k1a and k1b (naf_ga, naf_gb) over G_ODD and PHI_G_ODD,
+/// negated by the sign of the half, and width-5 ones of k2a and k2b over ta and tb: ta[0..7] and
+/// ta[8..15] hold (2j+1)*P_a and its negation, P_a = +/-R by the sign of k2a; tb likewise for
+/// P_b = +/-phi(R). naf_len is past the top non-zero digit of all four.
+ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
+    const int16_t* naf_gb, const int8_t* naf_a, const int8_t* naf_b, unsigned naf_len,
+    const AffinePoint* ta, const AffinePoint* tb) noexcept
+{
+    const auto top = naf_len;
+
+    ecc::ProjPoint<Curve> result;  // The point at infinity.
+    bool started = false;          // Doubling the point at infinity is a wasted doubling.
+    // The first addition sets the accumulator; the others know it is a live point.
+    const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+        if (started)
+            madd_inplace<true>(result, x, y);
+        else
+        {
+            result.x = x;
+            result.y = y;
+            result.z = FP_ONE;
+            started = true;
+        }
+    };
+    for (auto i = top; i-- != 0;)
+    {
+        if (started)
+            dbl_inplace(result);
+
+        if (const int d = naf_a[i]; d != 0)
+        {
+            const auto& pt = d > 0 ? ta[d >> 1] : ta[R_TABLE_SIZE + ((-d) >> 1)];
+            add(pt.x, pt.y);
+        }
+        if (const int d = naf_b[i]; d != 0)
+        {
+            const auto& pt = d > 0 ? tb[d >> 1] : tb[R_TABLE_SIZE + ((-d) >> 1)];
+            add(pt.x, pt.y);
+        }
+
+        if (const int d = naf_ga[i]; d != 0)
+        {
+            const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != neg_ga)
+                add(pt.x, -pt.y);
+            else
+                add(pt.x, pt.y);
+        }
+        if (const int d = naf_gb[i]; d != 0)
+        {
+            const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != neg_gb)
+                add(pt.x, -pt.y);
+            else
+                add(pt.x, pt.y);
+        }
+    }
+    return result;
+}
+
+/// u1*G + u2*R for a single signature (the ECRECOVER precompile), which has no batch to share
+/// inversions with: msm_wnaf()'s digits, with the odd multiples of R kept in Jacobian coordinates
+/// (2R by doubling, 3R by a mixed addition, the rest by Jacobian ones) and phi applied as
+/// (BETA X : Y : Z). No table addition can hit P == +/-Q (see ecrecover_batch()).
+ecc::ProjPoint<Curve> ecrecover_msm_single(
+    const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
+{
+    using Point = ecc::ProjPoint<Curve>;
+    const auto [a1, b1] = ecc::decompose<Curve>(u1);
+    const auto [a2, b2] = ecc::decompose<Curve>(u2);
+
+    alignas(32) std::byte t_raw[R_TABLE_SIZE * sizeof(Point)];
+    alignas(32) std::byte e_raw[2 * R_TABLE_SIZE * sizeof(Curve::Fp)];
+    auto* const t = reinterpret_cast<Point*>(t_raw);
+    auto* const bx = reinterpret_cast<Curve::Fp*>(e_raw);  // BETA X_j
+    auto* const ny = bx + R_TABLE_SIZE;                      // -Y_j
+    auto& r1 = *new (&t[0]) Point{};
+    r1.x = R.x;
+    r1.y = R.y;
+    r1.z = FP_ONE;
+    Point two_r = r1;
+    dbl_inplace(two_r);
+    madd_inplace<true>(*new (&t[1]) Point{two_r}, R.x, R.y);
+    for (size_t j = 2; j < R_TABLE_SIZE; ++j)
+        jadd_inplace<true>(*new (&t[j]) Point{t[j - 1]}, two_r.x, two_r.y, two_r.z);
+    const auto beta = Curve::Fp{Curve::BETA};
+    for (size_t j = 0; j < R_TABLE_SIZE; ++j)
+    {
+        new (&bx[j]) Curve::Fp{t[j].x};
+        bx[j] *= beta;
+        new (&ny[j]) Curve::Fp{-t[j].y};
+    }
+
+    alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
+    alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
+    alignas(4) int16_t naf_ga[WNAF_LEN + 1]{};
+    alignas(4) int16_t naf_gb[WNAF_LEN + 1]{};
+    const auto top = std::max(
+        std::max(wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const uint32_t*>(&a2.value)),
+            wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const uint32_t*>(&b2.value))),
+        std::max(wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const uint32_t*>(&a1.value)),
+            wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&b1.value))));
+
+    Point result;  // The point at infinity.
+    bool started = false;
+    const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+        if (started)
+            madd_inplace<true>(result, x, y);
+        else
+        {
+            result.x = x;
+            result.y = y;
+            result.z = FP_ONE;
+            started = true;
+        }
+    };
+    const auto add_jac = [&](const Curve::Fp& x, const Curve::Fp& y, const Curve::Fp& z) noexcept {
+        if (started)
+            jadd_inplace<true>(result, x, y, z);
+        else
+        {
+            result.x = x;
+            result.y = y;
+            result.z = z;
+            started = true;
+        }
+    };
+    for (auto i = top; i-- != 0;)
+    {
+        if (started)
+            dbl_inplace(result);
+
+        if (const int d = naf_a[i]; d != 0)
+        {
+            const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
+            add_jac(t[j].x, (d < 0) != a2.sign ? ny[j] : t[j].y, t[j].z);
+        }
+        if (const int d = naf_b[i]; d != 0)
+        {
+            const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
+            add_jac(bx[j], (d < 0) != b2.sign ? ny[j] : t[j].y, t[j].z);
+        }
+        if (const int d = naf_ga[i]; d != 0)
+        {
+            const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != a1.sign)
+                add(pt.x, -pt.y);
+            else
+                add(pt.x, pt.y);
+        }
+        if (const int d = naf_gb[i]; d != 0)
+        {
+            const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != b1.sign)
+                add(pt.x, -pt.y);
+            else
+                add(pt.x, pt.y);
+        }
+    }
+    return result;
+}
+}  // namespace
+#endif
+
+void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional<evmc::address>> out,
+    RecoveryMode mode) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    // The steps of secp256k1_ecdsa_recover() per signature, with its two inversions batched.
+    using Fr = Curve::Fr;
+    using Fp = Curve::Fp;
+    const size_t n = in.size();
+    AlignedArray<Fr> r_inv(n), fr_prefix(n), s(n), z(n);
+    AlignedArray<Fp> rx(n), ry(n), qz(n), fp_prefix(n);
+    AlignedArray<ecc::ProjPoint<Curve>> q(n);
+    const std::unique_ptr<uint8_t[]> live{new uint8_t[n]};
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        out[i] = std::nullopt;
+        live[i] = 0;
+        const auto opt_r = Fr::from_bytes(in[i].r);
+        if (!opt_r.has_value() || *opt_r == 0) [[unlikely]]
+            continue;
+        const auto opt_s = mode == RecoveryMode::strict ? Fr::from_bytes<Fr::Range::half>(in[i].s) :
+                                                          Fr::from_bytes<Fr::Range::full>(in[i].s);
+        if (!opt_s.has_value() || *opt_s == 0) [[unlikely]]
+            continue;
+        const auto r_mont = Fp{opt_r->value()};
+        const auto y = calculate_y(r_mont, in[i].parity);
+        if (!y.has_value()) [[unlikely]]
+            continue;
+        r_inv[i] = *opt_r;
+        s[i] = *opt_s;
+        z[i] = Fr{intx::be::unsafe::load<uint256>(in[i].hash.data())};
+        rx[i] = r_mont;
+        ry[i] = *y;
+        live[i] = 1;
+    }
+
+    batch_invert(r_inv, fr_prefix, live.get(), n);  // r is in [1, n) and n is prime.
+
+    // Split u1 and u2 by the endomorphism, and start on 2R in affine: lambda = 3x^2 / 2y needs
+    // 1/(2y), batched (y != 0: secp256k1 has no point of order 2).
+    AlignedArray<uint256> k1a(n), k1b(n), k2a(n), k2b(n);
+    const std::unique_ptr<uint8_t[]> signs{new uint8_t[n]};
+    AlignedArray<Fp> t(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        const auto u1 = -z[i] * r_inv[i];
+        const auto u2 = s[i] * r_inv[i];
+        const auto [a1, b1] = ecc::decompose<Curve>(u1.value());
+        const auto [a2, b2] = ecc::decompose<Curve>(u2.value());
+        k1a[i] = a1.value;
+        k1b[i] = b1.value;
+        k2a[i] = a2.value;
+        k2b[i] = b2.value;
+        signs[i] = static_cast<uint8_t>(a1.sign | b1.sign << 1 | a2.sign << 2 | b2.sign << 3);
+        t[i] = ry[i];
+        t[i] += ry[i];
+    }
+    batch_invert(t, fp_prefix, live.get(), n);
+
+    // The odd multiples 3R..15R: 2R in affine, then 7 mixed additions in Jacobian coordinates,
+    // their z batched into one inversion for the whole block. No addition can hit P == +/-Q:
+    // that needs (j +/- 2)R = 0 for some j <= 13, below the (prime) group order.
+    constexpr size_t M = R_TABLE_SIZE - 1;
+    AlignedArray<AffinePoint> two_r(n);
+    AlignedArray<ecc::ProjPoint<Curve>> odd(n * M);
+    AlignedArray<Fp> odd_z(n * M), odd_prefix(n * M);
+    const std::unique_ptr<uint8_t[]> odd_live{new uint8_t[n * M]};
+    for (size_t i = 0; i < n; ++i)
+    {
+        for (size_t j = 0; j < M; ++j)
+            odd_live[i * M + j] = live[i];
+        if (!live[i])
+            continue;
+        auto lambda = rx[i];
+        lambda *= rx[i];
+        const auto xx = lambda;
+        lambda += xx;
+        lambda += xx;
+        lambda *= t[i];  // 3x^2 / 2y
+        auto x2 = lambda;
+        x2 *= lambda;
+        x2 -= rx[i];
+        x2 -= rx[i];  // lambda^2 - 2x
+        auto y2 = rx[i];
+        y2 -= x2;
+        y2 *= lambda;
+        y2 -= ry[i];  // lambda (x - x2) - y
+        two_r[i] = AffinePoint{x2, y2};
+
+        auto& p = odd[i * M];
+        p.x = rx[i];
+        p.y = ry[i];
+        p.z = FP_ONE;
+        for (size_t j = 0;; ++j)
+        {
+            auto& p_j = odd[i * M + j];
+            madd_inplace<true>(p_j, two_r[i].x, two_r[i].y);
+            odd_z[i * M + j] = p_j.z;
+            if (j + 1 == M)
+                break;
+            odd[i * M + j + 1] = p_j;
+        }
+    }
+    batch_invert(odd_z, odd_prefix, odd_live.get(), n * M);
+
+    const auto beta = Fp{Curve::BETA};
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        // ta: (2j+1)*P_a then the negations, P_a = +/-R; tb likewise for P_b = +/-phi(R).
+        alignas(32) std::byte ta_raw[2 * R_TABLE_SIZE * sizeof(AffinePoint)];
+        alignas(32) std::byte tb_raw[2 * R_TABLE_SIZE * sizeof(AffinePoint)];
+        auto* const ta = reinterpret_cast<AffinePoint*>(ta_raw);
+        auto* const tb = reinterpret_cast<AffinePoint*>(tb_raw);
+        const bool neg_a = (signs[i] >> 2) & 1;
+        const bool neg_b = (signs[i] >> 3) & 1;
+        const auto put = [&](size_t j, const Fp& x, const Fp& y) noexcept {
+            const auto ny = -y;
+            auto bx = x;
+            bx *= beta;
+            new (&ta[j]) AffinePoint{x, neg_a ? ny : y};
+            new (&ta[R_TABLE_SIZE + j]) AffinePoint{x, neg_a ? y : ny};
+            new (&tb[j]) AffinePoint{bx, neg_b ? ny : y};
+            new (&tb[R_TABLE_SIZE + j]) AffinePoint{bx, neg_b ? y : ny};
+        };
+        put(0, rx[i], ry[i]);
+        for (size_t j = 1; j < R_TABLE_SIZE; ++j)
+        {
+            // to_affine() with the batched z_inv.
+            const auto& q_j = odd[i * M + j - 1];
+            const auto& z_inv = odd_z[i * M + j - 1];
+            auto zz_inv = z_inv;
+            zz_inv *= z_inv;
+            auto x = q_j.x;
+            x *= zz_inv;
+            zz_inv *= z_inv;
+            auto y = q_j.y;
+            y *= zz_inv;
+            put(j, x, y);
+        }
+
+        alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
+        alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
+        alignas(4) int16_t naf_ga[WNAF_LEN + 1]{};
+        alignas(4) int16_t naf_gb[WNAF_LEN + 1]{};
+        const auto len_a = wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const uint32_t*>(&k2a[i]));
+        const auto len_b = wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const uint32_t*>(&k2b[i]));
+        const auto len_ga = wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const uint32_t*>(&k1a[i]));
+        const auto len_gb = wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&k1b[i]));
+
+        q[i] = msm_wnaf(signs[i] & 1, (signs[i] >> 1) & 1, naf_ga, naf_gb, naf_a, naf_b,
+            std::max(std::max(len_a, len_b), std::max(len_ga, len_gb)), ta, tb);
+        if (q[i] == 0) [[unlikely]]  // The public key mustn't be the point at infinity.
+        {
+            live[i] = 0;
+            continue;
+        }
+        qz[i] = q[i].z;
+    }
+
+    batch_invert(qz, fp_prefix, live.get(), n);  // Z != 0 for every remaining point.
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (!live[i])
+            continue;
+        // to_affine() with the batched z_inv.
+        auto zz_inv = qz[i];
+        zz_inv *= qz[i];
+        auto zzz_inv = zz_inv;
+        zzz_inv *= qz[i];
+        auto x = q[i].x;
+        x *= zz_inv;
+        auto y = q[i].y;
+        y *= zzz_inv;
+        out[i] = to_address(AffinePoint{x, y});
+    }
+#else
+    for (size_t i = 0; i < in.size(); ++i)
+        out[i] = ecrecover(in[i].hash, in[i].r, in[i].s, in[i].parity, mode);
 #endif
 }
 

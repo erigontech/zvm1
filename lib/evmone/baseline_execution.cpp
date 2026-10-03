@@ -24,6 +24,14 @@
 #define ASM_COMMENT(COMMENT)
 #endif
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// The rv32 dispatch paths: the 32-bit gas deduction, PUSH2+JUMP/JUMPI fusion and the folded
+/// landing JUMPDEST. EVMONE_RV32_DISPATCH_TEST builds them on the host for testing.
+#define EVMONE_RV32_DISPATCH 1
+#else
+#define EVMONE_RV32_DISPATCH 0
+#endif
+
 namespace evmone::baseline
 {
 namespace
@@ -37,6 +45,43 @@ namespace
 ///
 /// @tparam         Op            Instruction opcode.
 /// @param          cost_table    Table of base gas costs.
+/// The stack overflow limit, StackSpace::limit items above stack_bottom. On rv32 the 32 KiB
+/// offset takes lui + add, which GCC rematerializes at every overflow check instead of keeping the
+/// pointer in a register; hiding its value behind an empty asm makes it compute the limit once.
+[[gnu::always_inline]] inline const uint256* stack_limit_of(const uint256* stack_bottom) noexcept
+{
+    const uint256* limit = stack_bottom + StackSpace::limit;
+#if EVMONE_RV32_DISPATCH
+    asm("" : "+r"(limit));
+#endif
+    return limit;
+}
+
+#if EVMONE_RV32_DISPATCH
+/// gas_left -= cost; false once that is negative. cost is a non-negative 16-bit value.
+///
+/// On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and test
+/// its sign: 2 instructions. A borrow always leaves the low word negative (at least
+/// 2^32 - 2^15). A non-negative low word therefore borrowed nothing and is the exact 64-bit
+/// result, still non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes
+/// the full 64-bit path, which recovers the borrow from the new low word alone.
+[[gnu::always_inline]] inline bool deduct_gas(int64_t& gas_left, uint32_t cost) noexcept
+{
+    const auto g = static_cast<uint64_t>(gas_left);
+    auto lo = static_cast<uint32_t>(g) - cost;
+    asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
+    if (static_cast<int32_t>(lo) >= 0) [[likely]]
+    {
+        gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
+        return true;
+    }
+    const auto borrow = static_cast<uint32_t>(lo + cost < cost);
+    const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
+    gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
+    return gas_left >= 0;
+}
+#endif
+
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
@@ -45,7 +90,7 @@ namespace
 ///          or EVMC_SUCCESS if everything is fine.
 template <Opcode Op>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
-    const uint256* stack_top, const uint256* stack_bottom) noexcept
+    const uint256* stack_top, const uint256* stack_bottom, const uint256* stack_limit) noexcept
 {
     static_assert(
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
@@ -76,7 +121,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     {
         static_assert(instr::traits[Op].stack_height_change == 1,
             "unexpected instruction with multiple results");
-        if (INTX_UNLIKELY(stack_top == stack_bottom + StackSpace::limit))
+        if (INTX_UNLIKELY(stack_top == stack_limit))
             return EVMC_STACK_OVERFLOW;
     }
     if constexpr (instr::traits[Op].stack_height_required > 0)
@@ -89,8 +134,13 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
 
     if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
     {
+#if EVMONE_RV32_DISPATCH
+        if (INTX_UNLIKELY(!deduct_gas(gas_left, static_cast<uint32_t>(gas_cost))))
+            return EVMC_OUT_OF_GAS;
+#else
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
+#endif
     }
 
     return EVMC_SUCCESS;
@@ -151,13 +201,272 @@ struct Position
     return nullptr;
 }
 
+#if EVMONE_RV32_DISPATCH
+/// Charges and steps over the JUMPDEST a jump lands on: it does nothing but cost 1 gas, and the
+/// destination is a JUMPDEST by construction. Running it separately would be another dispatch
+/// (6 instructions) and gas check. Only the status of a failure is observable, so charging the
+/// 1 gas here changes nothing: out of gas is out of gas, at the JUMPDEST or one step earlier.
+[[gnu::always_inline]] inline code_iterator skip_landing_jumpdest(
+    code_iterator target, int64_t& gas, ExecutionState& state) noexcept
+{
+    if (INTX_UNLIKELY(!deduct_gas(gas, 1)))
+    {
+        state.status = EVMC_OUT_OF_GAS;
+        return nullptr;
+    }
+    return target + 1;
+}
+
+/// PUSH2 followed by JUMP or JUMPI, which is how nearly every jump is written (99.6% of them on
+/// mainnet). The destination is the immediate, so it is never stored to the stack and read back
+/// and its high words need no zero check, and the landing JUMPDEST is folded in. The checks run
+/// in the order the separate instructions would run them, so a failure gets the same status.
+[[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto op = pos.code_it[3];
+    if (op != OP_JUMP && op != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    // PUSH2: stack overflow, then its 3 gas.
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    // The barrier keeps GCC's bswap pass from treating the two bytes as a big-endian halfword
+    // load, which it expands into 7 instructions on rv32 (no rev8); this is 3.
+    auto dst = static_cast<uint32_t>(pos.code_it[1]);
+    asm("" : "+r"(dst));
+    dst = dst << 8 | pos.code_it[2];
+    const auto& analysis = *state.analysis.baseline;
+    if (op == OP_JUMP)
+    {
+        // JUMP: the pushed item is its operand, so only the 8 gas can fail.
+        if (INTX_UNLIKELY(!deduct_gas(gas, 8)))
+            return fail(EVMC_OUT_OF_GAS);
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+        return true;
+    }
+    // JUMPI: underflow unless the condition is under the pushed destination, then 10 gas.
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    // stack_end is one past the top item: the condition is the top item, under the pushed
+    // destination.
+    const auto* const cw = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const bool taken = (cw[0] | cw[1] | cw[2] | cw[3] | cw[4] | cw[5] | cw[6] | cw[7]) != 0;
+    pos.stack_end -= 1;  // One pushed, two popped.
+    if (taken)
+    {
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 4;
+    return true;
+}
+/// ISZERO or EQ, then PUSH2 and JUMPI: the conditional branches Solidity emits for `if` and for
+/// comparisons (5.3M and 3.0M per 200 mainnet blocks). The comparison result is never written to
+/// the stack and read back; it decides the jump directly. Checks run in the separate
+/// instructions' order: the comparison's underflow and 3 gas, PUSH2's overflow (EQ popped an
+/// item, so it cannot overflow) and 3 gas, JUMPI's 10 gas (its two operands are there).
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_ISZERO || Op == OP_EQ);
+    constexpr int required = Op == OP_EQ ? 2 : 1;
+    if (pos.code_it[1] != OP_PUSH2 || pos.code_it[4] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + (required - 1)))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if constexpr (Op == OP_ISZERO)
+    {
+        if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+            return fail(EVMC_STACK_OVERFLOW);
+    }
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    const auto* const a = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    bool taken;
+    if constexpr (Op == OP_ISZERO)
+        taken = (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) == 0;
+    else
+    {
+        const auto* const b = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+        taken = ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) | (a[4] ^ b[4]) |
+                    (a[5] ^ b[5]) | (a[6] ^ b[6]) | (a[7] ^ b[7])) == 0;
+    }
+    pos.stack_end -= required;  // The comparison leaves one, PUSH2 one more, JUMPI takes two.
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(pos.code_it[2]);
+        asm("" : "+r"(dst));  // See fused_push2_jump().
+        dst = dst << 8 | pos.code_it[3];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 5;
+    return true;
+}
+
+/// DUP1 PUSH4 selector EQ PUSH2 tag JUMPI: one test of Solidity's function dispatcher (2.3M per
+/// 200 mainnet blocks, a chain of them per external call). The selector is compared against the
+/// top item in place and the result decides the jump; the stack ends as it began. Checks in the
+/// separate instructions' order: DUP1's underflow and overflow and 3 gas, PUSH4's overflow and
+/// its 3 gas, then EQ's 3, PUSH2's 3 (it cannot overflow: EQ popped one) and JUMPI's 10.
+[[gnu::always_inline]] inline bool fused_selector_test(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_PUSH4)
+        return false;
+    if (c[6] != OP_EQ || c[7] != OP_PUSH2 || c[10] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 3 + 3 + 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    // The 4 immediate bytes, big-endian, built with the barrier of push_data_word().
+    uint32_t sel = c[2];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[3];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[4];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[5];
+    const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const bool taken =
+        ((w[0] ^ sel) | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(c[8]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | c[9];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 11;
+    return true;
+}
+
+/// a < b on the 32-bit words of two 256-bit values, most significant word first.
+[[gnu::always_inline]] inline bool lt256(const uint32_t* a, const uint32_t* b) noexcept
+{
+#pragma GCC unroll 8
+    for (int i = 7; i > 0; --i)
+        if (a[i] != b[i])
+            return a[i] < b[i];
+    return a[0] < b[0];
+}
+
+/// LT or GT, then ISZERO PUSH2 JUMPI: how Solidity branches on a comparison (2.4M per 200
+/// mainnet blocks, loop conditions and bounds checks). The comparison decides the jump without
+/// its result and the inverted result ever reaching the stack. Checks in the separate
+/// instructions' order: the comparison's underflow and 3 gas, then ISZERO's 3, PUSH2's 3 (no
+/// overflow: the comparison popped one) and JUMPI's 10.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* stack_bottom,
+    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_LT || Op == OP_GT);
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + 1))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 3 + 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    const auto* const top = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const auto* const second = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+    // LT leaves top < second, GT leaves second < top; ISZERO inverts; JUMPI jumps on non-zero.
+    const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
+    pos.stack_end -= 2;  // The comparison leaves one of two, PUSH2 one more, JUMPI takes two.
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(c[3]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | c[4];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 6;
+    return true;
+}
+#endif
+
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
-    Position pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position pos, int64_t& gas, ExecutionState& state) noexcept
 {
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_PUSH2)
+    {
+        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_ISZERO || Op == OP_EQ)
+    {
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_DUP1)
+    {
+        if (fused_selector_test(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_LT || Op == OP_GT)
+    {
+        if (fused_cmp_iszero_push2_jumpi<Op>(stack_bottom, pos, gas, state))
+            return pos;
+    }
+#endif
     // auto starting_gas = gas;
-    const auto status = check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom);
+    const auto status =
+        check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom, stack_limit);
     if (status != EVMC_SUCCESS)
     {
         // if constexpr (TracingEnabled)
@@ -185,7 +494,20 @@ template <Opcode Op, bool TracingEnabled>
         state.status = status;
         return {nullptr, pos.stack_end};
     }
-    const auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
+    auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_JUMP)
+    {
+        if (new_pos != nullptr)  // A taken jump lands on a JUMPDEST.
+            new_pos = skip_landing_jumpdest(new_pos, gas, state);
+    }
+    else if constexpr (Op == OP_JUMPI)
+    {
+        // Taken or not: a JUMPDEST at the next position is executed the same way either way.
+        if (new_pos != nullptr && *new_pos == OP_JUMPDEST)
+            new_pos = skip_landing_jumpdest(new_pos, gas, state);
+    }
+#endif
     const auto new_stack_top = pos.stack_end + instr::traits[Op].stack_height_change;
     return {new_pos, new_stack_top};
 }
@@ -196,6 +518,7 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
     const uint8_t* code, Tracer* tracer = nullptr) noexcept
 {
     const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_limit = stack_limit_of(stack_bottom);
 
     // Code iterator and stack top pointer for interpreter loop.
     Position position{code, stack_bottom};
@@ -220,7 +543,8 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
     case OPCODE:                                                                                \
         ASM_COMMENT(OPCODE);                                                                    \
         if (const auto next =                                                                   \
-                invoke<OPCODE, TracingEnabled>(cost_table, stack_bottom, position, gas, state); \
+                invoke<OPCODE, TracingEnabled>(                                                 \
+                    cost_table, stack_bottom, stack_limit, position, gas, state);               \
             next.code_it == nullptr)                                                            \
         {                                                                                       \
             return gas;                                                                         \
@@ -244,6 +568,235 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
     intx::unreachable();
 }
 
+#if EVMONE_RV32_DISPATCH
+/// PUSH1 and its successor.
+///
+/// PUSH1 is the most executed instruction (29.3M per 200 mainnet blocks) and its successor is
+/// known at the point where the handler would push: the dispatch of that successor is the same
+/// 5 instructions whichever table it goes through. The PUSH1 handler therefore makes its own
+/// checks and dispatches the successor through push1_table, whose entries make the push and
+/// jump to the successor's handler (one extra instruction) or run the pair fused: SHL and SHR by
+/// an immediate (3.0M), MLOAD and MSTORE at an immediate offset (2.8M) and the mask idiom
+/// PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the immediate from the code instead of
+/// writing it to the stack and reading it back, skip its 224-bit zero checks and one dispatch.
+/// Checks keep the separate instructions' order, so a failure stops with the same status.
+
+/// The push itself: the immediate is the byte before the successor.
+[[gnu::always_inline]] inline void push1_commit(Position& pos) noexcept
+{
+    auto* const w = reinterpret_cast<uint32_t*>(pos.stack_end);
+    w[0] = pos.code_it[-1];
+    w[1] = 0;
+    w[2] = 0;
+    w[3] = 0;
+    w[4] = 0;
+    w[5] = 0;
+    w[6] = 0;
+    w[7] = 0;
+    pos.stack_end += 1;
+}
+
+/// The successors that run fused with PUSH1 through push1_then().
+constexpr bool push1_fuses(Opcode op) noexcept
+{
+    return op == OP_SHL || op == OP_SHR || op == OP_MLOAD || op == OP_MSTORE;
+}
+
+/// Word I of x <<= 32 * WS + bs, in place. Destinations are written from the most significant
+/// word down, so every source word is read before it is overwritten. (v >> 1) >> rs is
+/// v >> (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void shl_word(uint32_t* x, unsigned bs, unsigned rs) noexcept
+{
+    if constexpr (I < WS)
+        x[I] = 0;
+    else if constexpr (I == WS)
+        x[I] = x[0] << bs;
+    else
+        x[I] = (x[I - WS] << bs) | ((x[I - WS - 1] >> 1) >> rs);
+}
+
+template <unsigned WS>
+[[gnu::always_inline]] inline void shl_words(uint32_t* x, unsigned bs) noexcept
+{
+    const unsigned rs = 31 - bs;
+    shl_word<WS, 7>(x, bs, rs);
+    shl_word<WS, 6>(x, bs, rs);
+    shl_word<WS, 5>(x, bs, rs);
+    shl_word<WS, 4>(x, bs, rs);
+    shl_word<WS, 3>(x, bs, rs);
+    shl_word<WS, 2>(x, bs, rs);
+    shl_word<WS, 1>(x, bs, rs);
+    shl_word<WS, 0>(x, bs, rs);
+}
+
+/// Word I of x >>= 32 * WS + bs, in place, written from the least significant word up.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void shr_word(uint32_t* x, unsigned bs, unsigned rs) noexcept
+{
+    if constexpr (I + WS > 7)
+        x[I] = 0;
+    else if constexpr (I + WS == 7)
+        x[I] = x[7] >> bs;
+    else
+        x[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
+}
+
+template <unsigned WS>
+[[gnu::always_inline]] inline void shr_words(uint32_t* x, unsigned bs) noexcept
+{
+    const unsigned rs = 31 - bs;
+    shr_word<WS, 0>(x, bs, rs);
+    shr_word<WS, 1>(x, bs, rs);
+    shr_word<WS, 2>(x, bs, rs);
+    shr_word<WS, 3>(x, bs, rs);
+    shr_word<WS, 4>(x, bs, rs);
+    shr_word<WS, 5>(x, bs, rs);
+    shr_word<WS, 6>(x, bs, rs);
+    shr_word<WS, 7>(x, bs, rs);
+}
+
+/// The fused PUSH1 + Op, entered after PUSH1's own checks with the push not yet made: the
+/// immediate is pos.code_it[-1] and pos.stack_end is still the slot it would take. On false the
+/// status is set. On true pos is at the next instruction.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool push1_then(const CostTable& cost_table,
+    const uint256* stack_bottom, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    const uint32_t imm = pos.code_it[-1];
+    if constexpr (Op == OP_SHL || Op == OP_SHR)
+    {
+        // Constantinople instructions: undefined before it, which check_requirements() tests
+        // first, through the revision's cost table.
+        if (INTX_UNLIKELY(cost_table[Op] < 0))
+            return fail(EVMC_UNDEFINED_INSTRUCTION);
+        // Two operands: the pushed shift and the value under it, then 3 gas.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        auto* const x = reinterpret_cast<uint32_t*>(pos.stack_end - 1);
+        const unsigned bs = imm & 31;
+        switch (imm >> 5)  // The word shift: a byte is below 256, so there is no "all out" case.
+        {
+#define SHIFT_CASE(WS)                             \
+    case WS:                                       \
+        if constexpr (Op == OP_SHL)                \
+            shl_words<WS>(x, bs);                  \
+        else                                       \
+            shr_words<WS>(x, bs);                  \
+        break;
+            SHIFT_CASE(0)
+            SHIFT_CASE(1)
+            SHIFT_CASE(2)
+            SHIFT_CASE(3)
+            SHIFT_CASE(4)
+            SHIFT_CASE(5)
+            SHIFT_CASE(6)
+            SHIFT_CASE(7)
+#undef SHIFT_CASE
+        default:
+            intx::unreachable();
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_MLOAD || Op == OP_MSTORE)
+    {
+        if constexpr (Op == OP_MSTORE)  // The value under the pushed offset.
+        {
+            if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+                return fail(EVMC_STACK_UNDERFLOW);
+        }
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        // check_memory() for an offset of one byte: no high words to test.
+        auto& memory = state.memory;
+        if (imm + 32 > memory.size())
+        {
+            gas = grow_memory(gas, memory, imm + 32);
+            if (gas < 0) [[unlikely]]
+                return fail(EVMC_OUT_OF_GAS);
+        }
+        if constexpr (Op == OP_MLOAD)
+        {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+            intx::be::unsafe::load_into(*pos.stack_end, &memory[imm]);  // Into the push's slot.
+#else
+            *pos.stack_end = intx::be::unsafe::load<uint256>(&memory[imm]);
+#endif
+            pos.stack_end += 1;
+        }
+        else
+        {
+            intx::be::unsafe::store(&memory[imm], pos.stack_end[-1]);
+            pos.stack_end -= 1;
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else
+        return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
+}
+
+/// PUSH1 a PUSH1 b SHL SUB, the mask idiom (for 2^160 - 1 Solidity emits PUSH1 1 PUSH1 1 PUSH1
+/// 0xa0 SHL SUB): the top item x becomes (a << b) - x. Entered after the first PUSH1's checks
+/// with pos at the second PUSH1. The shifted constant is built in the first push's free slot and
+/// the subtraction is the one BigInt delegation SUB makes anyway.
+[[gnu::always_inline]] inline bool push1_shl_sub(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    // Second PUSH1: overflow with one item already pushed, 3 gas. SHL has its two operands: 3
+    // gas. SUB needs x under the shifted constant: underflow, 3 gas.
+    if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    const uint32_t a = pos.code_it[-1];
+    const uint32_t b = pos.code_it[1];
+    // c = a << b: a byte shifted by b < 256 lands in words b / 32 and b / 32 + 1.
+    auto* const c = reinterpret_cast<uint32_t*>(pos.stack_end);
+    c[0] = 0;
+    c[1] = 0;
+    c[2] = 0;
+    c[3] = 0;
+    c[4] = 0;
+    c[5] = 0;
+    c[6] = 0;
+    c[7] = 0;
+    const unsigned ws = b >> 5;
+    const unsigned bs = b & 31;
+    c[ws] = a << bs;
+    if (ws < 7)
+        c[ws + 1] = (a >> 1) >> (31 - bs);
+    // x = c - x: CSR SUB_AND_NEGATE (0x04) is *x10 = *x11 - *x10, as instr::core::sub() uses it.
+#if defined(AIRBENDER) && defined(__riscv)
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(pos.stack_end - 1);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(c);
+    register uint32_t r12 asm("x12") = 0x04;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
+    pos.stack_end[-1] = pos.stack_end[0] - pos.stack_end[-1];
+#endif
+    pos.code_it += 4;
+    return true;
+}
+#endif
+
 #if EVMONE_CGOTO_SUPPORTED
 int64_t dispatch_cgoto(
     const CostTable& cost_table, ExecutionState& state, int64_t gas, const uint8_t* code) noexcept
@@ -261,16 +814,30 @@ int64_t dispatch_cgoto(
     };
     // static_assert(std::size(cgoto_table) == 256);
 
+#if EVMONE_RV32_DISPATCH
+    // The successor of PUSH1, entered with the push still to make (see push1_then()).
+    static constexpr void* push1_table[] = {
+#define ON_OPCODE(OPCODE) &&PUSH1_THEN_##OPCODE,
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED(_) &&PUSH1_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
+    };
+#endif
+
     const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_limit = stack_limit_of(stack_bottom);
 
     // Code iterator and stack top pointer for interpreter loop.
     Position position{code, stack_bottom};
 
     goto* cgoto_table[*position.code_it];
 
-#define ON_OPCODE(OPCODE)                                                                        \
-    TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
-    if (const auto next = invoke<OPCODE, false>(cost_table, stack_bottom, position, gas, state); \
+#define ON_OPCODE_INVOKE(OPCODE)                                                                 \
+    if (const auto next =                                                                        \
+            invoke<OPCODE, false>(cost_table, stack_bottom, stack_limit, position, gas, state);  \
         next.code_it == nullptr)                                                                 \
     {                                                                                            \
         return gas;                                                                              \
@@ -283,12 +850,76 @@ int64_t dispatch_cgoto(
     }                                                                                            \
     goto* cgoto_table[*position.code_it];
 
+#if EVMONE_RV32_DISPATCH
+#define ON_OPCODE(OPCODE)                                                                        \
+    TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
+    if constexpr (OPCODE == OP_PUSH1)                                                            \
+    {                                                                                            \
+        /* PUSH1's checks; the push is made by the successor's PUSH1_THEN_ entry. */             \
+        if (INTX_UNLIKELY(position.stack_end == stack_limit))                                    \
+        {                                                                                        \
+            state.status = EVMC_STACK_OVERFLOW;                                                  \
+            return gas;                                                                          \
+        }                                                                                        \
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))                                                  \
+        {                                                                                        \
+            state.status = EVMC_OUT_OF_GAS;                                                      \
+            return gas;                                                                          \
+        }                                                                                        \
+        position.code_it += 2;                                                                   \
+        goto* push1_table[*position.code_it];                                                    \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        ON_OPCODE_INVOKE(OPCODE)                                                                 \
+    }
+#else
+#define ON_OPCODE(OPCODE)                                                                        \
+    TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
+    ON_OPCODE_INVOKE(OPCODE)
+#endif
+
     MAP_OPCODES
 #undef ON_OPCODE
+#undef ON_OPCODE_INVOKE
 
 TARGET_OP_UNDEFINED:
     state.status = EVMC_UNDEFINED_INSTRUCTION;
     return gas;
+
+#if EVMONE_RV32_DISPATCH
+#define ON_OPCODE(OPCODE)                                                                        \
+    PUSH1_THEN_##OPCODE : ASM_COMMENT(PUSH1_##OPCODE);                                           \
+    if constexpr (push1_fuses(OPCODE))                                                           \
+    {                                                                                            \
+        if (!push1_then<OPCODE>(cost_table, stack_bottom, position, gas, state))                 \
+            return gas;                                                                          \
+        goto* cgoto_table[*position.code_it];                                                    \
+    }                                                                                            \
+    else if constexpr (OPCODE == OP_PUSH1)                                                       \
+    {                                                                                            \
+        if (position.code_it[2] == OP_SHL && position.code_it[3] == OP_SUB)                      \
+        {                                                                                        \
+            if (!push1_shl_sub(stack_bottom, stack_limit, position, gas, state))                 \
+                return gas;                                                                      \
+            goto* cgoto_table[*position.code_it];                                                \
+        }                                                                                        \
+        push1_commit(position);                                                                  \
+        goto TARGET_##OPCODE;                                                                    \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        push1_commit(position);                                                                  \
+        goto TARGET_##OPCODE;                                                                    \
+    }
+
+    MAP_OPCODES
+#undef ON_OPCODE
+
+PUSH1_THEN_UNDEFINED:
+    push1_commit(position);
+    goto TARGET_OP_UNDEFINED;
+#endif
 }
 #endif
 }  // namespace
