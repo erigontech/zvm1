@@ -381,6 +381,60 @@ template <Opcode Op>
         pos.code_it += 11;
     return true;
 }
+
+/// a < b on the 32-bit words of two 256-bit values, most significant word first.
+[[gnu::always_inline]] inline bool lt256(const uint32_t* a, const uint32_t* b) noexcept
+{
+#pragma GCC unroll 8
+    for (int i = 7; i > 0; --i)
+        if (a[i] != b[i])
+            return a[i] < b[i];
+    return a[0] < b[0];
+}
+
+/// LT or GT, then ISZERO PUSH2 JUMPI: how Solidity branches on a comparison (2.4M per 200
+/// mainnet blocks, loop conditions and bounds checks). The comparison decides the jump without
+/// its result and the inverted result ever reaching the stack. Checks in the separate
+/// instructions' order: the comparison's underflow and 3 gas, then ISZERO's 3, PUSH2's 3 (no
+/// overflow: the comparison popped one) and JUMPI's 10.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* stack_bottom,
+    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_LT || Op == OP_GT);
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + 1))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 3 + 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    const auto* const top = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const auto* const second = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+    // LT leaves top < second, GT leaves second < top; ISZERO inverts; JUMPI jumps on non-zero.
+    const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
+    pos.stack_end -= 2;  // The comparison leaves one of two, PUSH2 one more, JUMPI takes two.
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(c[3]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | c[4];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 6;
+    return true;
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -402,6 +456,11 @@ template <Opcode Op, bool TracingEnabled>
     else if constexpr (Op == OP_DUP1)
     {
         if (fused_selector_test(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_LT || Op == OP_GT)
+    {
+        if (fused_cmp_iszero_push2_jumpi<Op>(stack_bottom, pos, gas, state))
             return pos;
     }
 #endif
