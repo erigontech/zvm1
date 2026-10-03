@@ -898,22 +898,38 @@ template <unsigned W, typename Digit>
 unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
 {
     const uint32_t x[6] = {w[0], w[1], w[2], w[3], 0, 0};
+    // Trailing zeros of a non-zero word: rv32im has no ctz, so a de Bruijn lookup (5 instructions).
+    static constexpr uint8_t DEBRUIJN[32] = {0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17,
+        4, 8, 31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9};
+    const auto ctz = [](uint32_t v) noexcept {
+        return static_cast<unsigned>(DEBRUIJN[((v & (0u - v)) * 0x077CB531u) >> 27]);
+    };
+    // The `count` bits at `pos`, from at most two adjacent words.
     const auto get_bits = [&x](unsigned pos, unsigned count) noexcept {
         const unsigned wi = pos / 32;
         const unsigned sh = pos % 32;
-        const uint64_t v = (uint64_t{x[wi + 1]} << 32 | x[wi]) >> sh;
-        return static_cast<uint32_t>(v) & ((uint32_t{1} << count) - 1);
+        uint32_t v = x[wi] >> sh;
+        if (sh != 0)
+            v |= x[wi + 1] << (32 - sh);
+        return v & ((uint32_t{1} << count) - 1);
     };
     unsigned bit = 0;
     unsigned len = 0;
     uint32_t carry = 0;
     while (bit < WNAF_LEN)
     {
-        if (((x[bit / 32] >> (bit % 32)) & 1) == carry)
+        // The next bit that differs from the carry, found a word at a time rather than bit by
+        // bit: the bits equal to the carry are cleared and the lowest remaining one located.
+        const unsigned wi = bit / 32;
+        const uint32_t differing = (x[wi] ^ (0u - carry)) >> (bit % 32);
+        if (differing == 0)
         {
-            ++bit;
+            bit = (wi + 1) * 32;
             continue;
         }
+        bit += ctz(differing);
+        if (bit >= WNAF_LEN)
+            break;
         const unsigned now = std::min(W, WNAF_LEN - bit);
         const auto word = get_bits(bit, now) + carry;
         carry = (word >> (W - 1)) & 1;
