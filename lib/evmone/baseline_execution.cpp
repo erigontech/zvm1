@@ -327,6 +327,60 @@ template <Opcode Op>
         pos.code_it += 5;
     return true;
 }
+
+/// DUP1 PUSH4 selector EQ PUSH2 tag JUMPI: one test of Solidity's function dispatcher (2.3M per
+/// 200 mainnet blocks, a chain of them per external call). The selector is compared against the
+/// top item in place and the result decides the jump; the stack ends as it began. Checks in the
+/// separate instructions' order: DUP1's underflow and overflow and 3 gas, PUSH4's overflow and
+/// its 3 gas, then EQ's 3, PUSH2's 3 (it cannot overflow: EQ popped one) and JUMPI's 10.
+[[gnu::always_inline]] inline bool fused_selector_test(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_PUSH4)
+        return false;
+    if (c[6] != OP_EQ || c[7] != OP_PUSH2 || c[10] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 3 + 3 + 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    // The 4 immediate bytes, big-endian, built with the barrier of push_data_word().
+    uint32_t sel = c[2];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[3];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[4];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[5];
+    const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const bool taken =
+        ((w[0] ^ sel) | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(c[8]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | c[9];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 11;
+    return true;
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -343,6 +397,11 @@ template <Opcode Op, bool TracingEnabled>
     else if constexpr (Op == OP_ISZERO || Op == OP_EQ)
     {
         if (fused_cmp_push2_jumpi<Op>(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_DUP1)
+    {
+        if (fused_selector_test(stack_bottom, stack_limit, pos, gas, state))
             return pos;
     }
 #endif
