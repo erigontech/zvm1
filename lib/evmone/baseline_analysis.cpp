@@ -16,9 +16,7 @@ static_assert(std::is_move_assignable_v<CodeAnalysis>);
 static_assert(!std::is_copy_constructible_v<CodeAnalysis>);
 static_assert(!std::is_copy_assignable_v<CodeAnalysis>);
 
-namespace
-{
-void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
+size_t scan_jumpdests(BitsetSpan map, const uint8_t* code, size_t from, size_t limit) noexcept
 {
     // To find if op is any PUSH opcode (OP_PUSH1 <= op <= OP_PUSH32)
     // it can be noticed that OP_PUSH32 is INT8_MAX (0x7f) therefore,
@@ -30,14 +28,14 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
     //
     // On rv64im with GCC this makes the common path 4 instructions instead of 9, and there an
     // executed instruction is a proven cycle. clang needs one more: llvm/llvm-project#217273.
-    const auto* const base = reinterpret_cast<const int8_t*>(code.data());
-    const auto* const end = base + code.size();
+    const auto* const base = reinterpret_cast<const int8_t*>(code);
+    const auto* const end = base + limit;
+    const auto* p = base + from;
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // Test 8 opcodes per bound check: a plain opcode then costs its load and one branch, where
-    // the loop above spends 4 instructions on each. The reads run up to 7 bytes past the end,
+    // the loop below spends 4 instructions on each. The reads run up to 7 bytes past the end,
     // into the zero padding of the analysis copy (see analyze_legacy()), and a 0 (STOP) is
     // neither PUSH nor JUMPDEST, so it only steps the walk past the end.
-    const auto* p = base;
     // Handle the PUSH or JUMPDEST..PUSH0 opcode op at p + K and step past it (and PUSH data).
     const auto special = [&]<std::ptrdiff_t K>(int8_t op) noexcept {
         if (op >= OP_PUSH1)
@@ -71,7 +69,7 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
             p += 8;
     }
 #else
-    for (const auto* p = base; p < end;)
+    while (p < end)
     {
         const auto op = *p;
         if (op >= OP_JUMPDEST)  // Everything below is neither, including every opcode >= 0x80.
@@ -89,8 +87,11 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
         ++p;
     }
 #endif
+    return static_cast<size_t>(p - base);
 }
 
+namespace
+{
 CodeAnalysis analyze_legacy(bytes_view code)
 {
     // We need at most 33 bytes of code padding: 32 for possible missing all data bytes of
@@ -120,9 +121,11 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto bitset_storage =
         new (&storage[bitset_off]) BitsetSpan::word_type[bitset_words];
     const BitsetSpan jumpdest_bitset{bitset_storage};
+#if !EVMONE_LAZY_JUMPDESTS
     // Scan the padded copy: a truncated PUSH at the end advances past the last opcode by up to
     // 32 bytes, which stays inside this allocation but not inside the caller's.
-    analyze_jumpdests(jumpdest_bitset, {padded, code.size()});
+    scan_jumpdests(jumpdest_bitset, padded, 0, code.size());
+#endif
     return {std::move(storage), padded, code.size(), jumpdest_bitset};
 #else
     const auto aligned_code_size =
@@ -143,9 +146,11 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto bitset_storage =
         new (&storage[aligned_code_size]) BitsetSpan::word_type[bitset_words];
     const BitsetSpan jumpdest_bitset{bitset_storage};
+#if !EVMONE_LAZY_JUMPDESTS
     // Scan the padded copy: a truncated PUSH at the end advances past the last opcode by up to
     // 32 bytes, which stays inside this allocation but not inside the caller's.
-    analyze_jumpdests(jumpdest_bitset, {storage.get(), code.size()});
+    scan_jumpdests(jumpdest_bitset, storage.get(), 0, code.size());
+#endif
 
     return {std::move(storage), code.size(), jumpdest_bitset};
 #endif
