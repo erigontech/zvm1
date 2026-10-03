@@ -24,6 +24,14 @@
 #define ASM_COMMENT(COMMENT)
 #endif
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// The rv32 dispatch paths: the 32-bit gas deduction, PUSH2+JUMP/JUMPI fusion and the folded
+/// landing JUMPDEST. EVMONE_RV32_DISPATCH_TEST builds them on the host for testing.
+#define EVMONE_RV32_DISPATCH 1
+#else
+#define EVMONE_RV32_DISPATCH 0
+#endif
+
 namespace evmone::baseline
 {
 namespace
@@ -43,11 +51,36 @@ namespace
 [[gnu::always_inline]] inline const uint256* stack_limit_of(const uint256* stack_bottom) noexcept
 {
     const uint256* limit = stack_bottom + StackSpace::limit;
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#if EVMONE_RV32_DISPATCH
     asm("" : "+r"(limit));
 #endif
     return limit;
 }
+
+#if EVMONE_RV32_DISPATCH
+/// gas_left -= cost; false once that is negative. cost is a non-negative 16-bit value.
+///
+/// On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and test
+/// its sign: 2 instructions. A borrow always leaves the low word negative (at least
+/// 2^32 - 2^15). A non-negative low word therefore borrowed nothing and is the exact 64-bit
+/// result, still non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes
+/// the full 64-bit path, which recovers the borrow from the new low word alone.
+[[gnu::always_inline]] inline bool deduct_gas(int64_t& gas_left, uint32_t cost) noexcept
+{
+    const auto g = static_cast<uint64_t>(gas_left);
+    auto lo = static_cast<uint32_t>(g) - cost;
+    asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
+    if (static_cast<int32_t>(lo) >= 0) [[likely]]
+    {
+        gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
+        return true;
+    }
+    const auto borrow = static_cast<uint32_t>(lo + cost < cost);
+    const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
+    gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
+    return gas_left >= 0;
+}
+#endif
 
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
@@ -101,27 +134,9 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
 
     if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
     {
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-        // On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and
-        // test its sign: 2 instructions. gas_cost is a non-negative 16-bit table value here, so
-        // a borrow always leaves the low word negative (at least 2^32 - 2^15). A non-negative
-        // low word therefore borrowed nothing and is the exact 64-bit result, still
-        // non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes the full
-        // 64-bit path, which recovers the borrow from the new low word alone.
-        const auto g = static_cast<uint64_t>(gas_left);
-        const auto cost = static_cast<uint32_t>(gas_cost);
-        auto lo = static_cast<uint32_t>(g) - cost;
-        asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
-        if (static_cast<int32_t>(lo) >= 0) [[likely]]
-            gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
-        else
-        {
-            const auto borrow = static_cast<uint32_t>(lo + cost < cost);
-            const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
-            gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
-            if (INTX_UNLIKELY(gas_left < 0))
-                return EVMC_OUT_OF_GAS;
-        }
+#if EVMONE_RV32_DISPATCH
+        if (INTX_UNLIKELY(!deduct_gas(gas_left, static_cast<uint32_t>(gas_cost))))
+            return EVMC_OUT_OF_GAS;
 #else
         if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
@@ -186,11 +201,92 @@ struct Position
     return nullptr;
 }
 
+#if EVMONE_RV32_DISPATCH
+/// Charges and steps over the JUMPDEST a jump lands on: it does nothing but cost 1 gas, and the
+/// destination is a JUMPDEST by construction. Running it separately would be another dispatch
+/// (6 instructions) and gas check. Only the status of a failure is observable, so charging the
+/// 1 gas here changes nothing: out of gas is out of gas, at the JUMPDEST or one step earlier.
+[[gnu::always_inline]] inline code_iterator skip_landing_jumpdest(
+    code_iterator target, int64_t& gas, ExecutionState& state) noexcept
+{
+    if (INTX_UNLIKELY(!deduct_gas(gas, 1)))
+    {
+        state.status = EVMC_OUT_OF_GAS;
+        return nullptr;
+    }
+    return target + 1;
+}
+
+/// PUSH2 followed by JUMP or JUMPI, which is how nearly every jump is written (99.6% of them on
+/// mainnet). The destination is the immediate, so it is never stored to the stack and read back
+/// and its high words need no zero check, and the landing JUMPDEST is folded in. The checks run
+/// in the order the separate instructions would run them, so a failure gets the same status.
+[[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto op = pos.code_it[3];
+    if (op != OP_JUMP && op != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    // PUSH2: stack overflow, then its 3 gas.
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    // The barrier keeps GCC's bswap pass from treating the two bytes as a big-endian halfword
+    // load, which it expands into 7 instructions on rv32 (no rev8); this is 3.
+    auto dst = static_cast<uint32_t>(pos.code_it[1]);
+    asm("" : "+r"(dst));
+    dst = dst << 8 | pos.code_it[2];
+    const auto& analysis = *state.analysis.baseline;
+    if (op == OP_JUMP)
+    {
+        // JUMP: the pushed item is its operand, so only the 8 gas can fail.
+        if (INTX_UNLIKELY(!deduct_gas(gas, 8)))
+            return fail(EVMC_OUT_OF_GAS);
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+        return true;
+    }
+    // JUMPI: underflow unless the condition is under the pushed destination, then 10 gas.
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    // stack_end is one past the top item: the condition is the top item, under the pushed
+    // destination.
+    const auto* const cw = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const bool taken = (cw[0] | cw[1] | cw[2] | cw[3] | cw[4] | cw[5] | cw[6] | cw[7]) != 0;
+    pos.stack_end -= 1;  // One pushed, two popped.
+    if (taken)
+    {
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 4;
+    return true;
+}
+#endif
+
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
     const uint256* stack_limit, Position pos, int64_t& gas, ExecutionState& state) noexcept
 {
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_PUSH2)
+    {
+        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+#endif
     // auto starting_gas = gas;
     const auto status =
         check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom, stack_limit);
@@ -221,7 +317,20 @@ template <Opcode Op, bool TracingEnabled>
         state.status = status;
         return {nullptr, pos.stack_end};
     }
-    const auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
+    auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_JUMP)
+    {
+        if (new_pos != nullptr)  // A taken jump lands on a JUMPDEST.
+            new_pos = skip_landing_jumpdest(new_pos, gas, state);
+    }
+    else if constexpr (Op == OP_JUMPI)
+    {
+        // Taken or not: a JUMPDEST at the next position is executed the same way either way.
+        if (new_pos != nullptr && *new_pos == OP_JUMPDEST)
+            new_pos = skip_landing_jumpdest(new_pos, gas, state);
+    }
+#endif
     const auto new_stack_top = pos.stack_end + instr::traits[Op].stack_height_change;
     return {new_pos, new_stack_top};
 }
