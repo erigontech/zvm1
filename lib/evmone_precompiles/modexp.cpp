@@ -716,7 +716,11 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
         {
             const auto base = load_u256(base_bytes);
             const ModArith<uint256> arith(mod);
-            const auto base_mont = arith.to_mont(base);
+            // Every operand sits in a 32-byte aligned buffer and is multiplied in place: the
+            // out-of-place mul() copied each operand into CSR buffers and the result back out,
+            // ~100 instructions per multiplication where the in-place form is ~40.
+            alignas(32) const auto base_mont = arith.to_mont(base);
+            alignas(32) uint256 r;
 
             uint256 result;
             const auto ebw = exp.bit_width();
@@ -724,39 +728,37 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
             if (ebw <= 32)
             {
                 // Small exponent: binary square-and-multiply (precompute overhead not worth it).
-                auto r = base_mont;
+                r = base_mont;
                 for (auto i = ebw - 1; i != 0; --i)
                 {
-                    r = arith.mul(r, r);
+                    arith.square_n_inplace(r, 1);
                     if (exp[i - 1])
-                        r = arith.mul(r, base_mont);
+                        arith.mul_assign(r, base_mont);
                 }
                 result = arith.from_mont(r);
             }
             else
             {
                 // Window-4 exponentiation: precompute table[i] = base^(i+1) in Montgomery form.
-                uint256 table[15];
+                alignas(32) uint256 table[15];
                 table[0] = base_mont;
                 for (int i = 1; i < 15; ++i)
-                    table[i] = arith.mul(table[i - 1], base_mont);
+                {
+                    table[i] = table[i - 1];
+                    arith.mul_assign(table[i], base_mont);
+                }
 
                 // Round bit_width up to a multiple of 4 for uniform window processing.
                 const auto padded_bw = (ebw + 3) & ~size_t{3};
 
                 // Process exponent 4 bits at a time, MSB to LSB.
-                auto r = arith.to_mont(uint256{1});
+                r = arith.to_mont(uint256{1});
                 for (auto pos = padded_bw; pos != 0; pos -= 4)
                 {
-                    // 4 squarings.
-                    r = arith.mul(r, r);
-                    r = arith.mul(r, r);
-                    r = arith.mul(r, r);
-                    r = arith.mul(r, r);
-
+                    arith.square_n_inplace(r, 4);
                     const auto w = exp.window(pos - 4, pos - 1);
                     if (w != 0)
-                        r = arith.mul(r, table[w - 1]);
+                        arith.mul_assign(r, table[w - 1]);
                 }
                 result = arith.from_mont(r);
             }
