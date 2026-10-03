@@ -1298,12 +1298,39 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
     static constexpr size_t NUM_DATA_WORDS = (Len + 3) / 4;
     auto* const w = reinterpret_cast<uint32_t*>(stack.end());
     const uint8_t* const d = pos + 1;  // Skip the opcode.
-    [&]<size_t... K>(std::index_sequence<K...>) noexcept {
-        ((w[K] = push_data_word<Len, K>(d)), ...);
-    }(std::make_index_sequence<NUM_DATA_WORDS>{});
+    if constexpr (Len == 32)
+    {
+        // Byte loads and stores reverse a whole word in 8 instructions where building it takes
+        // 11 (see intx::internal::bswap256_bytes()); one asm block each for the two common long
+        // pushes (constants and masks, addresses) keeps it to a single scratch register.
+        intx::internal::bswap256_bytes(w, d);
+    }
+    else if constexpr (Len == 20)
+    {
+        using Bytes = uint8_t[20];
+        uint32_t t;
+#define EVMONE_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
+        asm(EVMONE_RB(19, 0) EVMONE_RB(18, 1) EVMONE_RB(17, 2) EVMONE_RB(16, 3)
+            EVMONE_RB(15, 4) EVMONE_RB(14, 5) EVMONE_RB(13, 6) EVMONE_RB(12, 7)
+            EVMONE_RB(11, 8) EVMONE_RB(10, 9) EVMONE_RB(9, 10) EVMONE_RB(8, 11)
+            EVMONE_RB(7, 12) EVMONE_RB(6, 13) EVMONE_RB(5, 14) EVMONE_RB(4, 15)
+            EVMONE_RB(3, 16) EVMONE_RB(2, 17) EVMONE_RB(1, 18) EVMONE_RB(0, 19)
+            : [t] "=&r"(t), "=m"(*reinterpret_cast<Bytes*>(w))
+            : [d] "r"(w), [s] "r"(d), "m"(*reinterpret_cast<const Bytes*>(d)));
+#undef EVMONE_RB
+        w[5] = 0;
+        w[6] = 0;
+        w[7] = 0;
+    }
+    else
+    {
+        [&]<size_t... K>(std::index_sequence<K...>) noexcept {
+            ((w[K] = push_data_word<Len, K>(d)), ...);
+        }(std::make_index_sequence<NUM_DATA_WORDS>{});
 #pragma GCC unroll 8
-    for (size_t k = NUM_DATA_WORDS; k < 8; ++k)
-        w[k] = 0;
+        for (size_t k = NUM_DATA_WORDS; k < 8; ++k)
+            w[k] = 0;
+    }
     return d + Len;
 }
 #else
