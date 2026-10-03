@@ -181,6 +181,26 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
     // new_size is at most 2 * max_buffer_size, so the word counts stay below 2^28.
     const auto new_words = static_cast<uint32_t>((new_size + (word_size - 1)) / word_size);
     const auto current_words = static_cast<uint32_t>(memory.size() >> 5);  // / 32
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if (new_words < 65536) [[likely]]
+    {
+        // Below 2 MB of memory both squares fit 32 bits, so the cost does: on rv32 this is one
+        // mul per cost instead of a mul/mulhu pair and 64-bit adds and shifts, and the gas
+        // deduction is a 32-bit subtract with a borrow instead of a 64-bit one. Every growth on
+        // the 200-block corpus is below this (72% of them are by a single word).
+        const auto new_cost = 3 * new_words + (new_words * new_words >> 9);
+        const auto current_cost = 3 * current_words + (current_words * current_words >> 9);
+        const auto cost = new_cost - current_cost;  // new_words > current_words.
+        const auto g = static_cast<uint64_t>(gas_left);
+        const auto lo = static_cast<uint32_t>(g);
+        const auto borrow = static_cast<uint32_t>(lo < cost);
+        gas_left = static_cast<int64_t>(
+            (uint64_t{static_cast<uint32_t>(g >> 32) - borrow} << 32) | (lo - cost));
+        if (gas_left >= 0) [[likely]]
+            memory.grow(static_cast<size_t>(new_words) * word_size);
+        return gas_left;
+    }
+#endif
     // The square must be computed in 64 bits: it wraps uint32 once memory crosses
     // 2MB (65536 words), which turns the cost delta negative-then-huge and OOGs the
     // frame. On rv32im a 32x32->64 multiply is still a single mul/mulhu pair.
