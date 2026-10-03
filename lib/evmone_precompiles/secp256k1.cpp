@@ -966,18 +966,23 @@ __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
 
 /// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
 /// written into p's own coordinates as each one dies, skipping the copies through the returned
-/// point. Taking the coordinates apart lets a negated table point pass only its new y.
+/// point. Taking the coordinates apart lets a negated table point pass only its new y. With Live
+/// the caller knows p is not infinity either, which saves the 8-word test of z.
+template <bool Live = false>
 __attribute__((flatten)) void madd_inplace(
     ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
 {
     using FE = Curve::Fp;
     auto& [x1, y1, z1] = p;
-    if (p == 0)
+    if constexpr (!Live)
     {
-        x1 = x2;
-        y1 = y2;
-        z1 = FP_ONE;
-        return;
+        if (p == 0)
+        {
+            x1 = x2;
+            y1 = y2;
+            z1 = FP_ONE;
+            return;
+        }
     }
     DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
     DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
@@ -1005,17 +1010,21 @@ __attribute__((flatten)) void madd_inplace(
 
 /// p += (x2 : y2 : z2), a Jacobian point other than infinity, in place: ecc::add()'s
 /// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
+template <bool Live = false>
 __attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
     const Curve::Fp& y2, const Curve::Fp& z2) noexcept
 {
     using FE = Curve::Fp;
     auto& [x1, y1, z1] = p;
-    if (p == 0)
+    if constexpr (!Live)
     {
-        x1 = x2;
-        y1 = y2;
-        z1 = z2;
-        return;
+        if (p == 0)
+        {
+            x1 = x2;
+            y1 = y2;
+            z1 = z2;
+            return;
+        }
     }
     DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
     DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;      // z2^2
@@ -1055,6 +1064,18 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
 
     ecc::ProjPoint<Curve> result;  // The point at infinity.
     bool started = false;          // Doubling the point at infinity is a wasted doubling.
+    // The first addition sets the accumulator; the others know it is a live point.
+    const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+        if (started)
+            madd_inplace<true>(result, x, y);
+        else
+        {
+            result.x = x;
+            result.y = y;
+            result.z = FP_ONE;
+            started = true;
+        }
+    };
     for (auto i = top; i-- != 0;)
     {
         if (started)
@@ -1063,33 +1084,29 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
         if (const int d = naf_a[i]; d != 0)
         {
             const auto& pt = d > 0 ? ta[d >> 1] : ta[R_TABLE_SIZE + ((-d) >> 1)];
-            madd_inplace(result, pt.x, pt.y);
-            started = true;
+            add(pt.x, pt.y);
         }
         if (const int d = naf_b[i]; d != 0)
         {
             const auto& pt = d > 0 ? tb[d >> 1] : tb[R_TABLE_SIZE + ((-d) >> 1)];
-            madd_inplace(result, pt.x, pt.y);
-            started = true;
+            add(pt.x, pt.y);
         }
 
         if (const int d = naf_ga[i]; d != 0)
         {
             const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_ga)
-                madd_inplace(result, pt.x, -pt.y);
+                add(pt.x, -pt.y);
             else
-                madd_inplace(result, pt.x, pt.y);
-            started = true;
+                add(pt.x, pt.y);
         }
         if (const int d = naf_gb[i]; d != 0)
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_gb)
-                madd_inplace(result, pt.x, -pt.y);
+                add(pt.x, -pt.y);
             else
-                madd_inplace(result, pt.x, pt.y);
-            started = true;
+                add(pt.x, pt.y);
         }
     }
     return result;
@@ -1117,9 +1134,9 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
     r1.z = FP_ONE;
     Point two_r = r1;
     dbl_inplace(two_r);
-    madd_inplace(*new (&t[1]) Point{two_r}, R.x, R.y);
+    madd_inplace<true>(*new (&t[1]) Point{two_r}, R.x, R.y);
     for (size_t j = 2; j < R_TABLE_SIZE; ++j)
-        jadd_inplace(*new (&t[j]) Point{t[j - 1]}, two_r.x, two_r.y, two_r.z);
+        jadd_inplace<true>(*new (&t[j]) Point{t[j - 1]}, two_r.x, two_r.y, two_r.z);
     const auto beta = Curve::Fp{Curve::BETA};
     for (size_t j = 0; j < R_TABLE_SIZE; ++j)
     {
@@ -1140,6 +1157,28 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
 
     Point result;  // The point at infinity.
     bool started = false;
+    const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+        if (started)
+            madd_inplace<true>(result, x, y);
+        else
+        {
+            result.x = x;
+            result.y = y;
+            result.z = FP_ONE;
+            started = true;
+        }
+    };
+    const auto add_jac = [&](const Curve::Fp& x, const Curve::Fp& y, const Curve::Fp& z) noexcept {
+        if (started)
+            jadd_inplace<true>(result, x, y, z);
+        else
+        {
+            result.x = x;
+            result.y = y;
+            result.z = z;
+            started = true;
+        }
+    };
     for (auto i = top; i-- != 0;)
     {
         if (started)
@@ -1148,32 +1187,28 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
         if (const int d = naf_a[i]; d != 0)
         {
             const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
-            jadd_inplace(result, t[j].x, (d < 0) != a2.sign ? ny[j] : t[j].y, t[j].z);
-            started = true;
+            add_jac(t[j].x, (d < 0) != a2.sign ? ny[j] : t[j].y, t[j].z);
         }
         if (const int d = naf_b[i]; d != 0)
         {
             const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
-            jadd_inplace(result, bx[j], (d < 0) != b2.sign ? ny[j] : t[j].y, t[j].z);
-            started = true;
+            add_jac(bx[j], (d < 0) != b2.sign ? ny[j] : t[j].y, t[j].z);
         }
         if (const int d = naf_ga[i]; d != 0)
         {
             const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != a1.sign)
-                madd_inplace(result, pt.x, -pt.y);
+                add(pt.x, -pt.y);
             else
-                madd_inplace(result, pt.x, pt.y);
-            started = true;
+                add(pt.x, pt.y);
         }
         if (const int d = naf_gb[i]; d != 0)
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != b1.sign)
-                madd_inplace(result, pt.x, -pt.y);
+                add(pt.x, -pt.y);
             else
-                madd_inplace(result, pt.x, pt.y);
-            started = true;
+                add(pt.x, pt.y);
         }
     }
     return result;
@@ -1279,7 +1314,7 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         for (size_t j = 0;; ++j)
         {
             auto& p_j = odd[i * M + j];
-            madd_inplace(p_j, two_r[i].x, two_r[i].y);
+            madd_inplace<true>(p_j, two_r[i].x, two_r[i].y);
             odd_z[i * M + j] = p_j.z;
             if (j + 1 == M)
                 break;
