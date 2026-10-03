@@ -117,7 +117,22 @@ public:
 
             allocate_capacity();
         }
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+        // Every size is a multiple of 32 and m_data comes from the 8-aligned allocator, so the new
+        // extent is whole, word-aligned 32-byte words: store them inline, rather than calling
+        // memset for the usual 1 to 3 of them.
+        auto* w = reinterpret_cast<uint32_t*>(&m_data[m_size]);
+        auto* const end = reinterpret_cast<uint32_t*>(&m_data[new_size]);
+        do
+        {
+#pragma GCC unroll 8
+            for (size_t i = 0; i < 8; ++i)
+                w[i] = 0;
+            w += 8;
+        } while (w != end);
+#else
         std::memset(&m_data[m_size], 0, new_size - m_size);
+#endif
         m_size = new_size;
     }
 
