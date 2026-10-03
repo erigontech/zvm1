@@ -207,7 +207,10 @@ public:
         status = EVMC_SUCCESS;
         output_offset = 0;
         output_size = 0;
-        m_tx = {};
+        // get_tx_context() refetches the whole context once block_timestamp is 0, and nothing
+        // else reads m_tx: resetting that field invalidates it, where zeroing all 240 bytes was
+        // a memset per message.
+        m_tx.block_timestamp = 0;
     }
 
     [[nodiscard]] bool in_static_mode() const { return (msg->flags & EVMC_STATIC) != 0; }
