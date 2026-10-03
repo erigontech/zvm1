@@ -33,8 +33,8 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
     const auto* const base = reinterpret_cast<const int8_t*>(code.data());
     const auto* const end = base + code.size();
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // Test 4 opcodes per bound check: a plain opcode then costs its load and one branch, where
-    // the loop above spends 4 instructions on each. The reads run up to 3 bytes past the end,
+    // Test 8 opcodes per bound check: a plain opcode then costs its load and one branch, where
+    // the loop above spends 4 instructions on each. The reads run up to 7 bytes past the end,
     // into the zero padding of the analysis copy (see analyze_legacy()), and a 0 (STOP) is
     // neither PUSH nor JUMPDEST, so it only steps the walk past the end.
     const auto* p = base;
@@ -59,8 +59,16 @@ void analyze_jumpdests(BitsetSpan map, bytes_view code) noexcept
             special.operator()<2>(op2);
         else if (const auto op3 = p[3]; op3 >= OP_JUMPDEST)
             special.operator()<3>(op3);
+        else if (const auto op4 = p[4]; op4 >= OP_JUMPDEST)
+            special.operator()<4>(op4);
+        else if (const auto op5 = p[5]; op5 >= OP_JUMPDEST)
+            special.operator()<5>(op5);
+        else if (const auto op6 = p[6]; op6 >= OP_JUMPDEST)
+            special.operator()<6>(op6);
+        else if (const auto op7 = p[7]; op7 >= OP_JUMPDEST)
+            special.operator()<7>(op7);
         else
-            p += 4;
+            p += 8;
     }
 #else
     for (const auto* p = base; p < end;)
