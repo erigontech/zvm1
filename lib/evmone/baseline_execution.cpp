@@ -273,6 +273,60 @@ struct Position
         pos.code_it += 4;
     return true;
 }
+/// ISZERO or EQ, then PUSH2 and JUMPI: the conditional branches Solidity emits for `if` and for
+/// comparisons (5.3M and 3.0M per 200 mainnet blocks). The comparison result is never written to
+/// the stack and read back; it decides the jump directly. Checks run in the separate
+/// instructions' order: the comparison's underflow and 3 gas, PUSH2's overflow (EQ popped an
+/// item, so it cannot overflow) and 3 gas, JUMPI's 10 gas (its two operands are there).
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_ISZERO || Op == OP_EQ);
+    constexpr int required = Op == OP_EQ ? 2 : 1;
+    if (pos.code_it[1] != OP_PUSH2 || pos.code_it[4] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + (required - 1)))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+        return fail(EVMC_OUT_OF_GAS);
+    if constexpr (Op == OP_ISZERO)
+    {
+        if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+            return fail(EVMC_STACK_OVERFLOW);
+    }
+    if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 10)))
+        return fail(EVMC_OUT_OF_GAS);
+    const auto* const a = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    bool taken;
+    if constexpr (Op == OP_ISZERO)
+        taken = (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) == 0;
+    else
+    {
+        const auto* const b = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+        taken = ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) | (a[4] ^ b[4]) |
+                    (a[5] ^ b[5]) | (a[6] ^ b[6]) | (a[7] ^ b[7])) == 0;
+    }
+    pos.stack_end -= required;  // The comparison leaves one, PUSH2 one more, JUMPI takes two.
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(pos.code_it[2]);
+        asm("" : "+r"(dst));  // See fused_push2_jump().
+        dst = dst << 8 | pos.code_it[3];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+    }
+    else
+        pos.code_it += 5;
+    return true;
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -284,6 +338,11 @@ template <Opcode Op, bool TracingEnabled>
     if constexpr (Op == OP_PUSH2)
     {
         if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_ISZERO || Op == OP_EQ)
+    {
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, stack_limit, pos, gas, state))
             return pos;
     }
 #endif
