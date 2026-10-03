@@ -136,13 +136,15 @@ void CodeCache::put(const evmc::bytes32& code_hash, std::shared_ptr<baseline::Co
 }
 
 
-std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revision rev,
-    const evmc_message& msg, const evmc::bytes32& code_hash,
+bool VM::has_cached_execution() const noexcept
+{
+    return execute == static_cast<decltype(execute)>(baseline::execute);
+}
+
+evmc_result VM::execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
+    const evmc::bytes32& code_hash,
     const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept
 {
-    if (execute != static_cast<decltype(execute)>(baseline::execute))  // Only Baseline is supported
-        return {};
-
     auto p = m_code_cache.get(code_hash);
     if (p == nullptr)
     {
@@ -152,8 +154,7 @@ std::optional<evmc::Result> VM::execute_cached_code(evmc::Host& host, evmc_revis
     }
 
     const auto& ca = *p;
-    return evmc::Result{
-        baseline::execute(*this, evmc::Host::get_interface(), host.to_context(), rev, msg, ca)};
+    return baseline::execute(*this, evmc::Host::get_interface(), host.to_context(), rev, msg, ca);
 }
 
 }  // namespace evmone
