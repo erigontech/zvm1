@@ -675,6 +675,14 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
 #endif
 
 
+#if defined(AIRBENDER) && defined(__riscv)
+namespace
+{
+ecc::ProjPoint<Curve> ecrecover_msm_single(
+    const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept;
+}  // namespace
+#endif
+
 std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
     RecoveryMode mode) noexcept
@@ -717,8 +725,9 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     // 6. Calculate public key point Q = u1×G + u2×R.
     const auto Rpt = AffinePoint{r_mont, *y};
 #if defined(AIRBENDER) && defined(__riscv)
-    // Use GLV endomorphism for 4-way MSM over ~128-bit scalars
-    const auto Q = ecrecover_msm_glv(u1.value(), u2.value(), Rpt);
+    // GLV halves: width-12 NAFs over the precomputed odd multiples of G and phi(G), width-5 NAFs
+    // over odd multiples of R and phi(R) in Jacobian coordinates.
+    const auto Q = ecrecover_msm_single(u1.value(), u2.value(), Rpt);
 #else
     const auto Q = msm(u1.value(), G, u2.value(), Rpt);
 #endif
@@ -978,6 +987,45 @@ __attribute__((flatten)) void madd_inplace(
     z1 *= h; z1 += z1;                           // z3 = 2 z1 h
 }
 
+/// p += (x2 : y2 : z2), a Jacobian point other than infinity, in place: ecc::add()'s
+/// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
+__attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
+    const Curve::Fp& y2, const Curve::Fp& z2) noexcept
+{
+    using FE = Curve::Fp;
+    auto& [x1, y1, z1] = p;
+    if (p == 0)
+    {
+        x1 = x2;
+        y1 = y2;
+        z1 = z2;
+        return;
+    }
+    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
+    DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;      // z2^2
+    DECL_FE_COPY(FE, u1, x1); u1 *= z2z2;        // u1 = x1 z2^2
+    DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
+    z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
+    z2z2 *= z2; z2z2 *= y1;                      // s1 = y1 z2^3
+    h -= u1;                                     // h = u2 - u1
+    z1z1 -= z2z2;                                // r = s2 - s1
+    if (h == 0 && z1z1 == 0) [[unlikely]]
+    {
+        dbl_inplace(p);
+        return;
+    }
+    DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
+    u1 *= hh;                                    // v = u1 h^2
+    hh *= h;                                     // h^3
+    x1 = z1z1; x1 *= z1z1;                       // r^2
+    x1 -= hh; x1 -= u1; x1 -= u1;                // x3 = r^2 - h^3 - 2v
+    u1 -= x1;                                    // v - x3
+    hh *= z2z2;                                  // s1 h^3
+    y1 = z1z1; y1 *= u1;                         // r (v - x3)
+    y1 -= hh;                                    // y3 = r (v - x3) - s1 h^3
+    z1 *= z2; z1 *= h;                           // z3 = z1 z2 h
+}
+
 /// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves), from the
 /// NAFs of the halves: width-12 ones of k1a and k1b (naf_ga, naf_gb) over G_ODD and PHI_G_ODD,
 /// negated by the sign of the half, and width-5 ones of k2a and k2b over ta and tb: ta[0..7] and
@@ -1022,6 +1070,90 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_gb)
+                madd_inplace(result, pt.x, -pt.y);
+            else
+                madd_inplace(result, pt.x, pt.y);
+            started = true;
+        }
+    }
+    return result;
+}
+
+/// u1*G + u2*R for a single signature (the ECRECOVER precompile), which has no batch to share
+/// inversions with: msm_wnaf()'s digits, with the odd multiples of R kept in Jacobian coordinates
+/// (2R by doubling, 3R by a mixed addition, the rest by Jacobian ones) and phi applied as
+/// (BETA X : Y : Z). No table addition can hit P == +/-Q (see ecrecover_batch()).
+ecc::ProjPoint<Curve> ecrecover_msm_single(
+    const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
+{
+    using Point = ecc::ProjPoint<Curve>;
+    const auto [a1, b1] = ecc::decompose<Curve>(u1);
+    const auto [a2, b2] = ecc::decompose<Curve>(u2);
+
+    alignas(32) std::byte t_raw[R_TABLE_SIZE * sizeof(Point)];
+    alignas(32) std::byte e_raw[2 * R_TABLE_SIZE * sizeof(Curve::Fp)];
+    auto* const t = reinterpret_cast<Point*>(t_raw);
+    auto* const bx = reinterpret_cast<Curve::Fp*>(e_raw);  // BETA X_j
+    auto* const ny = bx + R_TABLE_SIZE;                      // -Y_j
+    auto& r1 = *new (&t[0]) Point{};
+    r1.x = R.x;
+    r1.y = R.y;
+    r1.z = FP_ONE;
+    Point two_r = r1;
+    dbl_inplace(two_r);
+    madd_inplace(*new (&t[1]) Point{two_r}, R.x, R.y);
+    for (size_t j = 2; j < R_TABLE_SIZE; ++j)
+        jadd_inplace(*new (&t[j]) Point{t[j - 1]}, two_r.x, two_r.y, two_r.z);
+    const auto beta = Curve::Fp{Curve::BETA};
+    for (size_t j = 0; j < R_TABLE_SIZE; ++j)
+    {
+        new (&bx[j]) Curve::Fp{t[j].x};
+        bx[j] *= beta;
+        new (&ny[j]) Curve::Fp{-t[j].y};
+    }
+
+    alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
+    alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
+    alignas(4) int16_t naf_ga[WNAF_LEN + 1]{};
+    alignas(4) int16_t naf_gb[WNAF_LEN + 1]{};
+    const auto top = std::max(
+        std::max(wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const uint32_t*>(&a2.value)),
+            wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const uint32_t*>(&b2.value))),
+        std::max(wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const uint32_t*>(&a1.value)),
+            wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&b1.value))));
+
+    Point result;  // The point at infinity.
+    bool started = false;
+    for (auto i = top; i-- != 0;)
+    {
+        if (started)
+            dbl_inplace(result);
+
+        if (const int d = naf_a[i]; d != 0)
+        {
+            const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
+            jadd_inplace(result, t[j].x, (d < 0) != a2.sign ? ny[j] : t[j].y, t[j].z);
+            started = true;
+        }
+        if (const int d = naf_b[i]; d != 0)
+        {
+            const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
+            jadd_inplace(result, bx[j], (d < 0) != b2.sign ? ny[j] : t[j].y, t[j].z);
+            started = true;
+        }
+        if (const int d = naf_ga[i]; d != 0)
+        {
+            const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != a1.sign)
+                madd_inplace(result, pt.x, -pt.y);
+            else
+                madd_inplace(result, pt.x, pt.y);
+            started = true;
+        }
+        if (const int d = naf_gb[i]; d != 0)
+        {
+            const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
+            if ((d < 0) != b1.sign)
                 madd_inplace(result, pt.x, -pt.y);
             else
                 madd_inplace(result, pt.x, pt.y);
