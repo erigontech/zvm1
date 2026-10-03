@@ -79,6 +79,12 @@ public:
         m_jumpdest_bitset{map}
     {}
 
+    /// Constructor for legacy code whose padded copy starts inside the owned storage.
+    CodeAnalysis(std::unique_ptr<uint8_t[]> storage, const uint8_t* padded_code,
+        size_t code_size, BitsetSpan map)
+      : m_code{padded_code, code_size}, m_padded_code{std::move(storage)}, m_jumpdest_bitset{map}
+    {}
+
     /// The executable code. This is where the interpreter should start execution.
     [[nodiscard]] bytes_view code() const noexcept { return m_code; }
 

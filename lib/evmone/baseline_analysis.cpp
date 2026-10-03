@@ -101,9 +101,32 @@ CodeAnalysis analyze_legacy(bytes_view code)
     static constexpr auto BITSET_ALIGNMENT = alignof(BitsetSpan::word_type);
 
     const auto padded_code_size = code.size() + PADDING;
+    const auto bitset_words = (code.size() + (BitsetSpan::WORD_BITS)) / BitsetSpan::WORD_BITS;
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The copy starts at the code's own offset modulo 32: the guest's memcpy then copies the
+    // bulk in 32-byte CSR chunks (0.125 instructions a byte) instead of word by word (0.5), and
+    // 2.8 MB of code is copied per block. The bitset follows the padded code word-aligned.
+    auto storage = std::make_unique_for_overwrite<uint8_t[]>(
+        32 + padded_code_size + BITSET_ALIGNMENT + bitset_words * sizeof(BitsetSpan::word_type));
+    const auto base = reinterpret_cast<uintptr_t>(storage.get());
+    const auto code_off = (reinterpret_cast<uintptr_t>(code.data()) - base) & 31;
+    uint8_t* const padded = storage.get() + code_off;
+    const auto bitset_off =
+        ((code_off + padded_code_size + (BITSET_ALIGNMENT - 1)) / BITSET_ALIGNMENT) *
+        BITSET_ALIGNMENT;
+    const auto total_size = bitset_off + bitset_words * sizeof(BitsetSpan::word_type);
+    std::memcpy(padded, code.data(), code.size());
+    std::memset(padded + code.size(), 0, total_size - code_off - code.size());
+    const auto bitset_storage =
+        new (&storage[bitset_off]) BitsetSpan::word_type[bitset_words];
+    const BitsetSpan jumpdest_bitset{bitset_storage};
+    // Scan the padded copy: a truncated PUSH at the end advances past the last opcode by up to
+    // 32 bytes, which stays inside this allocation but not inside the caller's.
+    analyze_jumpdests(jumpdest_bitset, {padded, code.size()});
+    return {std::move(storage), padded, code.size(), jumpdest_bitset};
+#else
     const auto aligned_code_size =
         (padded_code_size + (BITSET_ALIGNMENT - 1)) / BITSET_ALIGNMENT * BITSET_ALIGNMENT;
-    const auto bitset_words = (code.size() + (BitsetSpan::WORD_BITS)) / BitsetSpan::WORD_BITS;
     const auto total_size = aligned_code_size + bitset_words * sizeof(BitsetSpan::word_type);
 
     auto storage = std::make_unique_for_overwrite<uint8_t[]>(total_size);
@@ -125,6 +148,7 @@ CodeAnalysis analyze_legacy(bytes_view code)
     analyze_jumpdests(jumpdest_bitset, {storage.get(), code.size()});
 
     return {std::move(storage), code.size(), jumpdest_bitset};
+#endif
 }
 }  // namespace
 
