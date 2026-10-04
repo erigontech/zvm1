@@ -38,7 +38,9 @@ std::optional<blst_p1_affine> validate_G1(std::span<const std::byte, 48> b) noex
 
     // Subgroup check is required by the spec but there are no test vectors
     // with points outside G1 which would satisfy the final pairings check.
-    if (!blst_p1_affine_in_g1(&r))
+    // The point at infinity is in G1 (the spec's validate_kzg_g1() accepts it
+    // before the KeyValidate subgroup check), so skip the costly check for it.
+    if (!blst_p1_affine_is_inf(&r) && !blst_p1_affine_in_g1(&r))
         return std::nullopt;
     return r;
 }
@@ -99,6 +101,13 @@ bool kzg_verify_proof(const std::byte versioned_hash[VERSIONED_HASH_SIZE], const
     const auto Pi = validate_G1(std::span<const std::byte, 48>{proof, 48});
     if (!Pi)
         return false;
+
+    // C = π = O commits to and proves the zero polynomial (e.g. of an empty blob).
+    // Then the verification equation e(C - [y]₁, [1]₂) =? e(π, [s - z]₂) below becomes
+    // e(-[y]₁, [1]₂) =? 1, which holds iff y = 0 (y < r is validated), for any z.
+    // Decide it without the MSM and the pairings.
+    if (blst_p1_affine_is_inf(&*C) && blst_p1_affine_is_inf(&*Pi))
+        return std::ranges::all_of(std::span{y, 32}, [](std::byte b) { return b == std::byte{0}; });
 
     // The standard KZG verification equation
     //     e(C - [y]₁, [1]₂) =? e(π, [s - z]₂)

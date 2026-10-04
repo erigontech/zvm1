@@ -479,13 +479,19 @@ Account& State::insert(const address& addr, Account account)
 
 Account* State::find(const address& addr) noexcept
 {
+    const auto it = m_modified.find(addr);
+    if (it != m_modified.end() && it->second.loaded)
+        return it->second.nonexistent ? nullptr : &it->second;
+    return find_slow(addr, it);
+}
+
+Account* State::find_slow(
+    const address& addr, std::unordered_map<address, Account>::iterator it) noexcept
+{
     // TODO: Avoid the double lookup (find+insert). Nonexistent accounts are still re-queried from
     //   the initial state on every call; they could be cached as nonexistent nodes.
-    if (const auto it = m_modified.find(addr); it != m_modified.end())
+    if (it != m_modified.end())
     {
-        if (it->second.loaded)
-            return it->second.nonexistent ? nullptr : &it->second;
-
         // Access-list placeholder: lazy-load from StateView now.
         const auto cacc = m_initial.get_account(addr);
         it->second.loaded = true;

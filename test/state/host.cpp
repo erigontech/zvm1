@@ -357,7 +357,10 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
     if (msg_in.kind == EVMC_CREATE || msg_in.kind == EVMC_CREATE2)
         return create(msg_in);
 
-    auto msg = msg_in;  // Mutable: the depth-0 state-gas charge below can spill into msg.gas.
+    // The message is read-only here except that the depth-0 state-gas charge below can spill
+    // into its gas; only then is it copied (144 bytes, per call frame otherwise).
+    const evmc_message* msg_ptr = &msg_in;
+    evmc_message msg_copy;
 
     // EIP-8037: the top-level (depth 0) NEW_ACCOUNT state charge, which EIP-2780 makes a
     // top-level value transfer pay, applied after the EIP-7702 authorizations and before the
@@ -368,31 +371,34 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
     // EIP-8037: `msg.state_gas` stays the entry reservoir; `top_level_sg` holds the post-charge
     // pools (left/spilled) so a consuming path can commit the NEW_ACCOUNT charge on success or
     // refund it on failure. `used` is always derived as `msg.state_gas - left + spilled`.
-    StateGas top_level_sg{{.left = msg.state_gas}};
+    StateGas top_level_sg{{.left = msg_in.state_gas}};
     // Builds the failure result for a pre-execution charge OOG: all regular gas
     // is consumed and the entry reservoir is returned intact.
-    const auto out_of_gas_result = [&msg] {
+    const auto out_of_gas_result = [&msg_in] {
         evmc::Result r{EVMC_OUT_OF_GAS, 0};
-        r.state_gas.left = msg.state_gas;
+        r.state_gas.left = msg_in.state_gas;
         return r;
     };
-    if (m_rev >= EVMC_AMSTERDAM && msg.depth == 0)
+    if (m_rev >= EVMC_AMSTERDAM && msg_in.depth == 0)
     {
-        const auto* const recipient_acc = m_state.find(msg.recipient);
+        const auto* const recipient_acc = m_state.find(msg_in.recipient);
         const auto recipient_alive = recipient_acc != nullptr && !recipient_acc->is_empty();
-        if (!evmc::is_zero(msg.value) && !recipient_alive)
+        if (!evmc::is_zero(msg_in.value) && !recipient_alive)
         {
+            msg_copy = msg_in;
+            msg_ptr = &msg_copy;
             // A new account is materialized by the value transfer: pay NEW_ACCOUNT state gas.
             // This includes a previously-zero-balance precompile (EIP-161): funding it
             // creates a state account just like any other recipient. transition() has pre-checked
             // that the reservoir plus regular gas cover this, rolling authorizations back
             // otherwise.
-            if (!top_level_sg.charge(msg.gas, NEW_ACCOUNT_STATE_GAS))
+            if (!top_level_sg.charge(msg_copy.gas, NEW_ACCOUNT_STATE_GAS))
                 return out_of_gas_result();  // Reservoir untouched (atomic charge failure).
         }
         // The EIP-7702 delegated-recipient code-read access is charged at the top frame in
         // transition() (WARM_ACCESS or COLD_ACCOUNT_ACCESS by the target's warmth).
     }
+    const evmc_message& msg = *msg_ptr;
 
     if (msg.kind == EVMC_CALL)
     {
@@ -457,10 +463,11 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
     }
 
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
-    auto opt_result = my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
-        [this](const address& addr) { return m_state.get_code(addr); });
-    if (opt_result.has_value())
-        return std::move(*opt_result);
+    if (my_vm->has_cached_execution())
+    {
+        return evmc::Result{my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
+            [this](const address& addr) { return m_state.get_code(addr); })};
+    }
 
     // TODO: get_code() performs the account lookup. Add a way to get an account with code?
     const auto code = m_state.get_code(msg.code_address);

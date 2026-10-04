@@ -53,8 +53,15 @@ private:
 public:
     VM() noexcept;
 
-    std::optional<evmc::Result> execute_cached_code(evmc::Host& host, evmc_revision rev,
-        const evmc_message& msg, const evmc::bytes32& code_hash,
+    /// Whether execute_cached_code() applies: only the Baseline interpreter caches analyses.
+    [[nodiscard]] bool has_cached_execution() const noexcept;
+
+    /// Executes msg in the Baseline interpreter with the cached analysis of code_hash (made with
+    /// get_code when missing). Returns the raw result: the one copy into the caller's
+    /// evmc::Result is all it costs, where a std::optional<evmc::Result> return moved the
+    /// 80-byte result twice more per message.
+    evmc_result execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
+        const evmc::bytes32& code_hash,
         const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept;
 
     [[nodiscard]] ExecutionState& get_execution_state(size_t depth) noexcept;
