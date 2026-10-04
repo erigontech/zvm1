@@ -797,6 +797,21 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // 64 bytes are the mapping slots keccak(key . slot), mostly hashed before in the block: they
+    // are memoized, and the result is stored as the big-endian number directly. The memo reads
+    // words, so it takes aligned inputs, which are all but a few.
+    if (s == 64)
+    {
+        const auto data = &state.memory[i];
+        if ((reinterpret_cast<uintptr_t>(data) & 3) == 0) [[likely]]
+        {
+            ethash_keccak256_64_be(
+                reinterpret_cast<ethash_w32*>(&size), reinterpret_cast<const ethash_w32*>(data));
+            return {EVMC_SUCCESS, gas_left};
+        }
+    }
+#endif
     auto data = s != 0 ? &state.memory[i] : nullptr;
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
     return {EVMC_SUCCESS, gas_left};

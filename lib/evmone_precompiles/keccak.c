@@ -797,3 +797,95 @@ union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
     return hash;
 #endif
 }
+
+#if defined(AIRBENDER)
+/// The number of index bits of keccak64_memo[]: 16384 slots, 2 MB. A block of the 200-block corpus
+/// hashes 1280 distinct 64-byte inputs on average, and 11010 at most.
+#define KECCAK64_MEMO_BITS 14
+
+/// A 64-byte input of ethash_keccak256_64_be() and its result, padded to 128 bytes: a power of two
+/// takes the index to the slot with one shift instead of three instructions for 96 bytes.
+struct keccak64_memo_slot
+{
+    uint32_t key[16];   ///< The input words.
+    uint32_t value[8];  ///< The result words. The slot is empty while value[0] is 0.
+    uint32_t unused[8];
+};
+
+/// Direct-mapped memo of the 64-byte KECCAK256 inputs: the mapping slots keccak(key . slot), which
+/// a contract hashes again on every access to the same entry. 65% of the 64-byte hashes in the
+/// 200-block corpus repeat one done before in the block.
+///
+/// Zero-initialized, so it is .bss, which costs nothing at startup: Airbender RAM starts zeroed.
+/// A slot answers only if its first result word is nonzero, so the zeroed table never answers for
+/// the all-zero input before that has been hashed, and a result whose first word is 0 (one in
+/// 2^32) is just recomputed every time. An answer compares all 64 bytes; collisions only evict.
+static struct keccak64_memo_slot keccak64_memo[1u << KECCAK64_MEMO_BITS];
+
+/// Hashes the 64 bytes at @p data into @p slot and copies the result to @p out: the memo's miss.
+/// Out of line so that the permutation's fixed registers (x10 and x11, where the arguments arrive)
+/// leave the hit path's register allocation alone.
+static NO_INLINE void keccak64_memo_fill(
+    ethash_w32 out[8], const ethash_w32* data, struct keccak64_memo_slot* slot)
+{
+    // The state of ethash_keccak256()'s short path for a 64-byte input: the input, the padding
+    // byte, zeros, and the last block bit, which lane 16 holds alone.
+    ethash_w32* const state = (ethash_w32*)buf;
+    size_t i;
+    for (i = 0; i < 16; ++i)
+    {
+        const uint32_t w = data[i];
+        slot->key[i] = w;
+        state[i] = w;
+    }
+    state[16] = 0x01;
+    // The offset is fixed here, so plain stores do without buf_zero_state_from()'s computed jump.
+#pragma GCC unroll 33
+    for (i = 17; i < 2 * 25; ++i)
+        state[i] = 0;
+    buf[16] = 0x8000000000000000ULL;
+    keccak_permute_buf();
+
+    // The hash bytes reversed are the big-endian number's little-endian bytes. Byte copies take two
+    // instructions a byte; the barriers keep GCC from merging them into halfword loads and stores
+    // with shifts to swap, which take more.
+    const uint8_t* h = (const uint8_t*)buf;
+    uint8_t* const v = (uint8_t*)slot->value;
+    __asm__("" : "+r"(h));
+#pragma GCC unroll 32
+    for (i = 0; i < 32; ++i)
+    {
+        uint8_t c = h[31 - i];
+        __asm__("" : "+r"(c));
+        v[i] = c;
+    }
+    for (i = 0; i < 8; ++i)
+        out[i] = slot->value[i];
+}
+
+NO_INLINE void ethash_keccak256_64_be(ethash_w32 out[8], const ethash_w32* data)
+{
+    // The index mixes the words a mapping key and slot vary in: the last word of each half (the
+    // low bytes of a number or an address), the first (a left-aligned bytesN key) and the fourth
+    // (the high bytes of an address). On the corpus it hits as often as a mix of all 16 does.
+    const uint32_t x = data[0] ^ data[3] ^ data[7] ^ data[15];
+    const uint32_t index = (x * 0x9E3779B1u) >> (32 - KECCAK64_MEMO_BITS);
+    struct keccak64_memo_slot* slot = &keccak64_memo[index];
+    __asm__("" : "+r"(slot));  // Kept in a register: GCC would recompute it from the index.
+
+    if (slot->value[0] != 0)
+    {
+        size_t i;
+        for (i = 0; i < 16; ++i)
+        {
+            if (slot->key[i] != data[i])
+                goto miss;
+        }
+        for (i = 0; i < 8; ++i)
+            out[i] = slot->value[i];
+        return;
+    }
+miss:
+    keccak64_memo_fill(out, data, slot);
+}
+#endif
