@@ -227,6 +227,20 @@ public:
     constexpr auto __attribute__((always_inline)) square_n(unsigned n) const noexcept { return wrap(Fp.square_n(value_, n)); }
 
 #if defined(AIRBENDER) && defined(__riscv)
+    /// In-place halving: this = this / 2.
+    FieldElement& __attribute__((always_inline)) halve() noexcept
+    {
+        Fp.halve(value_);
+        return *this;
+    }
+
+    /// In-place reverse subtraction: this = b - this.
+    FieldElement& __attribute__((always_inline)) rsub(const FieldElement& b) noexcept
+    {
+        Fp.rsub_assign(value_, b.value_);
+        return *this;
+    }
+
     /// In-place repeated squaring: x = x^(2^n) mod p.
     /// Avoids the wrap() overhead (zero-init + word copy + return copy) of the const version.
     /// Saves ~20-24 instructions per call vs `*this = this->square_n(n)`.

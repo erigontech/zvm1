@@ -557,6 +557,10 @@ class ModArith
     const uint64_t mod_inv_;
     /// Full 256-bit inverse of the modulus: mod⋅mod_inv_full_ ≡ 1 (mod 2²⁵⁶).
     alignas(32) const UintT mod_inv_full_;
+    /// 2^255: MUL_HIGH by it is a right shift by one bit.
+    alignas(32) const UintT half_shift_;
+    /// (mod + 1) / 2 = 2⁻¹ mod p, added back when halving an odd value.
+    alignas(32) const UintT half_mod_;
 #else
     const UintT mod_;  ///< The modulus.
     const UintT r_squared_;  ///< R² % mod.
@@ -582,7 +586,9 @@ public:
 #elif defined(AIRBENDER) && defined(__riscv)
         r_squared_{compute_r_squared(mod)},
         mod_inv_{compute_mont_mod_inv(mod)},
-        mod_inv_full_{compute_mont_mod_inv_full(mod)}
+        mod_inv_full_{compute_mont_mod_inv_full(mod)},
+        half_shift_{UintT{1} << (UintT::num_bits - 1)},
+        half_mod_{(mod >> 1) + 1}
 #else
         r_squared_{compute_r_squared(mod)},
         mod_inv_{compute_mont_mod_inv(mod)}
@@ -1432,6 +1438,78 @@ public:
                 "csrrw x0, 0x7CA, x0\n\t"
                 "1:\n\t"
 
+                :
+                : [pX] "r"(pX), [pY] "r"(pY), [pMod] "r"(pMod)
+                : "x10", "x11", "x12", "memory"
+            );
+        }
+    }
+
+    /// In-place halving: x = x / 2 (mod p). Requires x 32-byte aligned and x < p (p odd).
+    void __attribute__((always_inline)) halve(UintT& x) const noexcept
+        requires(UintT::num_bits == 256)
+    {
+        const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+        const uintptr_t pShift = reinterpret_cast<uintptr_t>(&half_shift_);
+        const uintptr_t pHalf = reinterpret_cast<uintptr_t>(&half_mod_);
+        uint32_t odd;
+        asm volatile(
+            "lw %[odd], 0(%[pX])\n\t"
+            "andi %[odd], %[odd], 1\n\t"
+            "mv x10, %[pX]\n\t"
+            "mv x11, %[pShift]\n\t"
+            "li x12, 0x10\n\t"
+            "csrrw x0, 0x7CA, x0\n\t"
+            "beqz %[odd], 1f\n\t"
+            "mv x11, %[pHalf]\n\t"
+            "li x12, 0x01\n\t"
+            "csrrw x0, 0x7CA, x0\n\t"
+            "1:\n\t"
+            : [odd] "=&r"(odd)
+            : [pX] "r"(pX), [pShift] "r"(pShift), [pHalf] "r"(pHalf)
+            : "x10", "x11", "x12", "memory"
+        );
+    }
+
+    /// In-place reverse modular subtraction: x = y - x (mod p). Requires x 32-byte aligned and
+    /// x, y < p. A y that aliases x or is not 32-byte aligned is first copied to an aligned buffer:
+    /// the CSR needs x10 != x11 and aligned operands.
+    void __attribute__((always_inline)) rsub_assign(UintT& x, const UintT& y) const noexcept
+        requires(UintT::num_bits == 256)
+    {
+        DECL_UNINIT_BUF(UintT, yy_buf);
+        const bool y_aliased = (&x == &y);
+        const bool y_unaligned = (reinterpret_cast<uintptr_t>(&y) & 31) != 0;
+        const bool y_needs_copy = y_aliased || y_unaligned;
+        if (y_aliased) {
+            register uintptr_t a0_ asm("x10") = reinterpret_cast<uintptr_t>(&yy_buf);
+            register uintptr_t a1_ asm("x11") = reinterpret_cast<uintptr_t>(&y);
+            register uint32_t a2_ asm("x12") = 0x80;
+            asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
+        } else if (y_unaligned) {
+            auto* d_ = reinterpret_cast<uint32_t*>(&yy_buf);
+            const auto* s_ = reinterpret_cast<const uint32_t*>(&y);
+            d_[0]=s_[0]; d_[1]=s_[1]; d_[2]=s_[2]; d_[3]=s_[3];
+            d_[4]=s_[4]; d_[5]=s_[5]; d_[6]=s_[6]; d_[7]=s_[7];
+        }
+        const uintptr_t y_ptr = y_needs_copy
+            ? reinterpret_cast<uintptr_t>(&yy_buf)
+            : reinterpret_cast<uintptr_t>(&y);
+        {
+            const uintptr_t pX = reinterpret_cast<uintptr_t>(&x);
+            const uintptr_t pY = y_ptr;
+            const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
+            asm volatile(
+                // SUB_AND_NEGATE(x, y) -> x = y - x, then ADD(x, mod) on borrow
+                "mv x10, %[pX]\n\t"
+                "mv x11, %[pY]\n\t"
+                "li x12, 0x04\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "beqz x12, 1f\n\t"
+                "mv x11, %[pMod]\n\t"
+                "li x12, 0x01\n\t"
+                "csrrw x0, 0x7CA, x0\n\t"
+                "1:\n\t"
                 :
                 : [pX] "r"(pX), [pY] "r"(pY), [pMod] "r"(pMod)
                 : "x10", "x11", "x12", "memory"

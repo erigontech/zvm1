@@ -943,25 +943,27 @@ unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
 /// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
 constexpr auto FP_ONE = Curve::Fp::one();
 
-/// p = 2p in place: ecc::dbl()'s a = 0 formula written into p's own coordinates as each one
-/// dies (x after S, z right away as Z' = 2YZ), skipping the copies into the returned point and
-/// back (3 CSR MEMCOPY each way).
+/// p = 2p in place, as the representative (X3/4 : Y3/8 : Z3/2) of ecc::dbl()'s a = 0 result
+/// (X3 : Y3 : Z3), i.e. with lambda = 1/2: with L = 3X^2/2 and T = XY^2, X' = L^2 - 2T,
+/// Y' = L(T - X') - Y^4 and Z' = YZ. (X : Y : Z) and (l^2 X : l^3 Y : l Z) are the same point and
+/// every caller uses the point only projectively (z == 0 tests, further additions and doublings,
+/// x/z^2 and y/z^3), so one halving of X replaces the doublings in 2YZ, 4XY^2 and 8Y^4. Each
+/// coordinate is written into p as it dies, skipping the copies into the returned point and back
+/// (3 CSR MEMCOPY each way).
 __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
 {
     using FE = Curve::Fp;
     auto& [x1, y1, z1] = p;
-    DECL_FE_COPY(FE, xx, x1); xx *= x1;          // X^2
     DECL_FE_COPY(FE, yy, y1); yy *= y1;          // Y^2
-    z1 *= y1; z1 += z1;                          // Z' = 2YZ
-    DECL_FE_COPY(FE, yyyy, yy); yyyy *= yy;      // Y^4
-    yy *= x1; yy += yy; yy += yy;                // S = 4XY^2
-    DECL_FE_COPY(FE, m, xx); m += xx; m += xx;   // M = 3X^2
-    x1 = m; x1 *= m;                             // M^2
-    x1 -= yy; x1 -= yy;                          // X' = M^2 - 2S
-    yy -= x1;                                    // S - X'
-    yyyy += yyyy; yyyy += yyyy;                  // 4Y^4
-    y1 = m; y1 *= yy;                            // M(S - X')
-    y1 -= yyyy; y1 -= yyyy;                      // Y' = M(S - X') - 8Y^4
+    z1 *= y1;                                    // Z' = YZ
+    DECL_FE_COPY(FE, m, x1); m.halve();          // X/2
+    m += x1; m *= x1;                            // L = 3X^2/2
+    y1 = yy; y1 *= yy;                           // Y^4
+    yy *= x1;                                    // T = XY^2
+    x1 = m; x1 *= m;                             // L^2
+    x1 -= yy; x1 -= yy;                          // X' = L^2 - 2T
+    yy -= x1; yy *= m;                           // L(T - X')
+    y1.rsub(yy);                                 // Y' = L(T - X') - Y^4
 }
 
 /// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
