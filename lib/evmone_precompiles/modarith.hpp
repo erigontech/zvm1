@@ -93,18 +93,20 @@ void csr_copy256(void* dst, const void* src) noexcept
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
 }
 
-/// Compute the full 256-bit Montgomery inverse: N' such that mod⋅N' ≡ -1 (mod 2²⁵⁶).
+/// Compute the full 256-bit inverse of the modulus: N⁻¹ such that mod⋅N⁻¹ ≡ 1 (mod 2²⁵⁶).
+/// This is the positive inverse, not the usual N' = -N⁻¹: the CSR Montgomery reduction
+/// subtracts m⋅N instead of adding it (see ModArith::mul()).
 /// Uses Newton-Raphson starting from the 64-bit inverse, doubling bits each step.
 template <typename UintT>
 constexpr UintT compute_mont_mod_inv_full(const UintT& mod) noexcept
 {
     // Start with 64-bit inverse
     UintT inv{};
-    inv[0] = compute_mont_mod_inv(mod);
-    // Newton-Raphson: for N' where N*N' ≡ -1 (mod R), step is N' * (2 + N*N')
+    inv[0] = modinv_pow2(mod[0]);
+    // Newton-Raphson: for inv where N*inv ≡ 1 (mod R), step is inv * (2 - N*inv)
     // Each iteration doubles the number of correct bits: 64 → 128 → 256
-    inv = inv * (UintT{2} + mod * inv);  // 128 bits correct
-    inv = inv * (UintT{2} + mod * inv);  // 256 bits correct
+    inv = inv * (UintT{2} - mod * inv);  // 128 bits correct
+    inv = inv * (UintT{2} - mod * inv);  // 256 bits correct
     return inv;
 }
 #endif
@@ -553,7 +555,7 @@ class ModArith
     alignas(32) const UintT r_squared_;  ///< R² % mod.
     /// The modulus inversion, i.e. the number N' such that mod⋅N' = 2⁶⁴-1.
     const uint64_t mod_inv_;
-    /// Full 256-bit Montgomery inverse: mod⋅mod_inv_full_ ≡ -1 (mod 2²⁵⁶).
+    /// Full 256-bit inverse of the modulus: mod⋅mod_inv_full_ ≡ 1 (mod 2²⁵⁶).
     alignas(32) const UintT mod_inv_full_;
 #else
     const UintT mod_;  ///< The modulus.
@@ -623,19 +625,23 @@ public:
             {
                 // Optimized from_mont: mul(x, 1) means T = x*1, so t_lo = x, t_hi = 0.
                 // Skip the two MUL CSR calls for x*y entirely.
-                // m = x * N' mod 2^256, mN_hi = upper(m * N),
-                // result = 0 + mN_hi + carry where carry = (x != 0).
-                // Then conditional subtract mod.
+                // m = x * N⁻¹ mod 2^256, so m*N ≡ x (mod 2^256): the low halves of T = x*1 and
+                // m*N cancel, and result = (x - m*N) / 2^256 = t_hi - mN_hi with t_hi = 0, i.e.
+                // -mN_hi, which is mod - mN_hi: one SUB_AND_NEGATE.
                 //
-                // Merged asm blocks: MUL_LOW+MUL_HIGH share x10, ADD+SUB share x10.
-                // Zero check uses short-circuit branching for early exit.
+                // Requires x < mod (all Montgomery values are reduced). For 0 < x < mod,
+                // mN_hi is in [1, mod-1] (mN_hi = 0 would mean x = m*N), so mod - mN_hi
+                // needs no correction. x = 0 would give mod instead of 0, so it skips the
+                // reduction: D = x = 0 is already the result.
 
-                alignas(32) UintT A{};     // t_hi = 0 -> result
-                DECL_UNINIT_BUF(UintT, D); // scratch: x copy -> m -> mN_hi
-                D = x;  // word copy (cheaper than MEMCOPY CSR)
+                DECL_UNINIT_BUF(UintT, D); // scratch: x copy -> m -> mN_hi -> result
+                D = x;  // word copy (cheaper than MEMCOPY CSR; x may be unaligned)
 
-                // 1-2. MUL_LOW(D, mod_inv) then MUL_HIGH(D, mod) - merged (x10=pD shared)
+                // Short-circuit test: almost always decided by the first word.
+                if (x[0] != 0 || x[1] != 0 || x[2] != 0 || x[3] != 0)
                 {
+                    // MUL_LOW(D, mod_inv), MUL_HIGH(D, mod), SUB_AND_NEGATE(D, mod):
+                    // x10=pD shared, x11=pMod shared by the last two.
                     const uintptr_t pD = reinterpret_cast<uintptr_t>(&D);
                     const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
                     const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
@@ -648,63 +654,16 @@ public:
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
+                        // D = mod - D  (x10=pD, x11=pMod both still valid)
+                        "li x12, 0x04\n\t"
+                        "csrrw x0, 0x7CA, x0\n\t"
                         :
                         : [pD] "r"(pD), [pModInv] "r"(pModInv), [pMod] "r"(pMod)
                         : "x10", "x11", "x12", "memory"
                     );
                 }
 
-                // 3. carry = (x != 0) - short-circuit branching
-                uint32_t low_carry;
-                {
-                    const auto* xw = reinterpret_cast<const uint32_t*>(&x);
-                    uint32_t w = xw[0];
-                    if (w == 0) w |= xw[1];
-                    if (w == 0) w |= xw[2];
-                    if (w == 0) w |= xw[3];
-                    if (w == 0) w |= xw[4];
-                    if (w == 0) w |= xw[5];
-                    if (w == 0) w |= xw[6];
-                    if (w == 0) w |= xw[7];
-                    low_carry = (w != 0) ? 1u : 0u;
-                }
-
-                // 4-6. ADD(A, D+carry) + SUB(A, mod) + conditional ADD - merged
-                {
-                    const uintptr_t pA = reinterpret_cast<uintptr_t>(&A);
-                    const uintptr_t pD = reinterpret_cast<uintptr_t>(&D);
-                    const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
-                    uint32_t tmp;
-                    asm volatile(
-                        // ADD(A, D + carry)
-                        "mv x10, %[pA]\n\t"
-                        "mv x11, %[pD]\n\t"
-                        "slli x12, %[carry], 6\n\t"
-                        "ori x12, x12, 0x01\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-                        "mv %[tmp], x12\n\t"  // tmp = carry out
-
-                        // SUB(A, mod) - x10=pA stays
-                        "mv x11, %[pMod]\n\t"
-                        "li x12, 0x02\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-
-                        // Conditional ADD back if carry==0 && borrow!=0
-                        // x10=pA, x11=pMod still valid
-                        "bnez %[tmp], 2f\n\t"
-                        "beqz x12, 2f\n\t"
-                        "li x12, 0x01\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-                        "2:\n\t"
-
-                        : [tmp] "=&r"(tmp)
-                        : [pA] "r"(pA), [pD] "r"(pD), [pMod] "r"(pMod),
-                          [carry] "r"(low_carry)
-                        : "x10", "x11", "x12", "memory"
-                    );
-                }
-
-                return A;
+                return D;
             }
         }
 #endif
@@ -736,9 +695,13 @@ public:
             {
                 // BigInt CSR Montgomery multiplication using 3 aligned buffers (A, C, D):
                 //   T = x*y  (512-bit)
-                //   m = T_lo * N'  (mod 2^256)
-                //   result = (T + m*N) >> 256
-                //   if result >= N: result -= N
+                //   m = T_lo * N⁻¹  (mod 2^256), so m*N ≡ T_lo (mod 2^256)
+                //   result = (T - m*N) >> 256 = t_hi - mN_hi  (the low halves cancel exactly)
+                //   if result < 0: result += N
+                // Requires x < N or y < N (Montgomery values are reduced, to_mont() multiplies
+                // by R² mod N): then t_hi < N and mN_hi < N, so one conditional add of N reduces.
+                // Subtracting m*N with the positive inverse needs no t_lo != 0 carry, unlike
+                // adding m*N with N' = -N⁻¹.
                 //
                 // Class members mod_, mod_inv_full_ are aligned, used directly as x11.
                 // FieldElement value_ is aligned, so y can be used directly as x11.
@@ -771,7 +734,6 @@ public:
                     const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
                     const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
 
-                    uint32_t tmp;
                     asm volatile(
                         // Reordered: all B-ptr ops first, then A-ptr ops.
                         // Keeps x10 stable across consecutive CSR calls, saving 1 mv.
@@ -794,71 +756,43 @@ public:
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 3: Zero check on B (short-circuit: first nonzero word -> carry=1)
-                        "lw %[tmp], 0(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 4(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 8(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 12(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 16(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 20(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 24(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 28(%[pB])\n\t"
-                        "1:\n\t"
-                        "snez %[tmp], %[tmp]\n\t"  // tmp = (t_lo != 0) ? 1 : 0
-
-                        // Step 4: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
+                        // Step 3: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
                         "mv x11, %[pModInv]\n\t"
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 5: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
+                        // Step 4: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 6: MUL_HIGH(A, y) -> A = t_hi  (x10=pA, x11=pY)
+                        // Step 5: MUL_HIGH(A, y) -> A = t_hi  (x10=pA, x11=pY)
                         // Deferred from before: A still holds x (untouched since step 0).
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pY]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 7: ADD(A, B + carry) -> A += B  (x10=pA stays, x11=pB)
-                        // x10 still pA from step 6
+                        // Step 6: SUB(A, B) -> A = t_hi - mN_hi, x12 = borrow  (x10=pA stays)
                         "mv x11, %[pB]\n\t"
-                        "slli x12, %[tmp], 6\n\t"
-                        "ori x12, x12, 0x01\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-                        "mv %[tmp], x12\n\t"  // tmp = carry out from ADD
-
-                        // Step 8: SUB(A, mod) -> A -= mod  (x10=pA stays, x11=pMod)
-                        "mv x11, %[pMod]\n\t"
                         "li x12, 0x02\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 9: Conditional ADD back if carry==0 && borrow!=0
-                        // x10=pA, x11=pMod both still valid from step 8
-                        "bnez %[tmp], 2f\n\t"   // if carry != 0, skip (result valid)
-                        "beqz x12, 2f\n\t"      // if borrow == 0, skip (no underflow)
-                        "li x12, 0x01\n\t"
+                        // Step 7: Conditional ADD(A, mod) if the subtraction borrowed.
+                        // The borrow flag left in x12 is exactly 1, which is the ADD control mask.
+                        "beqz x12, 2f\n\t"
+                        "mv x11, %[pMod]\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
                         "2:\n\t"
 
-                        : [tmp] "=&r"(tmp)
+                        :
                         : [pA] "r"(pA), [pB] "r"(pB), [pX] "r"(pX),
                           [pY] "r"(pY), [pModInv] "r"(pModInv), [pMod] "r"(pMod)
                         : "x10", "x11", "x12", "memory"
                     );
                 } else {
                     // Unaligned x path: A already contains x from word copy above.
-                    // Steps 1-9 with word-copy reloads where needed.
+                    // Steps 1-7 with word-copy reloads where needed.
 
                     // 1. MUL_LOW(A, y) -> A = t_lo
                     {
@@ -885,22 +819,7 @@ public:
                         asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     }
 
-                    // 4. Zero check
-                    uint32_t low_carry;
-                    {
-                        const auto* bw = reinterpret_cast<const uint32_t*>(&B);
-                        uint32_t w = bw[0];
-                        if (w == 0) w |= bw[1];
-                        if (w == 0) w |= bw[2];
-                        if (w == 0) w |= bw[3];
-                        if (w == 0) w |= bw[4];
-                        if (w == 0) w |= bw[5];
-                        if (w == 0) w |= bw[6];
-                        if (w == 0) w |= bw[7];
-                        low_carry = (w != 0) ? 1u : 0u;
-                    }
-
-                    // 5-9: same as before
+                    // 4-7: same as the aligned path
                     {
                         register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&B);
                         register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_inv_full_);
@@ -913,23 +832,15 @@ public:
                         register uint32_t a2 asm("x12") = 0x10;
                         asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                     }
-                    uint32_t carry;
-                    {
-                        register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
-                        register uint32_t a2 asm("x12") = 0x01 | (low_carry << 6);
-                        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
-                        carry = a2;
-                    }
                     uint32_t borrow;
                     {
                         register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
-                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
+                        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&B);
                         register uint32_t a2 asm("x12") = 0x02;
                         asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
                         borrow = a2;
                     }
-                    if (!carry & borrow)
+                    if (borrow)
                     {
                         register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&A);
                         register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&mod_);
@@ -980,6 +891,7 @@ public:
     /// In-place Montgomery modular multiplication: x = x * y mod.
     /// Saves one MEMCOPY vs mul() by using x's aligned buffer directly as x10.
     /// Requires x to be 32-byte aligned (guaranteed by FieldElement::value_).
+    /// Same reduction as mul(): requires x < mod or y < mod.
     constexpr void mul_assign(UintT& x, const UintT& y) const noexcept
     {
 #if defined(AIRBENDER) && defined(__riscv)
@@ -1008,7 +920,6 @@ public:
                     const uintptr_t pModInv = reinterpret_cast<uintptr_t>(&mod_inv_full_);
                     const uintptr_t pMod = reinterpret_cast<uintptr_t>(&mod_);
 
-                    uint32_t tmp;
                     asm volatile(
                         // Reordered: all B-ptr ops first, then x-ptr ops.
                         // Keeps x10 stable across consecutive CSR calls, saving 1 mv.
@@ -1025,62 +936,36 @@ public:
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 2: Zero check on B (t_lo)
-                        "lw %[tmp], 0(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 4(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 8(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 12(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 16(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 20(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 24(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 28(%[pB])\n\t"
-                        "1:\n\t"
-                        "snez %[tmp], %[tmp]\n\t"
-
-                        // Step 3: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
+                        // Step 2: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
                         "mv x11, %[pModInv]\n\t"
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 4: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
+                        // Step 3: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 5: MUL_HIGH(x, y) -> x = t_hi  (x10=pX, x11=pY)
+                        // Step 4: MUL_HIGH(x, y) -> x = t_hi  (x10=pX, x11=pY)
                         // Deferred: x still holds original value (untouched since step 0).
                         "mv x10, %[pX]\n\t"
                         "mv x11, %[pY]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 6: ADD(x, B + carry) -> x += B  (x10=pX stays, x11=pB)
+                        // Step 5: SUB(x, B) -> x = t_hi - mN_hi, x12 = borrow  (x10=pX stays)
                         "mv x11, %[pB]\n\t"
-                        "slli x12, %[tmp], 6\n\t"
-                        "ori x12, x12, 0x01\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-                        "mv %[tmp], x12\n\t"
-
-                        // Step 7: SUB(x, mod)  (x10=pX stays, x11=pMod)
-                        "mv x11, %[pMod]\n\t"
                         "li x12, 0x02\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 8: Conditional ADD back
-                        "bnez %[tmp], 2f\n\t"
+                        // Step 6: Conditional ADD(x, mod) if the subtraction borrowed.
+                        // The borrow flag left in x12 is exactly 1, which is the ADD control mask.
                         "beqz x12, 2f\n\t"
-                        "li x12, 0x01\n\t"
+                        "mv x11, %[pMod]\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
                         "2:\n\t"
 
-                        : [tmp] "=&r"(tmp)
+                        :
                         : [pX] "r"(pX), [pB] "r"(pB),
                           [pY] "r"(pY), [pModInv] "r"(pModInv), [pMod] "r"(pMod)
                         : "x10", "x11", "x12", "memory"
@@ -1097,6 +982,7 @@ public:
     /// Keeps result in aligned buffer across iterations to avoid inter-call overhead.
     /// Uses 3 buffers: A (result), B (scratch for t_lo/m/mN), C (holds input copy as y operand).
     /// CSR constraint: x10 != x11 for all BigInt calls.
+    /// Same reduction as mul(): requires x < mod.
     constexpr UintT square_n(const UintT& x, unsigned n) const noexcept
     {
 #if defined(AIRBENDER) && defined(__riscv)
@@ -1126,11 +1012,10 @@ public:
                 {
                     // One squaring: A = A^2 mod p
                     // Steps 0-1: Copy A -> C, Copy A -> B
-                    // Step 2: MUL_LOW(B, C) -> B = t_lo
-                    // Steps 3-5: zero check, MUL_LOW(B,mod_inv), MUL_HIGH(B,mod)
-                    // Step 6: MUL_HIGH(A, C) -> A = t_hi (deferred)
-                    // Steps 7-9: ADD, SUB, conditional ADD
-                    uint32_t tmp;
+                    // Step 2: MUL_LOW(B, A) -> B = t_lo
+                    // Steps 3-4: MUL_LOW(B,mod_inv), MUL_HIGH(B,mod)
+                    // Step 5: MUL_HIGH(A, C) -> A = t_hi (deferred)
+                    // Steps 6-7: SUB, conditional ADD
                     asm volatile(
                         // Reordered: all B-ptr ops first, then A-ptr ops.
                         // Keeps x10 stable across consecutive CSR calls, saving 1 mv.
@@ -1147,69 +1032,42 @@ public:
                         "li x12, 0x80\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 2: MUL_LOW(B, C) -> B = t_lo  (x10=pB stays, x11=pC)
-                        // x10 still pB from step 1
-                        "mv x11, %[pC]\n\t"
+                        // Step 2: MUL_LOW(B, A) -> B = t_lo  (x10=pB, x11=pA both stay)
+                        // A and its copy C hold the same value; C is only needed as the
+                        // MUL_HIGH operand in step 5, where A is the destination.
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 3: Zero check on B (t_lo)
-                        "lw %[tmp], 0(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 4(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 8(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 12(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 16(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 20(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 24(%[pB])\n\t"
-                        "bnez %[tmp], 1f\n\t"
-                        "lw %[tmp], 28(%[pB])\n\t"
-                        "1:\n\t"
-                        "snez %[tmp], %[tmp]\n\t"
-
-                        // Step 4: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
+                        // Step 3: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
                         "mv x11, %[pModInv]\n\t"
                         "li x12, 0x08\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 5: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
+                        // Step 4: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
                         "mv x11, %[pMod]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 6: MUL_HIGH(A, C) -> A = t_hi  (x10=pA, x11=pC)
+                        // Step 5: MUL_HIGH(A, C) -> A = t_hi  (x10=pA, x11=pC)
                         // Deferred: A still holds original value (untouched since step 0).
                         "mv x10, %[pA]\n\t"
                         "mv x11, %[pC]\n\t"
                         "li x12, 0x10\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 7: ADD(A, B + carry) -> A += B  (x10=pA stays, x11=pB)
+                        // Step 6: SUB(A, B) -> A = t_hi - mN_hi, x12 = borrow  (x10=pA stays)
                         "mv x11, %[pB]\n\t"
-                        "slli x12, %[tmp], 6\n\t"
-                        "ori x12, x12, 0x01\n\t"
-                        "csrrw x0, 0x7CA, x0\n\t"
-                        "mv %[tmp], x12\n\t"
-
-                        // Step 8: SUB(A, mod) -> A -= mod  (x10=pA stays, x11=pMod)
-                        "mv x11, %[pMod]\n\t"
                         "li x12, 0x02\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
 
-                        // Step 9: Conditional ADD back
-                        // x10=pA, x11=pMod both still valid from step 8
-                        "bnez %[tmp], 2f\n\t"
+                        // Step 7: Conditional ADD(A, mod) if the subtraction borrowed.
+                        // The borrow flag left in x12 is exactly 1, which is the ADD control mask.
                         "beqz x12, 2f\n\t"
-                        "li x12, 0x01\n\t"
+                        "mv x11, %[pMod]\n\t"
                         "csrrw x0, 0x7CA, x0\n\t"
                         "2:\n\t"
 
-                        : [tmp] "=&r"(tmp)
+                        :
                         : [pA] "r"(pA), [pB] "r"(pB), [pC] "r"(pC),
                           [pModInv] "r"(pModInv), [pMod] "r"(pMod)
                         : "x10", "x11", "x12", "memory"
@@ -1232,6 +1090,7 @@ public:
     /// Avoids the return-value copy overhead of square_n (saves ~24 insns per call
     /// by writing the result back via CSR MEMCOPY instead of word-by-word return copy).
     /// Requires x to be 32-byte aligned (guaranteed by DECL_UNINIT_BUF / FieldElement).
+    /// Same reduction as mul(): requires x < mod.
     void square_n_inplace(UintT& x, unsigned n) const noexcept
         requires(UintT::num_bits == 256)
     {
@@ -1267,7 +1126,6 @@ public:
 
         for (unsigned iter = 0; iter < n; ++iter)
         {
-            uint32_t tmp;
             asm volatile(
                 // Step 0: MEMCOPY A -> C  (x10=pC, x11=pA)
                 "mv x10, %[pC]\n\t"
@@ -1280,66 +1138,41 @@ public:
                 "li x12, 0x80\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
 
-                // Step 2: MUL_LOW(B, C) -> B = t_lo  (x10=pB stays, x11=pC)
-                "mv x11, %[pC]\n\t"
+                // Step 2: MUL_LOW(B, A) -> B = t_lo  (x10=pB, x11=pA both stay)
+                // A and its copy C hold the same value; C is only needed as the
+                // MUL_HIGH operand in step 5, where A is the destination.
                 "li x12, 0x08\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
 
-                // Step 3: Zero check on B (t_lo)
-                "lw %[tmp], 0(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 4(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 8(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 12(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 16(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 20(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 24(%[pB])\n\t"
-                "bnez %[tmp], 1f\n\t"
-                "lw %[tmp], 28(%[pB])\n\t"
-                "1:\n\t"
-                "snez %[tmp], %[tmp]\n\t"
-
-                // Step 4: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
+                // Step 3: MUL_LOW(B, mod_inv) -> B = m  (x10=pB stays, x11=pModInv)
                 "mv x11, %[pModInv]\n\t"
                 "li x12, 0x08\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
 
-                // Step 5: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
+                // Step 4: MUL_HIGH(B, mod) -> B = mN_hi  (x10=pB stays, x11=pMod)
                 "mv x11, %[pMod]\n\t"
                 "li x12, 0x10\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
 
-                // Step 6: MUL_HIGH(A, C) -> A = t_hi  (x10=pA, x11=pC)
+                // Step 5: MUL_HIGH(A, C) -> A = t_hi  (x10=pA, x11=pC)
                 "mv x10, %[pA]\n\t"
                 "mv x11, %[pC]\n\t"
                 "li x12, 0x10\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
 
-                // Step 7: ADD(A, B + carry) -> A += B  (x10=pA stays, x11=pB)
+                // Step 6: SUB(A, B) -> A = t_hi - mN_hi, x12 = borrow  (x10=pA stays)
                 "mv x11, %[pB]\n\t"
-                "slli x12, %[tmp], 6\n\t"
-                "ori x12, x12, 0x01\n\t"
-                "csrrw x0, 0x7CA, x0\n\t"
-                "mv %[tmp], x12\n\t"
-
-                // Step 8: SUB(A, mod) -> A -= mod  (x10=pA stays, x11=pMod)
-                "mv x11, %[pMod]\n\t"
                 "li x12, 0x02\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
 
-                // Step 9: Conditional ADD back
-                "bnez %[tmp], 2f\n\t"
+                // Step 7: Conditional ADD(A, mod) if the subtraction borrowed.
+                // The borrow flag left in x12 is exactly 1, which is the ADD control mask.
                 "beqz x12, 2f\n\t"
-                "li x12, 0x01\n\t"
+                "mv x11, %[pMod]\n\t"
                 "csrrw x0, 0x7CA, x0\n\t"
                 "2:\n\t"
 
-                : [tmp] "=&r"(tmp)
+                :
                 : [pA] "r"(pA), [pB] "r"(pB), [pC] "r"(pC),
                   [pModInv] "r"(pModInv), [pMod] "r"(pMod)
                 : "x10", "x11", "x12", "memory"
