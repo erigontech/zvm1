@@ -967,9 +967,10 @@ __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
 /// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
 /// written into p's own coordinates as each one dies, skipping the copies through the returned
 /// point. Taking the coordinates apart lets a negated table point pass only its new y. With Live
-/// the caller knows p is not infinity either, which saves the 8-word test of z.
+/// the caller knows p is not infinity either, which saves the 8-word test of z. Returns true if
+/// the sum is the point at infinity (p == -(x2, y2)), and then leaves p with z == 0.
 template <bool Live = false>
-__attribute__((flatten)) void madd_inplace(
+__attribute__((flatten)) bool madd_inplace(
     ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
 {
     using FE = Curve::Fp;
@@ -981,7 +982,7 @@ __attribute__((flatten)) void madd_inplace(
             x1 = x2;
             y1 = y2;
             z1 = FP_ONE;
-            return;
+            return false;
         }
     }
     DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
@@ -991,10 +992,15 @@ __attribute__((flatten)) void madd_inplace(
     DECL_FE_COPY(FE, t1, h); t1 += h;            // 2h
     DECL_FE_COPY(FE, i, t1); i *= t1;            // i = (2h)^2
     z1z1 -= y1;                                  // t2 = s2 - y1
-    if (h == 0 && z1z1 == 0) [[unlikely]]
+    if (h == 0) [[unlikely]]
     {
-        dbl_inplace(p);
-        return;
+        if (z1z1 == 0)  // p == (x2, y2)
+        {
+            dbl_inplace(p);
+            return false;
+        }
+        z1 = FE{};  // p == -(x2, y2): the sum is the point at infinity.
+        return true;
     }
     DECL_FE_COPY(FE, r, z1z1); r += z1z1;        // r = 2 t2
     DECL_FE_COPY(FE, v, x1); v *= i;             // v = x1 i
@@ -1006,12 +1012,14 @@ __attribute__((flatten)) void madd_inplace(
     y1 = r; y1 *= v;                             // r (v - x3)
     y1 -= i; y1 -= i;                            // y3 = r (v - x3) - 2 y1 j
     z1 *= h; z1 += z1;                           // z3 = 2 z1 h
+    return false;
 }
 
 /// p += (x2 : y2 : z2), a Jacobian point other than infinity, in place: ecc::add()'s
 /// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
+/// Returns true if the sum is the point at infinity, and then leaves p with z == 0.
 template <bool Live = false>
-__attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
+__attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
     const Curve::Fp& y2, const Curve::Fp& z2) noexcept
 {
     using FE = Curve::Fp;
@@ -1023,7 +1031,7 @@ __attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve
             x1 = x2;
             y1 = y2;
             z1 = z2;
-            return;
+            return false;
         }
     }
     DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
@@ -1034,10 +1042,15 @@ __attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve
     z2z2 *= z2; z2z2 *= y1;                      // s1 = y1 z2^3
     h -= u1;                                     // h = u2 - u1
     z1z1 -= z2z2;                                // r = s2 - s1
-    if (h == 0 && z1z1 == 0) [[unlikely]]
+    if (h == 0) [[unlikely]]
     {
-        dbl_inplace(p);
-        return;
+        if (z1z1 == 0)  // p == (x2 : y2 : z2)
+        {
+            dbl_inplace(p);
+            return false;
+        }
+        z1 = FE{};  // p == -(x2 : y2 : z2): the sum is the point at infinity.
+        return true;
     }
     DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
     u1 *= hh;                                    // v = u1 h^2
@@ -1049,6 +1062,7 @@ __attribute__((flatten)) void jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve
     y1 = z1z1; y1 *= u1;                         // r (v - x3)
     y1 -= hh;                                    // y3 = r (v - x3) - s1 h^3
     z1 *= z2; z1 *= h;                           // z3 = z1 z2 h
+    return false;
 }
 
 /// u1*G + u2*R with u1 = k1a + k1b*lambda and u2 = k2a + k2b*lambda (signed halves), from the
@@ -1064,10 +1078,12 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
 
     ecc::ProjPoint<Curve> result;  // The point at infinity.
     bool started = false;          // Doubling the point at infinity is a wasted doubling.
-    // The first addition sets the accumulator; the others know it is a live point.
+    // The first addition sets the accumulator; the others know it is a live point, until one
+    // cancels it: a partial sum P meeting -P, which crafted inputs can reach (an ECRECOVER call
+    // takes any hash). The next addition then sets the accumulator again.
     const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
         if (started)
-            madd_inplace<true>(result, x, y);
+            started = !madd_inplace<true>(result, x, y);
         else
         {
             result.x = x;
@@ -1156,10 +1172,10 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
             wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&b1.value))));
 
     Point result;  // The point at infinity.
-    bool started = false;
+    bool started = false;  // As in msm_wnaf(): an addition that cancels the sum restarts it.
     const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
         if (started)
-            madd_inplace<true>(result, x, y);
+            started = !madd_inplace<true>(result, x, y);
         else
         {
             result.x = x;
@@ -1170,7 +1186,7 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
     };
     const auto add_jac = [&](const Curve::Fp& x, const Curve::Fp& y, const Curve::Fp& z) noexcept {
         if (started)
-            jadd_inplace<true>(result, x, y, z);
+            started = !jadd_inplace<true>(result, x, y, z);
         else
         {
             result.x = x;
