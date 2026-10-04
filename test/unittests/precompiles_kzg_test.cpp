@@ -45,6 +45,20 @@ TEST(kzg, verify_proof_zero)
     EXPECT_TRUE(r);
 }
 
+TEST(kzg, verify_proof_zero_nonzero_y)
+{
+    // The polynomial f(x) = 0 does not evaluate to y ≠ 0 at any z.
+    std::byte z[32]{};
+    z[13] = std::byte{17};
+    const auto hash = versioned_hash(POINT_AT_INFINITY);
+    for (const auto i : {0, 31})
+    {
+        std::byte y[32]{};
+        y[i] = std::byte{1};
+        EXPECT_FALSE(kzg_verify_proof(hash.data(), z, y, POINT_AT_INFINITY, POINT_AT_INFINITY));
+    }
+}
+
 TEST(kzg, verify_g2_gen_lines)
 {
     blst_fp6 expected[68];
