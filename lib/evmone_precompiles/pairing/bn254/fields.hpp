@@ -1,5 +1,6 @@
 // evmone: Fast Ethereum Virtual Machine implementation
-// Copyright 2024 The evmone Authors.
+// Copyright 2026 The zvm1 Authors (modifications)
+// Copyright 2024 The evmone Authors (original)
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
@@ -37,9 +38,54 @@ struct Fq12Config
 };
 using Fq12 = ecc::ExtFieldElem<Fq12Config>;
 
+#if defined(AIRBENDER) && defined(__riscv)
+/// multiply() computed in the result object with FieldElement's in-place CSR operators.
+/// The generic expression puts every product, sum and difference in a temporary and copies it
+/// out word by word; here each step updates its destination directly. The single named return
+/// lets NRV build r in the caller's slot, which aliases neither input: Fq2's copy assignment is
+/// not trivial, so `x = x * y` goes through a temporary.
+/// r starts as a copy of a, because `Fq2 r;` would zero-init coeffs with a memset call that the
+/// asm memory clobbers keep alive.
+[[gnu::always_inline]] inline Fq2 multiply_in_place(const Fq2& a, const Fq2& b) noexcept
+{
+    const auto& [a0, a1] = a.coeffs;
+    const auto& [b0, b1] = b.coeffs;
+    Fq2 r = a;
+    auto& [r0, r1] = r.coeffs;
+    DECL_FE_COPY(Fq, t, a1);
+    t *= b1;
+    r0 *= b0;
+    r0 -= t;  // a0*b0 - a1*b1
+    t = a0;
+    t *= b1;
+    r1 *= b0;
+    r1 += t;  // a1*b0 + a0*b1
+    return r;
+}
+
+/// sqr() computed in the result object, as multiply_in_place().
+[[gnu::always_inline]] inline Fq2 sqr_in_place(const Fq2& a) noexcept
+{
+    const auto& [a0, a1] = a.coeffs;
+    Fq2 r = a;
+    auto& [r0, r1] = r.coeffs;
+    DECL_FE_COPY(Fq, d, a0);
+    d -= a1;
+    r1 *= a0;
+    r0 += a1;
+    r0 *= d;   // (a0+a1)*(a0-a1)
+    r1 += r1;  // 2*a0*a1
+    return r;
+}
+#endif
+
 /// Multiplies two Fq^2 field elements
 constexpr Fq2 multiply(const Fq2& a, const Fq2& b) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    if (!std::is_constant_evaluated())
+        return multiply_in_place(a, b);
+#endif
     const auto& [a0, a1] = a.coeffs;
     const auto& [b0, b1] = b.coeffs;
     return Fq2({a0 * b0 - a1 * b1, a1 * b0 + a0 * b1});
@@ -48,6 +94,10 @@ constexpr Fq2 multiply(const Fq2& a, const Fq2& b) noexcept
 /// Squares an Fq^2 field element.
 constexpr Fq2 sqr(const Fq2& a) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
+    if (!std::is_constant_evaluated())
+        return sqr_in_place(a);
+#endif
     const auto& [a0, a1] = a.coeffs;
 
     // (a0 + a1*u)^2 = (a0+a1)*(a0-a1) + 2a0a1*u.
