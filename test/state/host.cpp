@@ -20,26 +20,14 @@ void set_state_gas(evmc::Result& r, int64_t left, int64_t spilled) noexcept
 {
     r.state_gas = {.left = left, .spilled = spilled};
 }
-}  // namespace
 
-bool Host::account_exists(const address& addr) const noexcept
-{
-    const auto* const acc = m_state.find(addr);
-    return acc != nullptr && (m_rev < EVMC_SPURIOUS_DRAGON || !acc->is_empty());
-}
-
-bytes32 Host::get_storage(const address& addr, const bytes32& key) const noexcept
-{
-    return m_state.get_storage(addr, key).current;
-}
-
-evmc_storage_status Host::set_storage(
-    const address& addr, const bytes32& key, const bytes32& value) noexcept
+/// The status and the journaled update of a slot's value, shared by set_storage() and sstore().
+[[gnu::always_inline]] inline evmc_storage_status update_storage(
+    State& state, StorageValue& storage_slot, const bytes32& value) noexcept
 {
     // Follow EVMC documentation https://evmc.ethereum.org/storagestatus.html#autotoc_md3
     // and EIP-2200 specification https://eips.ethereum.org/EIPS/eip-2200.
 
-    auto& storage_slot = m_state.get_storage(addr, key);
     const auto& current = storage_slot.current;
     const auto& original = storage_slot.original;
 
@@ -80,9 +68,27 @@ evmc_storage_status Host::set_storage(
     // access-status transition separately via JournalStorageAccess so the warm
     // flag and the slot value can roll back independently (EIP-7928 needs the
     // warm bit to survive certain reverts that discard the value).
-    m_state.journal_storage_change(storage_slot);
+    state.journal_storage_change(storage_slot);
     storage_slot.current = value;  // Update current value.
     return status;
+}
+}  // namespace
+
+bool Host::account_exists(const address& addr) const noexcept
+{
+    const auto* const acc = m_state.find(addr);
+    return acc != nullptr && (m_rev < EVMC_SPURIOUS_DRAGON || !acc->is_empty());
+}
+
+bytes32 Host::get_storage(const address& addr, const bytes32& key) const noexcept
+{
+    return m_state.get_storage(addr, key).current;
+}
+
+evmc_storage_status Host::set_storage(
+    const address& addr, const bytes32& key, const bytes32& value) noexcept
+{
+    return update_storage(m_state, m_state.get_storage(addr, key), value);
 }
 
 uint256be Host::get_balance(const address& addr) const noexcept
@@ -613,6 +619,47 @@ evmc_access_status Host::access_storage(const address& addr, const bytes32& key)
     it->second.access_status = EVMC_ACCESS_WARM;
     m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
     return EVMC_ACCESS_COLD;
+}
+
+const evmc_bytes32* Host::sload(const address& addr, const bytes32& key, int64_t cold_cost,
+    int64_t& gas_left, evmc_bytes32& /*buffer*/) noexcept
+{
+    // access_storage() and get_storage() on one lookup of the account and of the slot (node
+    // references are stable and nothing inserts between the two parts).
+    auto& acc = m_state.get(addr);
+    const auto [it, fresh] = acc.storage.try_emplace(key);
+    auto& slot = it->second;
+    if (slot.access_status != EVMC_ACCESS_WARM)
+    {
+        slot.access_status = EVMC_ACCESS_WARM;
+        m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
+        // Out of gas returns before the fetch: a witness may omit a slot that is never read.
+        if ((gas_left -= cold_cost) < 0)
+            return nullptr;
+    }
+    if (!slot.loaded)
+        m_state.load_storage(addr, key, slot);
+    return &slot.current;
+}
+
+evmc_storage_status Host::sstore(const address& addr, const bytes32& key, const bytes32& value,
+    evmc_access_status& access) noexcept
+{
+    // access_storage() and set_storage() on one lookup of the account and of the slot, see sload().
+    auto& acc = m_state.get(addr);
+    const auto [it, fresh] = acc.storage.try_emplace(key);
+    auto& slot = it->second;
+    access = slot.access_status == EVMC_ACCESS_WARM ? EVMC_ACCESS_WARM : EVMC_ACCESS_COLD;
+    if (access == EVMC_ACCESS_COLD)
+    {
+        slot.access_status = EVMC_ACCESS_WARM;
+        // The access entry goes first: reverting it erases a fresh slot, which the change entry
+        // journaled below points to.
+        m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
+    }
+    if (!slot.loaded)
+        m_state.load_storage(addr, key, slot);
+    return update_storage(m_state, slot, value);
 }
 
 

@@ -105,10 +105,38 @@ constexpr auto SSTORE_COSTS = []() noexcept {
 Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     auto& x = stack.top();
-    const auto key = intx::be::store<evmc::bytes32>(x);
+    // The conversion writes all 32 bytes, so the key needs no zero-initialization. Words of
+    // zero are skipped on rv32: most keys and values have few significant words.
+    alignas(4) evmc_bytes32 key;
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    intx::be::unsafe::store_aligned(key.bytes, x);
+#else
+    intx::be::unsafe::store(key.bytes, x);
+#endif
+    // Pass the message's address in place: converting it to evmc::address copies it per call.
+    const auto& recipient = evmc::internal::as_cpp(&state.msg->recipient);
+
+    if (state.rev >= EVMC_BERLIN && state.cpp_host != nullptr)
+    {
+        // One host call warms the slot, charges the cold access and returns the value: the slot
+        // is looked up once. Out of gas returns before the value is read.
+        evmc_bytes32 buffer;
+        const auto* value = state.cpp_host->sload(
+            recipient, evmc::internal::as_cpp(&key), ADDITIONAL_COLD_STORAGE_ACCESS, gas_left, buffer);
+        if (value == nullptr)
+            return {EVMC_OUT_OF_GAS, gas_left};
+        // Convert at once: the pointer may refer to host state that the next host call changes.
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+        static_assert(alignof(evmc_bytes32) >= 4);
+        intx::be::unsafe::load_aligned_into(x, value->bytes);
+#else
+        x = intx::be::load<uint256>(*value);
+#endif
+        return {EVMC_SUCCESS, gas_left};
+    }
 
     if (state.rev >= EVMC_BERLIN &&
-        state.host.access_storage(state.msg->recipient, key) == EVMC_ACCESS_COLD)
+        state.host.access_storage(recipient, evmc::internal::as_cpp(&key)) == EVMC_ACCESS_COLD)
     {
         // The warm storage access cost is already applied (from the cost table).
         // Here we need to apply additional cold storage access cost.
@@ -116,7 +144,7 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
-    x = intx::be::load<uint256>(state.host.get_storage(state.msg->recipient, key));
+    x = intx::be::load<uint256>(state.host.get_storage(recipient, evmc::internal::as_cpp(&key)));
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -129,15 +157,37 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     if (state.rev >= EVMC_ISTANBUL && gas_left <= CALL_STIPEND)
         return {EVMC_OUT_OF_GAS, gas_left};
 
-    const auto key = intx::be::store<evmc::bytes32>(stack.pop());
-    const auto value = intx::be::store<evmc::bytes32>(stack.pop());
+    alignas(4) evmc_bytes32 key;
+    alignas(4) evmc_bytes32 value;
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    intx::be::unsafe::store_aligned(key.bytes, stack.pop());
+    intx::be::unsafe::store_aligned(value.bytes, stack.pop());
+#else
+    intx::be::unsafe::store(key.bytes, stack.pop());
+    intx::be::unsafe::store(value.bytes, stack.pop());
+#endif
+    const auto& recipient = evmc::internal::as_cpp(&state.msg->recipient);
 
-    const auto gas_cost_cold =
-        (state.rev >= EVMC_BERLIN &&
-            state.host.access_storage(state.msg->recipient, key) == EVMC_ACCESS_COLD) ?
-            STORAGE_COST_SPEC[state.rev].cold :
-            0;
-    const auto status = state.host.set_storage(state.msg->recipient, key, value);
+    evmc_storage_status status;
+    int64_t gas_cost_cold;
+    if (state.rev >= EVMC_BERLIN && state.cpp_host != nullptr)
+    {
+        evmc_access_status access;
+        status = state.cpp_host->sstore(
+            recipient, evmc::internal::as_cpp(&key), evmc::internal::as_cpp(&value), access);
+        gas_cost_cold = access == EVMC_ACCESS_COLD ? STORAGE_COST_SPEC[state.rev].cold : 0;
+    }
+    else
+    {
+        gas_cost_cold =
+            (state.rev >= EVMC_BERLIN &&
+                state.host.access_storage(recipient, evmc::internal::as_cpp(&key)) ==
+                    EVMC_ACCESS_COLD) ?
+                STORAGE_COST_SPEC[state.rev].cold :
+                0;
+        status = state.host.set_storage(
+            recipient, evmc::internal::as_cpp(&key), evmc::internal::as_cpp(&value));
+    }
 
     const auto [gas_cost_warm, gas_refund] = SSTORE_COSTS[state.rev][status];
     const auto gas_cost = gas_cost_warm + gas_cost_cold;

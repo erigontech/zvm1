@@ -1367,9 +1367,19 @@ inline Result gas(StackTop stack, int64_t gas_left, ExecutionState& /*state*/) n
 inline void tload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& x = stack.top();
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The conversions write all 32 bytes, so the locals need no zero-initialization, and skip
+    // the zero words: most values have few significant words.
+    alignas(4) evmc_bytes32 key;
+    intx::be::unsafe::store(key.bytes, x);
+    alignas(4) const evmc_bytes32 value =
+        state.host.get_transient_storage_raw(state.msg->recipient, evmc::internal::as_cpp(&key));
+    intx::be::unsafe::load_aligned_into(x, value.bytes);
+#else
     const auto key = intx::be::store<evmc::bytes32>(x);
     const auto value = state.host.get_transient_storage(state.msg->recipient, key);
     x = intx::be::load<uint256>(value);
+#endif
 }
 
 inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
@@ -1377,9 +1387,19 @@ inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     if (state.in_static_mode())
         return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // As in tload().
+    alignas(4) evmc_bytes32 key;
+    intx::be::unsafe::store(key.bytes, stack.pop());
+    alignas(4) evmc_bytes32 value;
+    intx::be::unsafe::store_aligned(value.bytes, stack.pop());
+    state.host.set_transient_storage(
+        state.msg->recipient, evmc::internal::as_cpp(&key), evmc::internal::as_cpp(&value));
+#else
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
     state.host.set_transient_storage(state.msg->recipient, key, value);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 

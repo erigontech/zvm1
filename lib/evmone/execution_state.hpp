@@ -152,6 +152,9 @@ public:
     Memory memory;
     const evmc_message* msg = nullptr;
     evmc::HostContext host;
+    /// The C++ Host behind `host` when the frame runs through evmc::Host's own interface (null
+    /// otherwise): SLOAD and SSTORE call its fused virtuals directly instead of several C callbacks.
+    evmc::Host* cpp_host = nullptr;
     evmc_revision rev = {};
     bytes return_data;
 
@@ -189,6 +192,7 @@ public:
         bytes_view _code) noexcept
       : msg{&message},
         host{host_interface, host_ctx},
+        cpp_host{cpp_host_of(host_interface, host_ctx)},
         rev{revision},
         original_code{_code},
         state_gas{{.left = message.state_gas}}
@@ -204,6 +208,7 @@ public:
         memory.clear();
         msg = &message;
         host = {host_interface, host_ctx};
+        cpp_host = cpp_host_of(host_interface, host_ctx);
         rev = revision;
         return_data.clear();
         original_code = _code;
@@ -217,6 +222,14 @@ public:
     }
 
     [[nodiscard]] bool in_static_mode() const { return (msg->flags & EVMC_STATIC) != 0; }
+
+    static evmc::Host* cpp_host_of(
+        const evmc_host_interface& host_interface, evmc_host_context* host_ctx) noexcept
+    {
+        return &host_interface == &evmc::Host::get_interface() ?
+                   evmc::Host::from_context(host_ctx) :
+                   nullptr;
+    }
 
     const evmc_tx_context& get_tx_context() noexcept
     {

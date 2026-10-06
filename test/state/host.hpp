@@ -75,6 +75,12 @@ public:
 private:
     evmc_access_status access_storage(const address& addr, const bytes32& key) noexcept override;
 
+    const evmc_bytes32* sload(const address& addr, const bytes32& key, int64_t cold_cost,
+        int64_t& gas_left, evmc_bytes32& buffer) noexcept override;
+
+    evmc_storage_status sstore(const address& addr, const bytes32& key, const bytes32& value,
+        evmc_access_status& access) noexcept override;
+
     evmc::Result execute_message(const evmc_message& msg) noexcept;
 };
 }  // namespace evmone::state

@@ -139,6 +139,9 @@ public:
 
     StorageValue& get_storage(const address& addr, const bytes32& key);
 
+    /// Fetches the value of a slot that access_storage() created without a fetch.
+    void load_storage(const address& addr, const bytes32& key, StorageValue& slot);
+
     StateDiff build_diff(evmc_revision rev) const;
 
     /// Returns the state journal checkpoint. It can be later used to in rollback()

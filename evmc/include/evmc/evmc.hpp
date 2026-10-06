@@ -546,6 +546,33 @@ public:
     /// @copydoc evmc_host_interface::access_storage
     virtual evmc_access_status access_storage(const address& addr, const bytes32& key) noexcept = 0;
 
+    /// SLOAD's host work in one call: access_storage(), the additional @p cold_cost when the slot
+    /// was cold, then get_storage(). Returns null on out of gas, before the value is read, and
+    /// otherwise a pointer to the value, which is either @p buffer or owned by the host. The
+    /// pointer is valid until the next call into the host.
+    virtual const evmc_bytes32* sload(const address& addr,
+                                      const bytes32& key,
+                                      int64_t cold_cost,
+                                      int64_t& gas_left,
+                                      evmc_bytes32& buffer) noexcept
+    {
+        if (access_storage(addr, key) == EVMC_ACCESS_COLD && (gas_left -= cold_cost) < 0)
+            return nullptr;
+        buffer = get_storage(addr, key);
+        return &buffer;
+    }
+
+    /// SSTORE's host work in one call: access_storage() (its result in @p access), then
+    /// set_storage().
+    virtual evmc_storage_status sstore(const address& addr,
+                                       const bytes32& key,
+                                       const bytes32& value,
+                                       evmc_access_status& access) noexcept
+    {
+        access = access_storage(addr, key);
+        return set_storage(addr, key, value);
+    }
+
     /// @copydoc evmc_host_interface::get_transient_storage
     virtual bytes32 get_transient_storage(const address& addr,
                                           const bytes32& key) const noexcept = 0;
@@ -659,6 +686,14 @@ public:
     }
 
     bytes32 get_transient_storage(const address& address, const bytes32& key) const noexcept final
+    {
+        return host->get_transient_storage(context, &address, &key);
+    }
+
+    /// get_transient_storage() as the C struct: a local initialized with it receives the host's
+    /// result directly, where the bytes32 conversion copies it through a temporary.
+    evmc_bytes32 get_transient_storage_raw(const address& address,
+                                           const bytes32& key) const noexcept
     {
         return host->get_transient_storage(context, &address, &key);
     }

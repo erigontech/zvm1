@@ -598,15 +598,18 @@ StorageValue& State::get_storage(const address& addr, const bytes32& key)
     }
     const auto [it, _] = acc->storage.try_emplace(key);
     if (!it->second.loaded)
-    {
-        // The slot may have been created by access_storage() without a fetch.
-        // Load the underlying value now; preserve access_status set earlier.
-        const auto initial_value = m_initial.get_storage(addr, key);
-        it->second.current = initial_value;
-        it->second.original = initial_value;
-        it->second.loaded = true;
-    }
+        load_storage(addr, key, it->second);
     return it->second;
+}
+
+void State::load_storage(const address& addr, const bytes32& key, StorageValue& slot)
+{
+    // The slot may have been created by access_storage() without a fetch.
+    // Load the underlying value now; preserve access_status set earlier.
+    const auto initial_value = m_initial.get_storage(addr, key);
+    slot.current = initial_value;
+    slot.original = initial_value;
+    slot.loaded = true;
 }
 
 void State::journal_balance_change(const address& addr, const intx::uint256& prev_balance)
