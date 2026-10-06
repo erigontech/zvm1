@@ -217,6 +217,67 @@ struct Position
     return target + 1;
 }
 
+/// gas_left -= cost when the low word stays non-negative, with nothing changed otherwise. The
+/// whole static gas of a fused sequence in one test: if it passes, each separate charge would
+/// have passed. A false return may be a false negative (a low word of 2^31 or more); the caller
+/// then takes the exact sequential path.
+[[gnu::always_inline]] inline bool charge_all(int64_t& gas_left, uint32_t cost) noexcept
+{
+    const auto g = static_cast<uint64_t>(gas_left);
+    auto lo = static_cast<uint32_t>(g) - cost;
+    asm("" : "+r"(lo));
+    if (static_cast<int32_t>(lo) < 0) [[unlikely]]
+        return false;
+    gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
+    return true;
+}
+
+/// Gives back the landing JUMPDEST's 1 that charge_all() took for a jump not taken. The low word
+/// is below 2^31, so adding 1 cannot carry.
+[[gnu::always_inline]] inline void refund_landing(int64_t& gas_left) noexcept
+{
+    const auto g = static_cast<uint64_t>(gas_left);
+    gas_left = static_cast<int64_t>(
+        (g & 0xffffffff00000000) | static_cast<uint32_t>(static_cast<uint32_t>(g) + 1));
+}
+
+/// x != 0, word 0 first. A non-zero branch condition nearly always has a non-zero low word (a
+/// comparison result, a flag, a count or an address), so the other 7 words are read only when it is
+/// zero.
+[[gnu::always_inline]] inline bool nonzero256(const uint32_t* x) noexcept
+{
+    if (x[0] != 0) [[likely]]
+        return true;
+    return (x[1] | x[2] | x[3] | x[4] | x[5] | x[6] | x[7]) != 0;
+}
+
+/// x == 0, word 0 first, as nonzero256(). No branch hint: ISZERO's operand is zero more often than
+/// not, and a hint would move the jump, the common outcome, out of line.
+[[gnu::always_inline]] inline bool zero256(const uint32_t* x) noexcept
+{
+    if (x[0] != 0)
+        return false;
+    return (x[1] | x[2] | x[3] | x[4] | x[5] | x[6] | x[7]) == 0;
+}
+
+/// a == b, word 0 first: values that differ nearly always differ in their low words.
+[[gnu::always_inline]] inline bool eq256(const uint32_t* a, const uint32_t* b) noexcept
+{
+    if (a[0] != b[0])
+        return false;
+    return ((a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) | (a[4] ^ b[4]) | (a[5] ^ b[5]) |
+               (a[6] ^ b[6]) | (a[7] ^ b[7])) == 0;
+}
+
+/// w == sel for a 32-bit sel, word 0 first: a function dispatcher compares one selector against
+/// many, so the low word nearly always decides.
+[[gnu::always_inline]] inline bool eq256_u32(const uint32_t* w, uint32_t sel) noexcept
+{
+    if (w[0] != sel) [[likely]]
+        return false;
+    return (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
+}
+
 /// PUSH2 followed by JUMP or JUMPI, which is how nearly every jump is written (99.6% of them on
 /// mainnet). The destination is the immediate, so it is never stored to the stack and read back
 /// and its high words need no zero check, and the landing JUMPDEST is folded in. The checks run
@@ -224,53 +285,56 @@ struct Position
 [[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
     const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
-    const auto op = pos.code_it[3];
-    if (op != OP_JUMP && op != OP_JUMPI)
-        return false;
     const auto fail = [&](evmc_status_code status) noexcept {
         state.status = status;
         pos.code_it = nullptr;
         return true;
     };
-    // PUSH2: stack overflow, then its 3 gas.
-    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
-        return fail(EVMC_STACK_OVERFLOW);
-    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
-        return fail(EVMC_OUT_OF_GAS);
-    // The barrier keeps GCC's bswap pass from treating the two bytes as a big-endian halfword
-    // load, which it expands into 7 instructions on rv32 (no rev8); this is 3.
-    auto dst = static_cast<uint32_t>(pos.code_it[1]);
-    asm("" : "+r"(dst));
-    dst = dst << 8 | pos.code_it[2];
-    const auto& analysis = *state.analysis.baseline;
+    const auto op = pos.code_it[3];
     if (op == OP_JUMP)
     {
-        // JUMP: the pushed item is its operand, so only the 8 gas can fail.
-        if (INTX_UNLIKELY(!deduct_gas(gas, 8)))
-            return fail(EVMC_OUT_OF_GAS);
+        // PUSH2 3, JUMP 8, the landing JUMPDEST 1.
+        if (!charge_all(gas, 3 + 8 + 1)) [[unlikely]]
+            return false;
+        if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+            return fail(EVMC_STACK_OVERFLOW);
+        auto dst = static_cast<uint32_t>(pos.code_it[1]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | pos.code_it[2];
+        const auto& analysis = *state.analysis.baseline;
         if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+        pos.code_it = &analysis.code()[dst] + 1;
         return true;
     }
-    // JUMPI: underflow unless the condition is under the pushed destination, then 10 gas.
+    if (op != OP_JUMPI)
+        return false;
+    // PUSH2 3, JUMPI 10, the landing JUMPDEST 1.
+    if (!charge_all(gas, 3 + 10 + 1)) [[unlikely]]
+        return false;
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
     if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
         return fail(EVMC_STACK_UNDERFLOW);
-    if (INTX_UNLIKELY(!deduct_gas(gas, 10)))
-        return fail(EVMC_OUT_OF_GAS);
-    // stack_end is one past the top item: the condition is the top item, under the pushed
-    // destination.
-    const auto* const cw = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
-    const bool taken = (cw[0] | cw[1] | cw[2] | cw[3] | cw[4] | cw[5] | cw[6] | cw[7]) != 0;
     pos.stack_end -= 1;  // One pushed, two popped.
+    asm("" : "+r"(pos.stack_end));  // Address the popped words from the new stack_end only.
+    // The condition is the popped top item, under the pushed destination.
+    const bool taken = nonzero256(reinterpret_cast<const uint32_t*>(pos.stack_end));
     if (taken)
     {
+        auto dst = static_cast<uint32_t>(pos.code_it[1]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | pos.code_it[2];
+        const auto& analysis = *state.analysis.baseline;
         if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = skip_landing_jumpdest(&analysis.code()[dst], gas, state);
+        pos.code_it = &analysis.code()[dst] + 1;
     }
     else
+    {
+        refund_landing(gas);
         pos.code_it += 4;
+    }
     return true;
 }
 /// ISZERO or EQ, then PUSH2 and JUMPI: the conditional branches Solidity emits for `if` and for
@@ -279,7 +343,7 @@ struct Position
 /// instructions' order: the comparison's underflow and 3 gas, PUSH2's overflow (EQ popped an
 /// item, so it cannot overflow) and 3 gas, JUMPI's 10 gas (its two operands are there).
 template <Opcode Op>
-[[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
+[[gnu::always_inline]] inline bool fused_cmp_push2_jumpi_seq(const uint256* stack_bottom,
     const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
     static_assert(Op == OP_ISZERO || Op == OP_EQ);
@@ -328,12 +392,68 @@ template <Opcode Op>
     return true;
 }
 
+/// The fast form of fused_cmp_push2_jumpi_seq(): the whole static gas in one test.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_ISZERO || Op == OP_EQ);
+    constexpr int required = Op == OP_EQ ? 2 : 1;
+    if (pos.code_it[1] != OP_PUSH2 || pos.code_it[4] != OP_JUMPI)
+        return false;
+    // The comparison 3, PUSH2 3, JUMPI 10, the landing JUMPDEST 1.
+    if (!charge_all(gas, 3 + 3 + 10 + 1)) [[unlikely]]
+    {
+        if constexpr (Op == OP_ISZERO)
+            return false;
+        else
+            return fused_cmp_push2_jumpi_seq<Op>(stack_bottom, stack_limit, pos, gas, state);
+    }
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + (required - 1)))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if constexpr (Op == OP_ISZERO)
+    {
+        if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+            return fail(EVMC_STACK_OVERFLOW);
+    }
+    pos.stack_end -= required;  // The comparison leaves one, PUSH2 one more, JUMPI takes two.
+    asm("" : "+r"(pos.stack_end));  // Address the popped words from the new stack_end only.
+    // The operands are the popped items: the top one a and, for EQ, b under it.
+    const auto* const a = reinterpret_cast<const uint32_t*>(pos.stack_end + (required - 1));
+    bool taken;
+    if constexpr (Op == OP_ISZERO)
+        taken = zero256(a);
+    else
+        taken = eq256(a, reinterpret_cast<const uint32_t*>(pos.stack_end));
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(pos.code_it[2]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | pos.code_it[3];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = &analysis.code()[dst] + 1;
+    }
+    else
+    {
+        refund_landing(gas);
+        pos.code_it += 5;
+    }
+    return true;
+}
+
 /// DUP1 PUSH4 selector EQ PUSH2 tag JUMPI: one test of Solidity's function dispatcher (2.3M per
 /// 200 mainnet blocks, a chain of them per external call). The selector is compared against the
 /// top item in place and the result decides the jump; the stack ends as it began. Checks in the
 /// separate instructions' order: DUP1's underflow and overflow and 3 gas, PUSH4's overflow and
 /// its 3 gas, then EQ's 3, PUSH2's 3 (it cannot overflow: EQ popped one) and JUMPI's 10.
-[[gnu::always_inline]] inline bool fused_selector_test(const uint256* stack_bottom,
+[[gnu::always_inline]] inline bool fused_selector_test_seq(const uint256* stack_bottom,
     const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
     const auto* const c = pos.code_it;
@@ -382,6 +502,56 @@ template <Opcode Op>
     return true;
 }
 
+/// The fast form of fused_selector_test_seq(): the whole static gas in one test.
+[[gnu::always_inline]] inline bool fused_selector_test(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_PUSH4)
+        return false;
+    if (c[6] != OP_EQ || c[7] != OP_PUSH2 || c[10] != OP_JUMPI)
+        return false;
+    // DUP1 3, PUSH4 3, EQ 3, PUSH2 3, JUMPI 10, the landing JUMPDEST 1.
+    if (!charge_all(gas, 3 + 3 + 3 + 3 + 10 + 1)) [[unlikely]]
+        return fused_selector_test_seq(stack_bottom, stack_limit, pos, gas, state);
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    uint32_t sel = c[2];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[3];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[4];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[5];
+    const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const bool taken = eq256_u32(w, sel);
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(c[8]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | c[9];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = &analysis.code()[dst] + 1;
+    }
+    else
+    {
+        refund_landing(gas);
+        pos.code_it += 11;
+    }
+    return true;
+}
+
 /// a < b on the 32-bit words of two 256-bit values, most significant word first.
 [[gnu::always_inline]] inline bool lt256(const uint32_t* a, const uint32_t* b) noexcept
 {
@@ -398,7 +568,7 @@ template <Opcode Op>
 /// instructions' order: the comparison's underflow and 3 gas, then ISZERO's 3, PUSH2's 3 (no
 /// overflow: the comparison popped one) and JUMPI's 10.
 template <Opcode Op>
-[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* stack_bottom,
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi_seq(const uint256* stack_bottom,
     Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
     static_assert(Op == OP_LT || Op == OP_GT);
@@ -435,6 +605,46 @@ template <Opcode Op>
         pos.code_it += 6;
     return true;
 }
+/// The fast form of fused_cmp_iszero_push2_jumpi_seq(): the whole static gas in one test.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* stack_bottom,
+    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_LT || Op == OP_GT);
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
+        return false;
+    // The comparison 3, ISZERO 3, PUSH2 3, JUMPI 10, the landing JUMPDEST 1.
+    if (!charge_all(gas, 3 + 3 + 3 + 10 + 1)) [[unlikely]]
+        return fused_cmp_iszero_push2_jumpi_seq<Op>(stack_bottom, pos, gas, state);
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + 1))
+        return fail(EVMC_STACK_UNDERFLOW);
+    const auto* const top = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const auto* const second = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+    const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
+    pos.stack_end -= 2;
+    if (taken)
+    {
+        auto dst = static_cast<uint32_t>(c[3]);
+        asm("" : "+r"(dst));
+        dst = dst << 8 | c[4];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        pos.code_it = &analysis.code()[dst] + 1;
+    }
+    else
+    {
+        refund_landing(gas);
+        pos.code_it += 6;
+    }
+    return true;
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -462,6 +672,28 @@ template <Opcode Op, bool TracingEnabled>
     {
         if (fused_cmp_iszero_push2_jumpi<Op>(stack_bottom, pos, gas, state))
             return pos;
+    }
+    else if constexpr (Op == OP_JUMP)
+    {
+        if (INTX_UNLIKELY(pos.stack_end <= stack_bottom))
+        {
+            state.status = EVMC_STACK_UNDERFLOW;
+            return {nullptr, pos.stack_end};
+        }
+        // JUMP 8 and the landing JUMPDEST 1.
+        if (charge_all(gas, 8 + 1)) [[likely]]
+        {
+            const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+            const uint32_t dst = w[0];
+            const auto& analysis = *state.analysis.baseline;
+            if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||
+                              !analysis.check_jumpdest(dst)))
+            {
+                state.status = EVMC_BAD_JUMP_DESTINATION;
+                return {nullptr, pos.stack_end};
+            }
+            return {&analysis.code()[dst] + 1, pos.stack_end - 1};
+        }
     }
 #endif
     // auto starting_gas = gas;
@@ -756,16 +988,12 @@ template <Opcode Op>
     };
     // Second PUSH1: overflow with one item already pushed, 3 gas. SHL has its two operands: 3
     // gas. SUB needs x under the shifted constant: underflow, 3 gas.
+    // The caller has charged the 9 gas with charge_all().
+    (void)gas;
     if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
         return fail(EVMC_STACK_OVERFLOW);
-    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
-        return fail(EVMC_OUT_OF_GAS);
-    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
-        return fail(EVMC_OUT_OF_GAS);
     if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
         return fail(EVMC_STACK_UNDERFLOW);
-    if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
-        return fail(EVMC_OUT_OF_GAS);
     const uint32_t a = pos.code_it[-1];
     const uint32_t b = pos.code_it[1];
     // c = a << b: a byte shifted by b < 256 lands in words b / 32 and b / 32 + 1.
@@ -898,7 +1126,8 @@ TARGET_OP_UNDEFINED:
     }                                                                                            \
     else if constexpr (OPCODE == OP_PUSH1)                                                       \
     {                                                                                            \
-        if (position.code_it[2] == OP_SHL && position.code_it[3] == OP_SUB)                      \
+        if (position.code_it[2] == OP_SHL && position.code_it[3] == OP_SUB &&                    \
+            cost_table[OP_SHL] >= 0 && charge_all(gas, 3 + 3 + 3))                               \
         {                                                                                        \
             if (!push1_shl_sub(stack_bottom, stack_limit, position, gas, state))                 \
                 return gas;                                                                      \
