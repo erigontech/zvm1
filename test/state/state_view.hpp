@@ -32,6 +32,9 @@ public:
     /// alive and unmodified; an implementation that has no such storage must keep the bytes
     /// alive itself. Callers that need ownership copy at the point of use; most only inspect.
     virtual bytes_view get_account_code(const address& addr) const noexcept = 0;
+    /// Like get_account_code(), but nullopt when the view knows the account has code yet does
+    /// not hold the body (a stateless witness may omit code the block itself wrote, EIP-7928).
+    virtual std::optional<bytes_view> find_account_code(const address& addr) const noexcept = 0;
     virtual bytes32 get_storage(const address& addr, const bytes32& key) const noexcept = 0;
 };
 

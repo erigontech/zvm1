@@ -175,6 +175,11 @@ public:
         return m_inner.get_account_code(addr);
     }
 
+    std::optional<bytes_view> find_account_code(const address& addr) const noexcept override
+    {
+        return m_inner.find_account_code(addr);
+    }
+
     bytes32 get_storage(const address& addr, const bytes32& key) const noexcept override
     {
         m_builder.on_storage_read(addr, key);

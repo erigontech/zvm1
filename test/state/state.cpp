@@ -558,7 +558,15 @@ bytes_view State::get_code(const address& addr)
         return a->code;
     // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
     // its 23-byte prefix, so copying the whole contract here would be pure waste.
-    return m_initial.get_account_code(addr);
+    if (const auto code = m_initial.find_account_code(addr))
+        return *code;
+    // The view lacks the body: per EIP-7928 an earlier CREATE in this transaction may have written it.
+    for (const auto& [_, m] : m_modified)
+    {
+        if (m.code_hash == a->code_hash && !m.code.empty())
+            return m.code;
+    }
+    return m_initial.get_account_code(addr);  // let the view handle the missing body
 }
 
 Account& State::touch(const address& addr)

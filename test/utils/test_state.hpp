@@ -55,6 +55,7 @@ public:
 
     std::optional<Account> get_account(const address& addr) const noexcept override;
     bytes_view get_account_code(const address& addr) const noexcept override;
+    std::optional<bytes_view> find_account_code(const address& addr) const noexcept override;
     bytes32 get_storage(const address& addr, const bytes32& key) const noexcept override;
 
     /// Apply the state changes.
