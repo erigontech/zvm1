@@ -1312,14 +1312,17 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 /// Internal jump implementation for JUMP/JUMPI instructions.
 inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexcept
 {
+    // Bound once: the map read may alias the state, which makes the compiler load the pointer
+    // again for code().
+    const auto& analysis = *state.analysis.baseline;
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, use 32-bit word checks: dst must fit in word[0] (32-bit code offsets).
     const auto* w = reinterpret_cast<const uint32_t*>(&dst);
     const auto hi_part_is_nonzero = (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0;
-    if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(w[0])) [[unlikely]]
+    if (hi_part_is_nonzero || !analysis.check_jumpdest(w[0])) [[unlikely]]
 #else
     const auto hi_part_is_nonzero = (dst[3] | dst[2] | dst[1]) != 0;
-    if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(dst[0])) [[unlikely]]
+    if (hi_part_is_nonzero || !analysis.check_jumpdest(dst[0])) [[unlikely]]
 #endif
     {
         state.status = EVMC_BAD_JUMP_DESTINATION;
@@ -1327,9 +1330,9 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
     }
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    return &state.analysis.baseline->code()[w[0]];
+    return &analysis.code()[w[0]];
 #else
-    return &state.analysis.baseline->code()[static_cast<size_t>(dst[0])];
+    return &analysis.code()[static_cast<size_t>(dst[0])];
 #endif
 }
 
