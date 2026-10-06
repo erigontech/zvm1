@@ -966,11 +966,24 @@ __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
     y1.rsub(yy);                                 // Y' = L(T - X') - Y^4
 }
 
-/// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
-/// written into p's own coordinates as each one dies, skipping the copies through the returned
-/// point. Taking the coordinates apart lets a negated table point pass only its new y. With Live
-/// the caller knows p is not infinity either, which saves the 8-word test of z. Returns true if
-/// the sum is the point at infinity (p == -(x2, y2)), and then leaves p with z == 0.
+/// a == 0, testing the low word first: h is almost never 0, so the common case is a load and a
+/// branch where the full test ORs all 8 words.
+[[gnu::always_inline]] inline bool is_zero_low_first(const Curve::Fp& a) noexcept
+{
+    typedef uint32_t __attribute__((may_alias)) word;
+    if (*reinterpret_cast<const word*>(&a) != 0) [[likely]]
+        return false;
+    asm volatile("");  // keeps GCC from merging the low-word test back into the 8-word OR below
+    return a == 0;
+}
+
+/// p += (x2, y2), an affine point other than infinity, in place: the add-1998-cmo-2 formula with
+/// z2 = 1, written into p's own coordinates as each one dies, skipping the copies through the
+/// returned point. Its result (X3 : Y3 : Z3) is the same point as ecc::add()'s (4 X3 : 8 Y3 : 2 Z3),
+/// which is fine because callers use points only projectively (see dbl_inplace()). Taking the
+/// coordinates apart lets a negated table point pass only its new y. With Live the caller knows p
+/// is not infinity either, which saves the 8-word test of z. Returns true if the sum is the point
+/// at infinity (p == -(x2, y2)), and then leaves p with z == 0.
 template <bool Live = false>
 __attribute__((flatten)) bool madd_inplace(
     ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
@@ -991,10 +1004,8 @@ __attribute__((flatten)) bool madd_inplace(
     DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
     z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
     h -= x1;                                     // h = u2 - x1
-    DECL_FE_COPY(FE, t1, h); t1 += h;            // 2h
-    DECL_FE_COPY(FE, i, t1); i *= t1;            // i = (2h)^2
-    z1z1 -= y1;                                  // t2 = s2 - y1
-    if (h == 0) [[unlikely]]
+    z1z1 -= y1;                                  // r = s2 - y1
+    if (is_zero_low_first(h)) [[unlikely]]
     {
         if (z1z1 == 0)  // p == (x2, y2)
         {
@@ -1004,16 +1015,16 @@ __attribute__((flatten)) bool madd_inplace(
         z1 = FE{};  // p == -(x2, y2): the sum is the point at infinity.
         return true;
     }
-    DECL_FE_COPY(FE, r, z1z1); r += z1z1;        // r = 2 t2
-    DECL_FE_COPY(FE, v, x1); v *= i;             // v = x1 i
-    i *= h;                                      // j = h i
-    x1 = r; x1 *= r;                             // r^2
-    x1 -= i; x1 -= v; x1 -= v;                   // x3 = r^2 - j - 2v
-    v -= x1;                                     // v - x3
-    i *= y1;                                     // y1 j
-    y1 = r; y1 *= v;                             // r (v - x3)
-    y1 -= i; y1 -= i;                            // y3 = r (v - x3) - 2 y1 j
-    z1 *= h; z1 += z1;                           // z3 = 2 z1 h
+    z1 *= h;                                     // z3 = z1 h
+    DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
+    h *= hh;                                     // h^3
+    hh *= x1;                                    // v = x1 h^2
+    x1 = z1z1; x1 *= z1z1;                       // r^2
+    x1 -= h; x1 -= hh; x1 -= hh;                 // x3 = r^2 - h^3 - 2v
+    hh -= x1;                                    // v - x3
+    y1 *= h;                                     // y1 h^3
+    z1z1 *= hh;                                  // r (v - x3)
+    y1.rsub(z1z1);                               // y3 = r (v - x3) - y1 h^3
     return false;
 }
 
@@ -1044,7 +1055,7 @@ __attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve
     z2z2 *= z2; z2z2 *= y1;                      // s1 = y1 z2^3
     h -= u1;                                     // h = u2 - u1
     z1z1 -= z2z2;                                // r = s2 - s1
-    if (h == 0) [[unlikely]]
+    if (is_zero_low_first(h)) [[unlikely]]
     {
         if (z1z1 == 0)  // p == (x2 : y2 : z2)
         {
