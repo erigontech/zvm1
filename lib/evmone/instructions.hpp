@@ -10,6 +10,7 @@
 #include "instructions_traits.hpp"
 #include "instructions_xmacro.hpp"
 #include <evmone_precompiles/keccak.hpp>
+#include <bit>
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
@@ -349,6 +350,99 @@ inline void sub(StackTop stack) noexcept
 #endif
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// A 32-bit word of a uint256 (stored as 64-bit words): may alias them. Named, since `auto` would
+/// deduce plain uint32_t and GCC is then free to drop the stores as dead stores to 64-bit words.
+typedef uint32_t __attribute__((may_alias)) word32;
+
+/// Leading zeros of a non-zero word. The call-free one on rv32, where libgcc's __clzsi2 is a call.
+[[gnu::always_inline]] inline unsigned clz_nonzero(uint32_t x) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    return intx::internal::div32::clz_nonzero(x);
+#else
+    return static_cast<unsigned>(std::countl_zero(x));
+#endif
+}
+
+/// Word I of x >> (32 * WS + bs), bs < 32, into q. Both shifts of the carried-in bits stay below
+/// 32 (a shift by 32 is undefined), as in the PUSH1 SHR handlers.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void shr_word_to(
+    word32* q, const word32* x, unsigned bs, unsigned rs) noexcept
+{
+    if constexpr (I + WS > 7)
+        q[I] = 0;
+    else if constexpr (I + WS == 7)
+        q[I] = x[7] >> bs;
+    else
+        q[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
+}
+
+/// q = x >> (32 * WS + bs), bs < 32. q and x are different uint256 (the divisor's stack slot and
+/// the dividend's), so every word of x is read before it can be overwritten.
+template <unsigned WS>
+[[gnu::always_inline]] inline void shr_words_to(word32* q, const word32* x, unsigned bs) noexcept
+{
+    const unsigned rs = 31 - bs;
+    shr_word_to<WS, 0>(q, x, bs, rs);
+    shr_word_to<WS, 1>(q, x, bs, rs);
+    shr_word_to<WS, 2>(q, x, bs, rs);
+    shr_word_to<WS, 3>(q, x, bs, rs);
+    shr_word_to<WS, 4>(q, x, bs, rs);
+    shr_word_to<WS, 5>(q, x, bs, rs);
+    shr_word_to<WS, 6>(q, x, bs, rs);
+    shr_word_to<WS, 7>(q, x, bs, rs);
+}
+
+/// v = x / v for a divisor whose top non-zero word is word T, with the OR of the words below it
+/// in `low`. It is a power of two only if that word has a single bit and nothing is below it:
+/// 2^224 + 1 has the single-bit top word 1.
+template <unsigned T>
+[[gnu::always_inline]] inline void div_top(
+    const uint256& x, uint256& v, uint32_t top, uint32_t low) noexcept
+{
+    if (((top & (top - 1)) | low) == 0)
+    {
+        shr_words_to<T>(reinterpret_cast<word32*>(&v), reinterpret_cast<const word32*>(&x),
+            31 - clz_nonzero(top));
+        return;
+    }
+    v = x / v;
+}
+
+inline void div(StackTop stack) noexcept
+{
+    // Powers of two of any width become word shifts into the divisor's slot. The words the zero
+    // test loads give the top non-zero word, and each branch below goes straight to its own case.
+    uint256& v = stack[1];
+    const uint256& x = stack[0];
+    const word32* const vw = reinterpret_cast<const word32*>(&v);
+    const uint32_t w0 = vw[0], w1 = vw[1], w2 = vw[2], w3 = vw[3];
+    const uint32_t w4 = vw[4], w5 = vw[5], w6 = vw[6], w7 = vw[7];
+    if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    if (w7 != 0)
+        div_top<7>(x, v, w7, w0 | w1 | w2 | w3 | w4 | w5 | w6);
+    else if (w6 != 0)
+        div_top<6>(x, v, w6, w0 | w1 | w2 | w3 | w4 | w5);
+    else if (w5 != 0)
+        div_top<5>(x, v, w5, w0 | w1 | w2 | w3 | w4);
+    else if (w4 != 0)
+        div_top<4>(x, v, w4, w0 | w1 | w2 | w3);
+    else if (w3 != 0)
+        div_top<3>(x, v, w3, w0 | w1 | w2);
+    else if (w2 != 0)
+        div_top<2>(x, v, w2, w0 | w1);
+    else if (w1 != 0)
+        div_top<1>(x, v, w1, w0);
+    else
+        div_top<0>(x, v, w0, 0);
+}
+#else
 inline void div(StackTop stack) noexcept
 {
     auto& v = stack[1];
@@ -376,6 +470,7 @@ inline void div(StackTop stack) noexcept
         v = stack[0] / v;
     }
 }
+#endif
 
 inline void sdiv(StackTop stack) noexcept
 {
