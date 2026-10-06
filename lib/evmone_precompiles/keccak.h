@@ -39,6 +39,13 @@ typedef uint32_t __attribute__((may_alias)) ethash_w32;
 /// Keccak-256 of the 64 bytes at @p data, which must be 4-byte aligned, memoized: stores the hash
 /// to @p out as the big-endian number, in little-endian words (the uint256 KECCAK256 pushes).
 void ethash_keccak256_64_be(ethash_w32 out[8], const ethash_w32* data) noexcept;
+
+#if defined(__riscv) && __riscv_xlen == 32
+/// Reads the ceil(@p size / 4) words of a payload of @p size bytes (more than 32) from the guest's
+/// input into @p dst, hashing it as they arrive: 1 if its Keccak-256 equals the 8 words at @p key.
+/// @p dst and @p key must not overlap.
+int ethash_keccak256_read_verify(ethash_w32* dst, size_t size, const ethash_w32* key) noexcept;
+#endif
 #endif
 
 #ifdef __cplusplus

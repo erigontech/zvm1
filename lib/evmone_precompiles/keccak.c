@@ -1133,4 +1133,111 @@ NO_INLINE void ethash_keccak256_64_be(ethash_w32 out[8], const ethash_w32* data)
 miss:
     keccak64_memo_fill(out, data, slot);
 }
+#if defined(__riscv) && __riscv_xlen == 32
+/// The next word of the input from the non-determinism oracle (CSR 0x7C0), as the guest's reader
+/// takes it.
+static inline __attribute__((always_inline)) uint32_t read_input_word(void)
+{
+    uint32_t w;
+    __asm__ volatile("csrrw %0, 0x7C0, x0" : "=r"(w)::"memory");
+    return w;
+}
+
+/// Reads the ceil(@p size / 4) input words of a payload of @p size (more than 32) bytes into @p dst
+/// as they arrive and absorbs them into the state of its Keccak-256 hash on the way, so that the
+/// words are loaded once, not stored by the reader and loaded again by the hash. Returns 1 if the
+/// hash equals the 8 words at @p key, which the caller must have stored apart from @p dst.
+///
+/// The words reach @p dst whole, whatever follows the payload in its last word, but only the
+/// payload's bytes are absorbed: with those masked out, the unread bytes would let a key that
+/// hashes the payload extended by one to three of them pass for the payload's own.
+///
+/// Keeps the state in buf[] as ethash_keccak256() does, so it must not run inside a hash.
+NO_INLINE int ethash_keccak256_read_verify(ethash_w32* dst, size_t size, const ethash_w32* key)
+{
+    ethash_w32* const s = (ethash_w32*)buf;
+    size_t i;
+    size_t rem = size;
+    size_t m;
+    size_t r;
+    uint32_t pad;
+    if (rem >= 136)
+    {
+        // The state starts at zero: the first block is stored, not XORed in, and the rest of the
+        // state zeroed.
+#pragma GCC unroll 34
+        for (i = 0; i < 34; ++i)
+        {
+            const uint32_t w = read_input_word();
+            dst[i] = w;
+            s[i] = w;
+        }
+#pragma GCC unroll 16
+        for (; i < 50; ++i)
+            s[i] = 0;
+        keccak_permute_buf();
+        dst += 34;
+        rem -= 136;
+        while (rem >= 136)
+        {
+#pragma GCC unroll 34
+            for (i = 0; i < 34; ++i)
+            {
+                const uint32_t w = read_input_word();
+                dst[i] = w;
+                s[i] ^= w;
+            }
+            keccak_permute_buf();
+            dst += 34;
+            rem -= 136;
+        }
+        m = rem / 4;
+        r = rem % 4;
+        for (i = 0; i < m; ++i)
+        {
+            const uint32_t w = read_input_word();
+            dst[i] = w;
+            s[i] ^= w;
+        }
+        // The padding byte follows the payload's last byte, in the word that holds it.
+        pad = (uint32_t)1 << (8 * r);
+        if (r != 0)
+        {
+            const uint32_t w = read_input_word();
+            dst[m] = w;
+            pad |= w & (pad - 1);
+        }
+        s[m] ^= pad;
+        s[33] ^= 0x80000000u;
+    }
+    else
+    {
+        m = rem / 4;
+        r = rem % 4;
+        for (i = 0; i < m; ++i)
+        {
+            const uint32_t w = read_input_word();
+            dst[i] = w;
+            s[i] = w;
+        }
+        pad = (uint32_t)1 << (8 * r);
+        if (r != 0)
+        {
+            const uint32_t w = read_input_word();
+            dst[m] = w;
+            pad |= w & (pad - 1);
+        }
+        s[m] = pad;
+        buf_zero_state_from(4 * (m + 1));
+        s[33] |= 0x80000000u;
+    }
+    keccak_permute_buf();
+
+    uint32_t diff = 0;
+#pragma GCC unroll 8
+    for (i = 0; i < 8; ++i)
+        diff |= s[i] ^ key[i];
+    return diff == 0;
+}
+#endif
 #endif
