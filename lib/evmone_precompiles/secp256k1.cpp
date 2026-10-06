@@ -951,6 +951,105 @@ constexpr auto FP_ONE = Curve::Fp::one();
 /// the host.
 static_assert(alignof(ecc::ProjPoint<Curve>) == 32 && alignof(AffinePoint) == 32 && alignof(Curve::Fp) == 32);
 
+/// x = x OP y on the BigInt delegation (x and y 32-byte aligned and distinct); returns the
+/// carry/borrow flag the operation leaves in x12.
+[[gnu::always_inline]] inline uint32_t bigint_op(void* x, const void* y, uint32_t op) noexcept
+{
+    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(x);
+    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(y);
+    register uint32_t a2 asm("x12") = op;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+    return a2;
+}
+constexpr uint32_t BIGINT_SUB = 0x02, BIGINT_SUB_AND_NEGATE = 0x04, BIGINT_MUL_LOW = 0x08,
+                   BIGINT_MUL_HIGH = 0x10;
+
+/// The GLV split of ecc::decompose(): k == k1 + k2 lambda (mod n) with |k1|, |k2| < 2^128.
+/// c1 = round(b2 k / n) and c2 = round(-b1 k / n) come from 384-bit shifted products with
+/// libsecp256k1's g1 = round(2^384 b2 / n) and g2 = round(2^384 (-b1) / n), and then
+/// k1 = k - c1 a1 - c2 a2 and k2 = -c1 b1 - c2 b2 are computed modulo 2^256: both are short
+/// (|ci - exact| <= 1/2 + 2^-127 bounds them by 0.64 * 2^128), so the top bit is the sign.
+/// All on the BigInt delegation: 2 MUL_HIGH, 4 MUL_LOW, 3 SUB and the negations.
+std::array<ecc::SignedScalar<uint256>, 2> split_lambda(const uint256& k) noexcept
+{
+    typedef uint32_t __attribute__((may_alias)) word;
+    alignas(32) static constexpr uint256 G1 =
+        0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
+    alignas(32) static constexpr uint256 G2 =
+        0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+    alignas(32) static constexpr uint256 A1 = Curve::X1;
+    alignas(32) static constexpr uint256 A2 = Curve::X2;
+    alignas(32) static constexpr uint256 MINUS_B1 = Curve::MINUS_Y1;
+    alignas(32) static constexpr uint256 B2 = Curve::Y2;
+    alignas(32) static constexpr uint256 ZERO = 0;
+    // The rounding constants are tied to the lattice: g = round(2^384 b / n) for b = b2 and -b1;
+    // their top halves are below 2^128 - 1, so c = (h >> 128) + bit 127 of h does not carry out;
+    // and (1/2 + 2^-129)(|a1| + |a2|) and (1/2 + 2^-129)(|b1| + |b2|) stay below 2^128.
+    constexpr auto round_384 = [](const uint256& b) noexcept {
+        return static_cast<uint256>(((intx::uint<512>{b} << 384) + (Curve::ORDER >> 1)) /
+                                    intx::uint<512>{Curve::ORDER});
+    };
+    static_assert(G1 == round_384(Curve::Y2) && G2 == round_384(Curve::MINUS_Y1));
+    static_assert(Curve::X1 * Curve::Y2 + Curve::X2 * Curve::MINUS_Y1 == Curve::ORDER);
+    static_assert((G1 >> 128) < (uint256{1} << 128) - 1 && (G2 >> 128) < (uint256{1} << 128) - 1);
+    static_assert((Curve::X1 + Curve::X2) / 2 + 1 < (uint256{1} << 128) &&
+                  (Curve::MINUS_Y1 + Curve::Y2) / 2 + 1 < (uint256{1} << 128));
+
+    alignas(32) word kw[8];
+    alignas(32) word h1[8];
+    alignas(32) word h2[8];
+    const word* const src = reinterpret_cast<const word*>(&k);
+    for (int i = 0; i < 8; ++i)
+        kw[i] = h1[i] = h2[i] = src[i];
+    bigint_op(h1, &G1, BIGINT_MUL_HIGH);
+    bigint_op(h2, &G2, BIGINT_MUL_HIGH);
+
+    // c = (h >> 128) + bit 127 of h, below 2^128 (h < g < 2^256 - 2^127), in two buffers each:
+    // the products below overwrite their first operand.
+    alignas(32) word c1a[8];
+    alignas(32) word c1b[8];
+    alignas(32) word c2a[8];
+    alignas(32) word c2b[8];
+    const auto round_shift = [](word* a, word* b, const word* h) noexcept {
+        uint32_t carry = h[3] >> 31;
+        for (int i = 0; i < 4; ++i)
+        {
+            const uint32_t v = h[4 + i] + carry;
+            carry = v < carry;
+            a[i] = b[i] = v;
+            a[4 + i] = b[4 + i] = 0;
+        }
+    };
+    round_shift(c1a, c1b, h1);
+    round_shift(c2a, c2b, h2);
+
+    bigint_op(c1a, &MINUS_B1, BIGINT_MUL_LOW);  // -c1 b1
+    bigint_op(c2a, &B2, BIGINT_MUL_LOW);        // c2 b2
+    bigint_op(c1a, c2a, BIGINT_SUB);            // k2 = -c1 b1 - c2 b2 (mod 2^256)
+    bigint_op(c1b, &A1, BIGINT_MUL_LOW);        // c1 a1
+    bigint_op(c2b, &A2, BIGINT_MUL_LOW);        // c2 a2
+    bigint_op(kw, c1b, BIGINT_SUB);
+    bigint_op(kw, c2b, BIGINT_SUB);             // k1 = k - c1 a1 - c2 a2 (mod 2^256)
+
+    const bool k1_neg = (kw[7] >> 31) != 0;
+    const bool k2_neg = (c1a[7] >> 31) != 0;
+    if (k1_neg)
+        bigint_op(kw, &ZERO, BIGINT_SUB_AND_NEGATE);
+    if (k2_neg)
+        bigint_op(c1a, &ZERO, BIGINT_SUB_AND_NEGATE);
+    std::array<ecc::SignedScalar<uint256>, 2> r;
+    r[0].sign = k1_neg;
+    r[1].sign = k2_neg;
+    word* const d1 = reinterpret_cast<word*>(&r[0].value);
+    word* const d2 = reinterpret_cast<word*>(&r[1].value);
+    for (int i = 0; i < 8; ++i)
+    {
+        d1[i] = kw[i];
+        d2[i] = c1a[i];
+    }
+    return r;
+}
+
 /// p = 2p in place, as the representative (X3/4 : Y3/8 : Z3/2) of ecc::dbl()'s a = 0 result
 /// (X3 : Y3 : Z3), i.e. with lambda = 1/2: with L = 3X^2/2 and T = XY^2, X' = L^2 - 2T,
 /// Y' = L(T - X') - Y^4 and Z' = YZ. (X : Y : Z) and (l^2 X : l^3 Y : l Z) are the same point and
@@ -1165,8 +1264,8 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
     const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
 {
     using Point = ecc::ProjPoint<Curve>;
-    const auto [a1, b1] = ecc::decompose<Curve>(u1);
-    const auto [a2, b2] = ecc::decompose<Curve>(u2);
+    const auto [a1, b1] = split_lambda(u1);
+    const auto [a2, b2] = split_lambda(u2);
 
     alignas(32) std::byte t_raw[R_TABLE_SIZE * sizeof(Point)];
     alignas(32) std::byte e_raw[2 * R_TABLE_SIZE * sizeof(Curve::Fp)];
@@ -1310,8 +1409,8 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
             continue;
         const auto u1 = -z[i] * r_inv[i];
         const auto u2 = s[i] * r_inv[i];
-        const auto [a1, b1] = ecc::decompose<Curve>(u1.value());
-        const auto [a2, b2] = ecc::decompose<Curve>(u2.value());
+        const auto [a1, b1] = split_lambda(u1.value());
+        const auto [a2, b2] = split_lambda(u2.value());
         k1a[i] = a1.value;
         k1b[i] = b1.value;
         k2a[i] = a2.value;
