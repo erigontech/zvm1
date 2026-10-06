@@ -408,7 +408,12 @@ template <unsigned T>
             31 - clz_nonzero(top));
         return;
     }
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The quotient alone, written straight into the divisor's slot, for a divisor of T + 1 words.
+    intx::internal::div32::udiv(x, v, v, T + 1);
+#else
     v = x / v;
+#endif
 }
 
 inline void div(StackTop stack) noexcept
@@ -500,7 +505,12 @@ inline void mod(StackTop stack) noexcept
             return;
         }
     }
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The remainder alone, written straight into the divisor's slot.
+    intx::internal::div32::urem(stack[0], v, v);
+#else
     v = stack[0] % v;
+#endif
 }
 
 inline void smod(StackTop stack) noexcept
@@ -562,6 +572,22 @@ inline void mulmod(StackTop stack) noexcept
     std::swap(x, m);
     // The result will be in the &m position (now containing x) as expected by EVM.
     sp1::mulmod(m, std::span<const uint256, 2>{&y, 2});
+#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The 512-bit product straight from MUL_LOW and MUL_HIGH, which overwrite their first operand:
+    // two copies of x, multiplied by y in its stack slot. Then only its remainder, into m's slot.
+    alignas(32) intx::uint512 p{intx::uint512::uninit_tag{}};
+    word32* const pw = reinterpret_cast<word32*>(&p);
+    const word32* const xw = reinterpret_cast<const word32*>(&x);
+    for (size_t i = 0; i < 8; ++i)
+        pw[i] = pw[i + 8] = xw[i];
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&pw[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+    register uint32_t r12 asm("x12") = 0x08;  // MUL_LOW
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    r10 = reinterpret_cast<uintptr_t>(&pw[8]);
+    r12 = 0x10;  // MUL_HIGH
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    intx::internal::div32::urem(p, m, m);
 #else
     m = intx::mulmod(x, y, m);
 #endif
