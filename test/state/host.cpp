@@ -638,7 +638,7 @@ const evmc_bytes32* Host::sload(const address& addr, const bytes32& key, int64_t
             return nullptr;
     }
     if (!slot.loaded)
-        m_state.load_storage(addr, key, slot);
+        m_state.load_storage(addr, acc.view_handle, key, slot);
     return &slot.current;
 }
 
@@ -658,7 +658,7 @@ evmc_storage_status Host::sstore(const address& addr, const bytes32& key, const 
         m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
     }
     if (!slot.loaded)
-        m_state.load_storage(addr, key, slot);
+        m_state.load_storage(addr, acc.view_handle, key, slot);
     return update_storage(m_state, slot, value);
 }
 

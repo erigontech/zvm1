@@ -180,5 +180,18 @@ public:
         m_builder.on_storage_read(addr, key);
         return m_inner.get_storage(addr, key);
     }
+
+    /// Non-recording like get_account_code(): the handle is the inner view's.
+    bytes_view get_account_code_at(const void* handle, const address& addr) const noexcept override
+    {
+        return m_inner.get_account_code_at(handle, addr);
+    }
+
+    bytes32 get_storage_at(
+        const void* handle, const address& addr, const bytes32& key) const noexcept override
+    {
+        m_builder.on_storage_read(addr, key);
+        return m_inner.get_storage_at(handle, addr, key);
+    }
 };
 }  // namespace evmone::state
