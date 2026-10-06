@@ -814,6 +814,7 @@ template <typename T>
 class AlignedArray
 {
     static_assert(std::is_trivially_destructible_v<T>);
+    static_assert(sizeof(T) % 32 == 0);  // every element stays 32-aligned
     std::unique_ptr<std::byte[]> raw_;
     T* p_;
 
@@ -943,6 +944,13 @@ unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
 /// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
 constexpr auto FP_ONE = Curve::Fp::one();
 
+/// dbl_inplace, madd_inplace and jadd_inplace rebind their operands through __builtin_assume_aligned(.., 32),
+/// so the inlined ModArith operations fold their alignment tests. Every caller passes 32-byte-aligned storage
+/// (FieldElement's value_ is alignas(32)); a misaligned operand would be undefined behavior and would make the
+/// BigInt CSR fault. There is no assert(): the guest is built with NDEBUG, and these functions do not exist on
+/// the host.
+static_assert(alignof(ecc::ProjPoint<Curve>) == 32 && alignof(AffinePoint) == 32 && alignof(Curve::Fp) == 32);
+
 /// p = 2p in place, as the representative (X3/4 : Y3/8 : Z3/2) of ecc::dbl()'s a = 0 result
 /// (X3 : Y3 : Z3), i.e. with lambda = 1/2: with L = 3X^2/2 and T = XY^2, X' = L^2 - 2T,
 /// Y' = L(T - X') - Y^4 and Z' = YZ. (X : Y : Z) and (l^2 X : l^3 Y : l Z) are the same point and
@@ -950,9 +958,10 @@ constexpr auto FP_ONE = Curve::Fp::one();
 /// x/z^2 and y/z^3), so one halving of X replaces the doublings in 2YZ, 4XY^2 and 8Y^4. Each
 /// coordinate is written into p as it dies, skipping the copies into the returned point and back
 /// (3 CSR MEMCOPY each way).
-__attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
+__attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p_) noexcept
 {
     using FE = Curve::Fp;
+    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
     auto& [x1, y1, z1] = p;
     DECL_FE_COPY(FE, yy, y1); yy *= y1;          // Y^2
     z1 *= y1;                                    // Z' = YZ
@@ -986,9 +995,12 @@ __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
 /// at infinity (p == -(x2, y2)), and then leaves p with z == 0.
 template <bool Live = false>
 __attribute__((flatten)) bool madd_inplace(
-    ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
+    ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_, const Curve::Fp& y2_) noexcept
 {
     using FE = Curve::Fp;
+    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
+    const auto& x2 = *static_cast<const FE*>(__builtin_assume_aligned(&x2_, 32));
+    const auto& y2 = *static_cast<const FE*>(__builtin_assume_aligned(&y2_, 32));
     auto& [x1, y1, z1] = p;
     if constexpr (!Live)
     {
@@ -1032,10 +1044,14 @@ __attribute__((flatten)) bool madd_inplace(
 /// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
 /// Returns true if the sum is the point at infinity, and then leaves p with z == 0.
 template <bool Live = false>
-__attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
-    const Curve::Fp& y2, const Curve::Fp& z2) noexcept
+__attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_,
+    const Curve::Fp& y2_, const Curve::Fp& z2_) noexcept
 {
     using FE = Curve::Fp;
+    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
+    const auto& x2 = *static_cast<const FE*>(__builtin_assume_aligned(&x2_, 32));
+    const auto& y2 = *static_cast<const FE*>(__builtin_assume_aligned(&y2_, 32));
+    const auto& z2 = *static_cast<const FE*>(__builtin_assume_aligned(&z2_, 32));
     auto& [x1, y1, z1] = p;
     if constexpr (!Live)
     {
