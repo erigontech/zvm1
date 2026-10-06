@@ -34,6 +34,14 @@ else()
             set(BLST_PATCH_COMMAND sh ${BLST_AIRBENDER_PATCH})
             set(BLST_CC "${BLST_CC} -DAIRBENDER_BIGINT_CSR")
             set(BLST_BUILD_SCRIPT ./build.sh CC='${BLST_CC}' AR='${CMAKE_AR}' RANLIB='${CMAKE_RANLIB}')
+            # The script edits the extracted sources in place, so a changed script needs a fresh
+            # extraction (the patch step alone would find them already patched). Tag the URL with
+            # the script's hash: the fragment never reaches the server and the downloaded tarball
+            # is reused, but the download step, which extracts, re-runs whenever the hash changes.
+            file(SHA256 "${BLST_AIRBENDER_PATCH}" BLST_PATCH_HASH)
+            string(SUBSTRING "${BLST_PATCH_HASH}" 0 16 BLST_PATCH_HASH)
+            set(BLST_URL_TAG "#airbender-${BLST_PATCH_HASH}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BLST_AIRBENDER_PATCH}")
         else()
             set(BLST_PATCH_COMMAND "")
         endif()
@@ -46,7 +54,7 @@ ExternalProject_Add(
     blst
     EXCLUDE_FROM_ALL TRUE
     PREFIX ${PROJECT_BINARY_DIR}/deps
-    URL https://github.com/supranational/blst/archive/refs/tags/v0.3.17.tar.gz
+    URL https://github.com/supranational/blst/archive/refs/tags/v0.3.17.tar.gz${BLST_URL_TAG}
     URL_HASH SHA256=c3fef37b566b67419703b2bbb648e15176276af9a880c22aa8f5f2e8cecc2e4d
     DOWNLOAD_NO_PROGRESS TRUE
     PATCH_COMMAND ${BLST_PATCH_COMMAND}
