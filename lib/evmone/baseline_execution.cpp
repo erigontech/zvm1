@@ -1023,6 +1023,148 @@ template <Opcode Op>
     pos.code_it += 4;
     return true;
 }
+
+/// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
+[[gnu::always_inline]] inline void copy_slot(uint256* dst, const uint256* src) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(dst);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(src);
+    register uint32_t r12 asm("x12") = 0x80;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
+    *dst = *src;
+#endif
+}
+
+/// *dst += *src: the one BigInt delegation ADD makes.
+[[gnu::always_inline]] inline void add_slot(uint256* dst, const uint256* src) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(dst);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(src);
+    register uint32_t r12 asm("x12") = 0x01;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
+    *dst += *src;
+#endif
+}
+
+constexpr bool swap1_fuses(Opcode op) noexcept
+{
+    return op == OP_POP || op == OP_JUMP || op == OP_SWAP2 || op == OP_DUP2;
+}
+constexpr bool swap2_fuses(Opcode op) noexcept
+{
+    return op == OP_POP || op == OP_SWAP1 || op == OP_ADD;
+}
+
+/// SWAP1 and Op, entered after SWAP1's checks with the swap not yet made; pos.code_it is at Op.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool swap1_then(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    auto* const s = pos.stack_end;
+    if constexpr (Op == OP_POP)
+    {
+        if (INTX_UNLIKELY(!deduct_gas(gas, 2)))
+            return fail(EVMC_OUT_OF_GAS);
+        copy_slot(s - 2, s - 1);
+        pos.stack_end = s - 1;
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_JUMP)
+    {
+        if (INTX_UNLIKELY(!deduct_gas(gas, 8)))
+            return fail(EVMC_OUT_OF_GAS);
+        const auto* const w = reinterpret_cast<const uint32_t*>(s - 2);
+        const uint32_t dst = w[0];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||
+                          !analysis.check_jumpdest(dst)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        copy_slot(s - 2, s - 1);
+        pos.stack_end = s - 1;
+        if (INTX_UNLIKELY(!deduct_gas(gas, 1)))
+            return fail(EVMC_OUT_OF_GAS);
+        pos.code_it = &analysis.code()[dst] + 1;
+        return true;
+    }
+    else if constexpr (Op == OP_SWAP2)
+    {
+        if (INTX_UNLIKELY(s <= stack_bottom + 2))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        alignas(32) char tmp_raw_[sizeof(uint256)];
+        auto* const tmp = reinterpret_cast<uint256*>(tmp_raw_);
+        copy_slot(tmp, s - 3);
+        copy_slot(s - 3, s - 2);
+        copy_slot(s - 2, s - 1);
+        copy_slot(s - 1, tmp);
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_DUP2)
+    {
+        if (INTX_UNLIKELY(s == stack_limit))
+            return fail(EVMC_STACK_OVERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        copy_slot(s, s - 1);
+        copy_slot(s - 1, s - 2);
+        copy_slot(s - 2, s);
+        pos.stack_end = s + 1;
+        pos.code_it += 1;
+        return true;
+    }
+    else
+        return true;
+}
+
+/// SWAP2 and Op, entered after SWAP2's checks with the swap not yet made; pos.code_it is at Op.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool swap2_then(Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    auto* const s = pos.stack_end;
+    if constexpr (Op == OP_POP)
+    {
+        if (INTX_UNLIKELY(!deduct_gas(gas, 2)))
+            return fail(EVMC_OUT_OF_GAS);
+        copy_slot(s - 3, s - 1);
+        pos.stack_end = s - 1;
+    }
+    else if constexpr (Op == OP_SWAP1)
+    {
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        alignas(32) char tmp_raw_[sizeof(uint256)];
+        auto* const tmp = reinterpret_cast<uint256*>(tmp_raw_);
+        copy_slot(tmp, s - 1);
+        copy_slot(s - 1, s - 2);
+        copy_slot(s - 2, s - 3);
+        copy_slot(s - 3, tmp);
+    }
+    else if constexpr (Op == OP_ADD)
+    {
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        add_slot(s - 2, s - 3);
+        copy_slot(s - 3, s - 1);
+        pos.stack_end = s - 1;
+    }
+    pos.code_it += 1;
+    return true;
+}
 #endif
 
 #if EVMONE_CGOTO_SUPPORTED
@@ -1031,6 +1173,46 @@ int64_t dispatch_cgoto(
 {
 #pragma GCC diagnostic ignored "-Wpedantic"
 
+#if EVMONE_RV32_DISPATCH
+    static constexpr void* tables[] = {
+#define ON_OPCODE(OPCODE) &&SWAP2_THEN_##OPCODE,
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED(_) &&SWAP2_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE(OPCODE) &&SWAP1_THEN_##OPCODE,
+#define ON_OPCODE_UNDEFINED(_) &&SWAP1_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE(OPCODE) &&TARGET_##OPCODE,
+#define ON_OPCODE_UNDEFINED(_) &&TARGET_OP_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE(OPCODE) &&PUSH1_THEN_##OPCODE,
+#define ON_OPCODE_UNDEFINED(_) &&PUSH1_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
+    };
+    static_assert(std::size(tables) == 1024);
+    void* const* tbl = &tables[512];
+    asm("" : "+r"(tbl));
+    // The entry for an opcode: the opcode's slot, hidden from GCC so that the table offset
+    // stays the load's immediate instead of being added to the opcode.
+    const auto slot = [tbl](unsigned op) noexcept {
+        auto* p = tbl + op;
+        asm("" : "+r"(p));
+        return p;
+    };
+#define CGOTO(OP) (slot(OP)[0])
+#define PUSH1_CGOTO(OP) (slot(OP)[256])
+#define SWAP1_CGOTO(OP) (slot(OP)[-256])
+#define SWAP2_CGOTO(OP) (slot(OP)[-512])
+#else
     static constexpr void* cgoto_table[] = {
 #define ON_OPCODE(OPCODE) &&TARGET_##OPCODE,
 #undef ON_OPCODE_UNDEFINED
@@ -1040,19 +1222,7 @@ int64_t dispatch_cgoto(
 #undef ON_OPCODE_UNDEFINED
 #define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
     };
-    // static_assert(std::size(cgoto_table) == 256);
-
-#if EVMONE_RV32_DISPATCH
-    // The successor of PUSH1, entered with the push still to make (see push1_then()).
-    static constexpr void* push1_table[] = {
-#define ON_OPCODE(OPCODE) &&PUSH1_THEN_##OPCODE,
-#undef ON_OPCODE_UNDEFINED
-#define ON_OPCODE_UNDEFINED(_) &&PUSH1_THEN_UNDEFINED,
-        MAP_OPCODES
-#undef ON_OPCODE
-#undef ON_OPCODE_UNDEFINED
-#define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
-    };
+#define CGOTO(OP) cgoto_table[OP]
 #endif
 
     const auto stack_bottom = state.stack_space.bottom();
@@ -1061,7 +1231,7 @@ int64_t dispatch_cgoto(
     // Code iterator and stack top pointer for interpreter loop.
     Position position{code, stack_bottom};
 
-    goto* cgoto_table[*position.code_it];
+    goto* CGOTO(*position.code_it);
 
 #define ON_OPCODE_INVOKE(OPCODE)                                                                 \
     if (const auto next =                                                                        \
@@ -1076,7 +1246,7 @@ int64_t dispatch_cgoto(
            this improves compiler optimization. */                                               \
         position = next;                                                                         \
     }                                                                                            \
-    goto* cgoto_table[*position.code_it];
+    goto* CGOTO(*position.code_it);
 
 #if EVMONE_RV32_DISPATCH
 #define ON_OPCODE(OPCODE)                                                                        \
@@ -1095,7 +1265,23 @@ int64_t dispatch_cgoto(
             return gas;                                                                          \
         }                                                                                        \
         position.code_it += 2;                                                                   \
-        goto* push1_table[*position.code_it];                                                    \
+        goto* PUSH1_CGOTO(*position.code_it);                                                    \
+    }                                                                                            \
+    else if constexpr (OPCODE == OP_SWAP1 || OPCODE == OP_SWAP2)                                 \
+    {                                                                                            \
+        /* The swap's checks; the swap is made by the successor's SWAPn_THEN_ entry. */          \
+        if (const auto status = check_requirements<OPCODE>(                                      \
+                cost_table, gas, position.stack_end, stack_bottom, stack_limit);                 \
+            status != EVMC_SUCCESS)                                                              \
+        {                                                                                        \
+            state.status = status;                                                               \
+            return gas;                                                                          \
+        }                                                                                        \
+        position.code_it += 1;                                                                   \
+        if constexpr (OPCODE == OP_SWAP1)                                                        \
+            goto* SWAP1_CGOTO(*position.code_it);                                                \
+        else                                                                                     \
+            goto* SWAP2_CGOTO(*position.code_it);                                                \
     }                                                                                            \
     else                                                                                         \
     {                                                                                            \
@@ -1122,7 +1308,7 @@ TARGET_OP_UNDEFINED:
     {                                                                                            \
         if (!push1_then<OPCODE>(cost_table, stack_bottom, position, gas, state))                 \
             return gas;                                                                          \
-        goto* cgoto_table[*position.code_it];                                                    \
+        goto* CGOTO(*position.code_it);                                                    \
     }                                                                                            \
     else if constexpr (OPCODE == OP_PUSH1)                                                       \
     {                                                                                            \
@@ -1131,7 +1317,7 @@ TARGET_OP_UNDEFINED:
         {                                                                                        \
             if (!push1_shl_sub(stack_bottom, stack_limit, position, gas, state))                 \
                 return gas;                                                                      \
-            goto* cgoto_table[*position.code_it];                                                \
+            goto* CGOTO(*position.code_it);                                                \
         }                                                                                        \
         push1_commit(position);                                                                  \
         goto TARGET_##OPCODE;                                                                    \
@@ -1147,6 +1333,48 @@ TARGET_OP_UNDEFINED:
 
 PUSH1_THEN_UNDEFINED:
     push1_commit(position);
+    goto TARGET_OP_UNDEFINED;
+
+#define ON_OPCODE(OPCODE)                                                                        \
+    SWAP1_THEN_##OPCODE : ASM_COMMENT(SWAP1_##OPCODE);                                           \
+    if constexpr (swap1_fuses(OPCODE))                                                           \
+    {                                                                                            \
+        if (!swap1_then<OPCODE>(stack_bottom, stack_limit, position, gas, state))                \
+            return gas;                                                                          \
+        goto* CGOTO(*position.code_it);                                                          \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        instr::core::swap<1>(position.stack_end);                                                \
+        goto TARGET_##OPCODE;                                                                    \
+    }
+
+    MAP_OPCODES
+#undef ON_OPCODE
+
+SWAP1_THEN_UNDEFINED:
+    instr::core::swap<1>(position.stack_end);
+    goto TARGET_OP_UNDEFINED;
+
+#define ON_OPCODE(OPCODE)                                                                        \
+    SWAP2_THEN_##OPCODE : ASM_COMMENT(SWAP2_##OPCODE);                                           \
+    if constexpr (swap2_fuses(OPCODE))                                                           \
+    {                                                                                            \
+        if (!swap2_then<OPCODE>(position, gas, state))                                           \
+            return gas;                                                                          \
+        goto* CGOTO(*position.code_it);                                                          \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        instr::core::swap<2>(position.stack_end);                                                \
+        goto TARGET_##OPCODE;                                                                    \
+    }
+
+    MAP_OPCODES
+#undef ON_OPCODE
+
+SWAP2_THEN_UNDEFINED:
+    instr::core::swap<2>(position.stack_end);
     goto TARGET_OP_UNDEFINED;
 #endif
 }

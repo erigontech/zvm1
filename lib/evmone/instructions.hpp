@@ -1432,7 +1432,29 @@ template <int N>
 inline void swap(StackTop stack) noexcept
 {
     static_assert(N >= 1 && N <= 16);
+#if defined(AIRBENDER) && defined(__riscv)
+    // fast_swap() with the two stack slots addressed from the stack end inside the asm: the
+    // offsets are immediates, so GCC does not compute both addresses into registers first.
+    alignas(32) char tmp_raw_[sizeof(uint256)];
+    asm volatile(
+        "mv x10, %[tmp]\n\t"
+        "addi x11, %[end], %[x]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        "addi x10, %[end], %[x]\n\t"
+        "addi x11, %[end], %[y]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        "addi x10, %[end], %[y]\n\t"
+        "mv x11, %[tmp]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [tmp] "r"(tmp_raw_), [end] "r"(stack.end()), [x] "I"(-32), [y] "I"(-32 * (N + 1))
+        : "x10", "x11", "x12", "memory");
+#else
     fast_swap(stack.top(), stack[N]);
+#endif
 }
 
 inline code_iterator dupn(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
