@@ -251,6 +251,122 @@ static inline ALWAYS_INLINE uint64_t load_le_any(const uint8_t* data)
 }
 #endif
 
+#if defined(AIRBENDER)
+typedef uint32_t __attribute__((may_alias)) keccak_word32;
+
+/// The word holding the last 0-3 input bytes and the padding byte after them.
+static inline ALWAYS_INLINE uint32_t tail_word(const uint8_t* t, size_t r)
+{
+    if (r == 0)
+        return 1;
+    uint32_t w = (uint32_t)1 << (8 * r);
+    w |= t[0];
+    if (r >= 2)
+        w |= (uint32_t)t[1] << 8;
+    if (r == 3)
+        w |= (uint32_t)t[2] << 16;
+    return w;
+}
+
+/// XORs the last incomplete block (rem < 136 bytes, 4-aligned data) and the padding byte into s.
+static inline ALWAYS_INLINE void absorb_last_aligned(keccak_word32* s, const uint8_t* data, size_t rem)
+{
+    const keccak_word32* const d = (const keccak_word32*)data;
+    const size_t m = rem / 4;
+    switch (m)
+    {
+    case 33: s[32] ^= d[32]; /* fallthrough */
+    case 32: s[31] ^= d[31]; /* fallthrough */
+    case 31: s[30] ^= d[30]; /* fallthrough */
+    case 30: s[29] ^= d[29]; /* fallthrough */
+    case 29: s[28] ^= d[28]; /* fallthrough */
+    case 28: s[27] ^= d[27]; /* fallthrough */
+    case 27: s[26] ^= d[26]; /* fallthrough */
+    case 26: s[25] ^= d[25]; /* fallthrough */
+    case 25: s[24] ^= d[24]; /* fallthrough */
+    case 24: s[23] ^= d[23]; /* fallthrough */
+    case 23: s[22] ^= d[22]; /* fallthrough */
+    case 22: s[21] ^= d[21]; /* fallthrough */
+    case 21: s[20] ^= d[20]; /* fallthrough */
+    case 20: s[19] ^= d[19]; /* fallthrough */
+    case 19: s[18] ^= d[18]; /* fallthrough */
+    case 18: s[17] ^= d[17]; /* fallthrough */
+    case 17: s[16] ^= d[16]; /* fallthrough */
+    case 16: s[15] ^= d[15]; /* fallthrough */
+    case 15: s[14] ^= d[14]; /* fallthrough */
+    case 14: s[13] ^= d[13]; /* fallthrough */
+    case 13: s[12] ^= d[12]; /* fallthrough */
+    case 12: s[11] ^= d[11]; /* fallthrough */
+    case 11: s[10] ^= d[10]; /* fallthrough */
+    case 10: s[9] ^= d[9]; /* fallthrough */
+    case 9: s[8] ^= d[8]; /* fallthrough */
+    case 8: s[7] ^= d[7]; /* fallthrough */
+    case 7: s[6] ^= d[6]; /* fallthrough */
+    case 6: s[5] ^= d[5]; /* fallthrough */
+    case 5: s[4] ^= d[4]; /* fallthrough */
+    case 4: s[3] ^= d[3]; /* fallthrough */
+    case 3: s[2] ^= d[2]; /* fallthrough */
+    case 2: s[1] ^= d[1]; /* fallthrough */
+    case 1: s[0] ^= d[0]; /* fallthrough */
+    case 0:
+        break;
+    default:
+        __builtin_unreachable();
+    }
+    s[m] ^= tail_word(data + 4 * m, rem % 4);
+}
+
+/// Copies a short input (size < 136, 4-aligned data) with its padding byte into the zero state s.
+/// Returns the number of words written.
+static inline ALWAYS_INLINE size_t copy_short_aligned(keccak_word32* s, const uint8_t* data, size_t size)
+{
+    const keccak_word32* const d = (const keccak_word32*)data;
+    const size_t m = size / 4;
+    switch (m)
+    {
+    case 33: s[32] = d[32]; /* fallthrough */
+    case 32: s[31] = d[31]; /* fallthrough */
+    case 31: s[30] = d[30]; /* fallthrough */
+    case 30: s[29] = d[29]; /* fallthrough */
+    case 29: s[28] = d[28]; /* fallthrough */
+    case 28: s[27] = d[27]; /* fallthrough */
+    case 27: s[26] = d[26]; /* fallthrough */
+    case 26: s[25] = d[25]; /* fallthrough */
+    case 25: s[24] = d[24]; /* fallthrough */
+    case 24: s[23] = d[23]; /* fallthrough */
+    case 23: s[22] = d[22]; /* fallthrough */
+    case 22: s[21] = d[21]; /* fallthrough */
+    case 21: s[20] = d[20]; /* fallthrough */
+    case 20: s[19] = d[19]; /* fallthrough */
+    case 19: s[18] = d[18]; /* fallthrough */
+    case 18: s[17] = d[17]; /* fallthrough */
+    case 17: s[16] = d[16]; /* fallthrough */
+    case 16: s[15] = d[15]; /* fallthrough */
+    case 15: s[14] = d[14]; /* fallthrough */
+    case 14: s[13] = d[13]; /* fallthrough */
+    case 13: s[12] = d[12]; /* fallthrough */
+    case 12: s[11] = d[11]; /* fallthrough */
+    case 11: s[10] = d[10]; /* fallthrough */
+    case 10: s[9] = d[9]; /* fallthrough */
+    case 9: s[8] = d[8]; /* fallthrough */
+    case 8: s[7] = d[7]; /* fallthrough */
+    case 7: s[6] = d[6]; /* fallthrough */
+    case 6: s[5] = d[5]; /* fallthrough */
+    case 5: s[4] = d[4]; /* fallthrough */
+    case 4: s[3] = d[3]; /* fallthrough */
+    case 3: s[2] = d[2]; /* fallthrough */
+    case 2: s[1] = d[1]; /* fallthrough */
+    case 1: s[0] = d[0]; /* fallthrough */
+    case 0:
+        break;
+    default:
+        __builtin_unreachable();
+    }
+    s[m] = tail_word(data + 4 * m, size % 4);
+    return m + 1;
+}
+#endif
+
 #if KECCAK_INLINE_STATE_CLEAR
 /// Clears the state with 25 stores.
 ///
@@ -620,6 +736,14 @@ static inline ALWAYS_INLINE void absorb_input(
         size -= block_words * WORD_SIZE;
     }
 
+#if defined(AIRBENDER)
+    if (misalign == 0)
+    {
+        absorb_last_aligned((keccak_word32*)state, reader.data, size);
+        return;
+    }
+#endif
+
     const size_t last_words = size / WORD_SIZE;  // Whole words of the last, incomplete block.
     absorb_words(state, last_words, &reader);
     size %= WORD_SIZE;
@@ -715,6 +839,18 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 
             // Fast path: copy full 4-byte words when data is 4-byte aligned.
             if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
+            {
+                const size_t words = copy_short_aligned((keccak_word32*)buf, data, size);
+                buf_zero_state_from(4 * words);
+                buf[16] |= 0x8000000000000000ULL;
+                keccak_permute_buf();
+                hash.word64s[0] = to_le64(buf[0]);
+                hash.word64s[1] = to_le64(buf[1]);
+                hash.word64s[2] = to_le64(buf[2]);
+                hash.word64s[3] = to_le64(buf[3]);
+                return hash;
+            }
+            if (0)
             {
                 const uint32_t* dW = (const uint32_t*)d;
                 size_t full_words = remaining / 4;
