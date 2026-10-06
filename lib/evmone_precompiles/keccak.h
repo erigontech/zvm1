@@ -20,6 +20,18 @@ extern "C" {
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size) noexcept;
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32]) noexcept;
 
+/// ethash_keccak256() of the @p size bytes at @p data, which must be 8-byte aligned and hold at least
+/// @p blocks (1 or more) whole 136-byte blocks, that also leaves the Keccak state after those
+/// blocks in @p slot (32 lanes, 256-byte aligned): the state of the first 136 * @p blocks bytes.
+union ethash_hash256 ethash_keccak256_snap(
+    const uint8_t* data, size_t size, size_t blocks, uint64_t* slot) noexcept;
+
+/// ethash_keccak256() of the @p size bytes at @p data (8-byte aligned) given the state ethash_keccak256_snap()
+/// left in @p slot for the same @p blocks and the same first 136 * @p blocks bytes of data: absorbs only
+/// the rest. The slot is permuted in place and so holds no snapshot afterwards.
+union ethash_hash256 ethash_keccak256_resume(
+    uint64_t* slot, size_t blocks, const uint8_t* data, size_t size) noexcept;
+
 #if defined(AIRBENDER)
 /// A 32-bit word of a byte buffer or of a uint256 (stored as 64-bit words): may alias them.
 typedef uint32_t __attribute__((may_alias)) ethash_w32;

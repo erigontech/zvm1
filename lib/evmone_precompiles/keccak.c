@@ -102,13 +102,13 @@ static inline __attribute__((always_inline)) void buf_zero_state_from(size_t off
         : [off] "r"(off), [b] "r"(buf));
 }
 
-/// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting buf[] in place.
+/// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting the 256-byte-aligned state s in place.
 /// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
 /// scans for exactly 649 contiguous csrrw instructions.
-static inline __attribute__((always_inline)) void keccak_permute_buf(void)
+static inline __attribute__((always_inline)) void keccak_permute_at(uint64_t* s)
 {
     register uint32_t ctrl __asm__("x10") = 0;
-    register void*    sptr __asm__("x11") = (void*)buf;
+    register void*    sptr __asm__("x11") = (void*)s;
     __asm__ __volatile__(
         ".rept 649\n"
         "  csrrw x0, 0x7CB, x0\n"
@@ -117,6 +117,13 @@ static inline __attribute__((always_inline)) void keccak_permute_buf(void)
         : "r"(sptr)
         : "memory"
     );
+}
+
+/// The same on buf[]. The delegation takes any 256-byte-aligned state in RAM, so the snapshot pool
+/// of ethash_keccak256_resume() is permuted in place by keccak_permute_at() too.
+static inline __attribute__((always_inline)) void keccak_permute_buf(void)
+{
+    keccak_permute_at(buf);
 }
 
 /// Keccak-f[1600] on any state. keccak() keeps its state in buf[] itself, so once inlined there
@@ -902,6 +909,108 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
     }
 #endif
     keccak(hash.word64s, 256, data, size);
+    return hash;
+}
+
+/// Copies the 25 lanes of the state in buf[] to the pool slot. Word by word and unrolled: a loop
+/// GCC recognizes as a copy becomes a memcpy call, and the guest's memcpy is the BigInt delegation.
+#if defined(AIRBENDER)
+static inline ALWAYS_INLINE void save_buf_lanes(uint64_t* slot)
+{
+    const keccak_word32* const s = (const keccak_word32*)buf;
+    keccak_word32* const d = (keccak_word32*)slot;
+    size_t i;
+#pragma GCC unroll 50
+    for (i = 0; i < 2 * 25; ++i)
+        d[i] = s[i];
+}
+#endif
+
+union ethash_hash256 ethash_keccak256_snap(
+    const uint8_t* data, size_t size, size_t blocks, uint64_t* slot)
+{
+    union ethash_hash256 hash;
+    const size_t block_words = (1600 - 256 * 2) / 8 / WORD_SIZE;
+#if defined(AIRBENDER)
+    // keccak() with a copy of the state after every block, kept when it is the blocks-th. The state
+    // lives in buf[] as there: the snapshot is the only extra work.
+    {
+        const keccak_word32* const s = (const keccak_word32*)data;
+        keccak_word32* const d = (keccak_word32*)buf;
+        size_t i;
+#pragma GCC unroll 34
+        for (i = 0; i < 2 * block_words; ++i)
+            d[i] = s[i];
+#pragma GCC unroll 32
+        for (; i < 2 * 25; ++i)
+            d[i] = 0;
+    }
+    size_t done = 1;
+    for (;;)
+    {
+        keccak_permute_buf();
+        data += block_words * WORD_SIZE;
+        size -= block_words * WORD_SIZE;
+        if (done == blocks)
+            save_buf_lanes(slot);
+        if (size < block_words * WORD_SIZE)
+            break;
+        struct word_reader reader = {data, 0, 0};
+        absorb_words(buf, block_words, &reader);
+        ++done;
+    }
+    absorb_last_aligned((keccak_word32*)buf, data, size);
+    buf[block_words - 1] ^= 0x8000000000000000;
+    keccak_permute_buf();
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(buf[i]);
+#else
+    uint64_t state[25] = {0};
+    struct word_reader reader = {data, 0, 0};
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        absorb_words(state, block_words, &reader);
+        keccakf1600_best(state);
+    }
+    for (size_t i = 0; i < 25; ++i)
+        slot[i] = state[i];
+    absorb_input(state, block_words, reader.data, size - blocks * block_words * WORD_SIZE, 0);
+    state[block_words - 1] ^= 0x8000000000000000;
+    keccakf1600_best(state);
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(state[i]);
+#endif
+    return hash;
+}
+
+union ethash_hash256 ethash_keccak256_resume(
+    uint64_t* slot, size_t blocks, const uint8_t* data, size_t size)
+{
+    union ethash_hash256 hash;
+    const size_t block_words = (1600 - 256 * 2) / 8 / WORD_SIZE;
+    data += blocks * block_words * WORD_SIZE;
+    size -= blocks * block_words * WORD_SIZE;
+#if defined(AIRBENDER)
+    // The slot is permuted where it is, and consumed. Lanes 25..30 of it are the delegation's
+    // scratch and need no initialization (see buf_zero_state_from()).
+    while (size >= block_words * WORD_SIZE)
+    {
+        struct word_reader reader = {data, 0, 0};
+        absorb_words(slot, block_words, &reader);
+        keccak_permute_at(slot);
+        data += block_words * WORD_SIZE;
+        size -= block_words * WORD_SIZE;
+    }
+    absorb_last_aligned((keccak_word32*)slot, data, size);
+    slot[block_words - 1] ^= 0x8000000000000000;
+    keccak_permute_at(slot);
+#else
+    absorb_input(slot, block_words, data, size, 0);
+    slot[block_words - 1] ^= 0x8000000000000000;
+    keccakf1600_best(slot);
+#endif
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(slot[i]);
     return hash;
 }
 
