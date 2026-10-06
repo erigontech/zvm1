@@ -1322,18 +1322,15 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
     }
     batch_invert(t, fp_prefix, live.get(), n);
 
-    // The odd multiples 3R..15R: 2R in affine, then 7 mixed additions in Jacobian coordinates,
-    // their z batched into one inversion for the whole block. No addition can hit P == +/-Q:
-    // that needs (j +/- 2)R = 0 for some j <= 13, below the (prime) group order.
-    constexpr size_t M = R_TABLE_SIZE - 1;
+    // The odd multiples 3R..15R in affine coordinates: 2R from the batched 1/(2y), then
+    // (2j+1)R = (2j-1)R + 2R, one round per j over the whole block with the denominators
+    // x(2R) - x((2j-1)R) batched into one inversion. None of them is 0: that needs
+    // (2j-1)R = +/-2R, i.e. (2j-3)R = 0 or (2j+1)R = 0 for some j <= 7, below the (prime) group order.
+    constexpr size_t M = R_TABLE_SIZE;
     AlignedArray<AffinePoint> two_r(n);
-    AlignedArray<ecc::ProjPoint<Curve>> odd(n * M);
-    AlignedArray<Fp> odd_z(n * M), odd_prefix(n * M);
-    const std::unique_ptr<uint8_t[]> odd_live{new uint8_t[n * M]};
+    AlignedArray<AffinePoint> odd(n * M);  // odd[i * M + j] = (2j+1) R_i
     for (size_t i = 0; i < n; ++i)
     {
-        for (size_t j = 0; j < M; ++j)
-            odd_live[i * M + j] = live[i];
         if (!live[i])
             continue;
         auto lambda = rx[i];
@@ -1342,31 +1339,48 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         lambda += xx;
         lambda += xx;
         lambda *= t[i];  // 3x^2 / 2y
-        auto x2 = lambda;
-        x2 *= lambda;
-        x2 -= rx[i];
-        x2 -= rx[i];  // lambda^2 - 2x
-        auto y2 = rx[i];
-        y2 -= x2;
-        y2 *= lambda;
-        y2 -= ry[i];  // lambda (x - x2) - y
-        two_r[i] = AffinePoint{x2, y2};
-
-        auto& p = odd[i * M];
-        p.x = rx[i];
-        p.y = ry[i];
-        p.z = FP_ONE;
-        for (size_t j = 0;; ++j)
+        auto& d = two_r[i];
+        d.x = lambda;
+        d.x *= lambda;
+        d.x -= rx[i];
+        d.x -= rx[i];  // lambda^2 - 2x
+        d.y = rx[i];
+        d.y -= d.x;
+        d.y *= lambda;
+        d.y -= ry[i];  // lambda (x - x2) - y
+        odd[i * M].x = rx[i];
+        odd[i * M].y = ry[i];
+    }
+    for (size_t j = 1; j < M; ++j)
+    {
+        for (size_t i = 0; i < n; ++i)
         {
-            auto& p_j = odd[i * M + j];
-            madd_inplace<true>(p_j, two_r[i].x, two_r[i].y);
-            odd_z[i * M + j] = p_j.z;
-            if (j + 1 == M)
-                break;
-            odd[i * M + j + 1] = p_j;
+            if (!live[i])
+                continue;
+            t[i] = two_r[i].x;
+            t[i] -= odd[i * M + j - 1].x;
+        }
+        batch_invert(t, fp_prefix, live.get(), n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (!live[i])
+                continue;
+            const auto& p = odd[i * M + j - 1];
+            const auto& d = two_r[i];
+            auto& q = odd[i * M + j];
+            auto lambda = d.y;
+            lambda -= p.y;
+            lambda *= t[i];  // (y2 - y1) / (x2 - x1)
+            q.x = lambda;
+            q.x *= lambda;
+            q.x -= p.x;
+            q.x -= d.x;  // lambda^2 - x1 - x2
+            q.y = p.x;
+            q.y -= q.x;
+            q.y *= lambda;
+            q.y -= p.y;  // lambda (x1 - x3) - y1
         }
     }
-    batch_invert(odd_z, odd_prefix, odd_live.get(), n * M);
 
     const auto beta = Fp{Curve::BETA};
     for (size_t i = 0; i < n; ++i)
@@ -1389,21 +1403,8 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
             new (&tb[j]) AffinePoint{bx, neg_b ? ny : y};
             new (&tb[R_TABLE_SIZE + j]) AffinePoint{bx, neg_b ? y : ny};
         };
-        put(0, rx[i], ry[i]);
-        for (size_t j = 1; j < R_TABLE_SIZE; ++j)
-        {
-            // to_affine() with the batched z_inv.
-            const auto& q_j = odd[i * M + j - 1];
-            const auto& z_inv = odd_z[i * M + j - 1];
-            auto zz_inv = z_inv;
-            zz_inv *= z_inv;
-            auto x = q_j.x;
-            x *= zz_inv;
-            zz_inv *= z_inv;
-            auto y = q_j.y;
-            y *= zz_inv;
-            put(j, x, y);
-        }
+        for (size_t j = 0; j < R_TABLE_SIZE; ++j)
+            put(j, odd[i * M + j].x, odd[i * M + j].y);
 
         alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
         alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
