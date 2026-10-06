@@ -345,6 +345,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
         new_acc->code_hash = keccak256(code);
         new_acc->code = code;
         new_acc->code_changed = true;
+        m_state.mark_code_written();
     }
 
     auto r = evmc::Result{result.status_code, gas_left, result.gas_refund};

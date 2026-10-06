@@ -92,6 +92,9 @@ class State
     /// with information how to revert them.
     std::vector<JournalEntry> m_journal;
 
+    /// Set once at least one account's code has been written.
+    bool m_code_written = false;
+
 public:
     explicit State(const StateView& state_view) noexcept : m_initial{state_view} {}
     State(const State&) = delete;
@@ -126,6 +129,8 @@ public:
     Account& get_or_insert_for_access(const address& addr);
 
     bytes_view get_code(const address& addr);
+
+    void mark_code_written() noexcept { m_code_written = true; }
 
     StorageValue& get_storage(const address& addr, const bytes32& key);
 

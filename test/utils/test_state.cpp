@@ -49,11 +49,6 @@ void TestState::apply(const state::StateDiff& diff)
         erase(addr);
 }
 
-std::optional<bytes_view> TestState::find_account_code(const address& addr) const noexcept
-{
-    return get_account_code(addr);
-}
-
 bytes32 TestState::get_storage(const address& addr, const bytes32& key) const noexcept
 {
     const auto ait = find(addr);
