@@ -269,6 +269,8 @@ AuthOutcome process_authorization_list(State& state, uint64_t chain_id,
     const auto new_account_state = STATE_BYTES_PER_NEW_ACCOUNT * cpsb;
 
     AuthOutcome out;
+    if (authorization_list.empty())
+        return out;
 
     // Leaves already written this transaction pay no ACCOUNT_WRITE: the sender's at inclusion
     // (nonce bump + fee), the recipient's on a value transfer. Later authorities join the set on
@@ -569,13 +571,16 @@ bytes_view State::get_code(const address& addr)
 
 Account& State::touch(const address& addr)
 {
-    auto& acc = get_or_insert(addr, {.erase_if_empty = true});
-    if (!acc.erase_if_empty && acc.is_empty())
+    // get_or_insert() inlined so that the 160-byte Account argument is built only on a miss.
+    auto* acc = find(addr);
+    if (acc == nullptr)
+        acc = &insert(addr, {.erase_if_empty = true});
+    if (!acc->erase_if_empty && acc->is_empty())
     {
-        journal_account_flags(addr, acc);
-        acc.erase_if_empty = true;
+        journal_account_flags(addr, *acc);
+        acc->erase_if_empty = true;
     }
-    return acc;
+    return *acc;
 }
 
 StorageValue& State::get_storage(const address& addr, const bytes32& key)
@@ -918,7 +923,8 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     const TransactionProperties& tx_props)
 {
     State state{state_view};
-    auto& sender_acc = state.get_or_insert(tx.sender);
+    auto* const sender_found = state.find(tx.sender);
+    auto& sender_acc = sender_found != nullptr ? *sender_found : state.insert(tx.sender);
     assert(sender_acc.nonce < MAX_NONCE);  // Required for valid tx.
     ++sender_acc.nonce;                    // Bump sender nonce.
 
