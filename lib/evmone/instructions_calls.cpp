@@ -183,6 +183,10 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         msg.flags |= EVMC_DELEGATED;
     else
         msg.flags &= ~std::underlying_type_t<evmc_flags>{EVMC_DELEGATED};
+#ifdef EVMONE_WORD_LAYOUT
+    // Set here, after the flags are known: STATICCALL replaced them and the others inherit them.
+    msg.flags |= wl::FLAG_WORD_INPUT | wl::FLAG_WORD_OUTPUT;
+#endif
     msg.depth = state.msg->depth + 1;
     msg.state_gas = state.state_gas.left;
     msg.recipient = (Op == OP_CALL || Op == OP_STATICCALL) ? dst : state.msg->recipient;
@@ -237,7 +241,13 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     stack.top() = result.status_code == EVMC_SUCCESS;
 
     if (const auto copy_size = std::min(output_size, result.output_size); copy_size > 0)
+    {
+#ifdef EVMONE_WORD_LAYOUT
+        wl::copy_w2w(&state.memory[output_offset], result.output_data, copy_size);
+#else
         std::memcpy(&state.memory[output_offset], result.output_data, copy_size);
+#endif
+    }
 
     const auto gas_used = msg.gas - result.gas_left;
     gas_left -= gas_used;
@@ -308,8 +318,21 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     if (sender_nonce == MAX_NONCE)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
+#ifdef EVMONE_WORD_LAYOUT
+    // The init code is code: byte order, and it must outlive the call that runs it, in which the
+    // frames below this one use their own buffers.
+    const uint8_t* init_code_data = nullptr;
+    if (init_code_size > 0)
+    {
+        auto* const buffer = state.init_code.get(init_code_size);
+        wl::copy_w2b(buffer, &state.memory[init_code_offset], init_code_size);
+        init_code_data = buffer;
+    }
+    const auto init_code = bytes_view{init_code_data, init_code_size};
+#else
     const auto init_code =
         bytes_view{init_code_size > 0 ? &state.memory[init_code_offset] : nullptr, init_code_size};
+#endif
 
     evmc_message msg{.kind = to_call_kind(Op)};
     msg.recipient = (Op == OP_CREATE) ? compute_create_address(sender, sender_nonce) :
@@ -337,6 +360,9 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     msg.sender = sender;
     msg.depth = state.msg->depth + 1;
     msg.value = intx::be::store<evmc::uint256be>(endowment);
+#ifdef EVMONE_WORD_LAYOUT
+    msg.flags = wl::FLAG_WORD_OUTPUT;  // The REVERT data is read as return data.
+#endif
 
     const auto result = state.host.call(msg);
     gas_left -= msg.gas - result.gas_left;

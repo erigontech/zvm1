@@ -9,6 +9,7 @@
 #include "execution_state.hpp"
 #include "instructions_traits.hpp"
 #include "instructions_xmacro.hpp"
+#include "word_layout.hpp"
 #include <evmone_precompiles/keccak.hpp>
 #include <bit>
 
@@ -903,6 +904,15 @@ inline void clz(StackTop stack) noexcept
     stack.top() = clz(stack.top());
 }
 
+#ifdef EVMONE_WORD_LAYOUT
+/// The hash of the n bytes at the W pointer p, which the hash reads as bytes. Out of line, to keep
+/// the conversion out of the interpreter loop.
+[[gnu::noinline]] inline ethash::hash256 keccak256_w(const uint8_t* p, size_t n) noexcept
+{
+    return ethash::keccak256(wl::scratch_copy(p, n), n);
+}
+#endif
+
 inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     const auto& index = stack.pop();
@@ -933,8 +943,12 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
         }
     }
 #endif
+#ifdef EVMONE_WORD_LAYOUT
+    size = intx::be::load<uint256>(keccak256_w(s != 0 ? &state.memory[i] : nullptr, s));
+#else
     auto data = s != 0 ? &state.memory[i] : nullptr;
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -995,6 +1009,17 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         const auto end = std::min(begin + 32, state.msg->input_size);
         const auto len = end - begin;
 
+#ifdef EVMONE_WORD_LAYOUT
+        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+        {
+            // The calldata of a call is the caller's memory.
+            if (len == 32) [[likely]]
+                wl::load_u256(index, state.msg->input_data + begin);
+            else
+                wl::load_u256_partial(index, state.msg->input_data + begin, len);
+        }
+        else
+#endif
         if (len == 32) [[likely]]
         {
             // Fast path: full 32-byte load, skip temporary buffer.
@@ -1036,11 +1061,24 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
     if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    if (copy_size > 0)
+    {
+        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0)
+            wl::copy_w2w(&state.memory[dst], &state.msg->input_data[src], copy_size);
+        else
+            wl::copy_b2w(&state.memory[dst], &state.msg->input_data[src], copy_size);
+    }
+
+    if (s - copy_size > 0)
+        wl::zero(&state.memory[dst + copy_size], s - copy_size);
+#else
     if (copy_size > 0)
         std::memcpy(&state.memory[dst], &state.msg->input_data[src], copy_size);
 
     if (s - copy_size > 0)
         std::memset(&state.memory[dst + copy_size], 0, s - copy_size);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1071,11 +1109,19 @@ inline Result codecopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
         return {EVMC_OUT_OF_GAS, gas_left};
 
     // TODO: Add unit tests for each combination of conditions.
+#ifdef EVMONE_WORD_LAYOUT
+    if (copy_size > 0)
+        wl::copy_b2w(&state.memory[dst], &state.original_code[src], copy_size);
+
+    if (s - copy_size > 0)
+        wl::zero(&state.memory[dst + copy_size], s - copy_size);
+#else
     if (copy_size > 0)
         std::memcpy(&state.memory[dst], &state.original_code[src], copy_size);
 
     if (s - copy_size > 0)
         std::memset(&state.memory[dst + copy_size], 0, s - copy_size);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1151,9 +1197,18 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
         const auto src =
             (max_buffer_size < input_index) ? max_buffer_size : static_cast<size_t>(input_index);
         const auto dst = static_cast<size_t>(mem_index);
+#ifdef EVMONE_WORD_LAYOUT
+        // The host writes bytes: into a buffer, and then into the memory.
+        auto* const buffer = wl::scratch(s);
+        const auto num_bytes_copied = state.host.copy_code(addr, src, buffer, s);
+        wl::copy_b2w(&state.memory[dst], buffer, num_bytes_copied);
+        if (const auto num_bytes_to_clear = s - num_bytes_copied; num_bytes_to_clear > 0)
+            wl::zero(&state.memory[dst + num_bytes_copied], num_bytes_to_clear);
+#else
         const auto num_bytes_copied = state.host.copy_code(addr, src, &state.memory[dst], s);
         if (const auto num_bytes_to_clear = s - num_bytes_copied; num_bytes_to_clear > 0)
             std::memset(&state.memory[dst + num_bytes_copied], 0, num_bytes_to_clear);
+#endif
     }
     else if (state.rev >= EVMC_AMSTERDAM)
     {
@@ -1193,8 +1248,13 @@ inline Result returndatacopy(StackTop stack, int64_t gas_left, ExecutionState& s
     if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    if (s > 0)
+        wl::copy_w2w(&state.memory[dst], state.return_data.data() + src, s);
+#else
     if (s > 0)
         std::memcpy(&state.memory[dst], &state.return_data[src], s);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1272,7 +1332,9 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#ifdef EVMONE_WORD_LAYOUT
+    wl::load_u256(index, &state.memory[static_cast<size_t>(index)]);
+#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // Reverse the bytes straight into the stack slot.
     intx::be::unsafe::load_into(index, &state.memory[static_cast<size_t>(index)]);
 #else
@@ -1289,7 +1351,11 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    wl::store_u256(&state.memory[static_cast<size_t>(index)], value);
+#else
     intx::be::unsafe::store(&state.memory[static_cast<size_t>(index)], value);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -1301,7 +1367,12 @@ inline Result mstore8(StackTop stack, int64_t gas_left, ExecutionState& state) n
     if (!check_memory(gas_left, state.memory, index, 1))
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    // The byte of the address; the word holding it lies inside the memory (a multiple of 32).
+    state.memory[static_cast<size_t>(index) ^ 3] = static_cast<uint8_t>(value);
+#else
     state.memory[static_cast<size_t>(index)] = static_cast<uint8_t>(value);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -1677,8 +1748,13 @@ inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (const auto cost = copy_cost(size); (gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    if (size > 0)
+        wl::move_w2w(&state.memory[dst], &state.memory[src], size);
+#else
     if (size > 0)
         std::memmove(&state.memory[dst], &state.memory[src], size);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1711,6 +1787,7 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
             topic = intx::be::store<evmc::bytes32>(stack.pop());
     }
 
+    // With the word layout the data is a W pointer; the state Host converts it.
     const auto data = s != 0 ? &state.memory[o] : nullptr;
     state.host.emit_log(state.msg->recipient, data, s, topics.data(), NumTopics);
     return {EVMC_SUCCESS, gas_left};

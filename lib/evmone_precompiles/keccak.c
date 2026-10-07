@@ -1077,11 +1077,21 @@ static NO_INLINE void keccak64_memo_fill(
     // byte, zeros, and the last block bit, which lane 16 holds alone.
     ethash_w32* const state = (ethash_w32*)buf;
     size_t i;
+    // The input is memory in the word layout: each word holds the big-endian number of its 4
+    // bytes, where the state takes them as the little-endian number. The key stays as it is, the
+    // hit path compares and indexes the words as they come. Byte copies take two instructions a
+    // byte; the barrier keeps GCC from merging them into shifts to swap, which take more.
     for (i = 0; i < 16; ++i)
     {
         const uint32_t w = data[i];
         slot->key[i] = w;
-        state[i] = w;
+        const uint8_t* b = (const uint8_t*)&data[i];
+        __asm__("" : "+r"(b));
+        uint8_t* const sb = (uint8_t*)&state[i];
+        sb[0] = b[3];
+        sb[1] = b[2];
+        sb[2] = b[1];
+        sb[3] = b[0];
     }
     state[16] = 0x01;
     // The offset is fixed here, so plain stores do without buf_zero_state_from()'s computed jump.

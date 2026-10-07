@@ -956,7 +956,9 @@ template <Opcode Op>
         }
         if constexpr (Op == OP_MLOAD)
         {
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#ifdef EVMONE_WORD_LAYOUT
+            wl::load_u256(*pos.stack_end, &memory[imm]);  // Into the push's slot.
+#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
             intx::be::unsafe::load_into(*pos.stack_end, &memory[imm]);  // Into the push's slot.
 #else
             *pos.stack_end = intx::be::unsafe::load<uint256>(&memory[imm]);
@@ -965,7 +967,11 @@ template <Opcode Op>
         }
         else
         {
+#ifdef EVMONE_WORD_LAYOUT
+            wl::store_u256(&memory[imm], pos.stack_end[-1]);
+#else
             intx::be::unsafe::store(&memory[imm], pos.stack_end[-1]);
+#endif
             pos.stack_end -= 1;
         }
         pos.code_it += 1;

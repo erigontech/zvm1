@@ -36,7 +36,9 @@ union ethash_hash256 ethash_keccak256_resume(
 /// A 32-bit word of a byte buffer or of a uint256 (stored as 64-bit words): may alias them.
 typedef uint32_t __attribute__((may_alias)) ethash_w32;
 
-/// Keccak-256 of the 64 bytes at @p data, which must be 4-byte aligned, memoized: stores the hash
+/// Keccak-256 of the 64 bytes at @p data, which must be 4-byte aligned, memoized. The bytes are EVM
+/// memory in the word layout (see evmone/word_layout.hpp): each word holds the big-endian number of
+/// its 4 bytes. Stores the hash
 /// to @p out as the big-endian number, in little-endian words (the uint256 KECCAK256 pushes).
 void ethash_keccak256_64_be(ethash_w32 out[8], const ethash_w32* data) noexcept;
 

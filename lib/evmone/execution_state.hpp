@@ -4,9 +4,11 @@
 #pragma once
 
 #include "state_gas.hpp"
+#include "word_layout.hpp"
 #include <evmc/evmc.hpp>
 #include <intx/intx.hpp>
 #include <cassert>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <string>
@@ -55,6 +57,9 @@ public:
 
 /// The EVM memory.
 ///
+/// With EVMONE_WORD_LAYOUT the byte of EVM address a is at index a ^ 3 and the pointers into it
+/// are W pointers, see word_layout.hpp. The allocation is 8-byte aligned, which the layout needs.
+///
 /// The implementations uses initial allocation of 4k and then grows capacity with 2x factor.
 /// Some benchmarks have been done to confirm 4k is ok-ish value.
 class Memory
@@ -83,6 +88,9 @@ class Memory
         m_data.reset(static_cast<uint8_t*>(std::realloc(m_data.release(), m_capacity)));
         if (!m_data) [[unlikely]]
             handle_out_of_memory();
+#ifdef EVMONE_WORD_LAYOUT
+        assert(wl::is_aligned4(m_data.get()));
+#endif
     }
 
 public:
@@ -156,7 +164,13 @@ public:
     /// otherwise): SLOAD and SSTORE call its fused virtuals directly instead of several C callbacks.
     evmc::Host* cpp_host = nullptr;
     evmc_revision rev = {};
+#ifdef EVMONE_WORD_LAYOUT
+    wl::ReturnData return_data;
+    /// The init code of the frame's CREATE in byte order, for as long as the call that runs it.
+    wl::Buffer init_code;
+#else
     bytes return_data;
+#endif
 
     /// Reference to original EVM code.
     bytes_view original_code;
@@ -260,6 +274,39 @@ inline evmc_result make_execution_result(ExecutionState& state, int64_t gas_left
     const auto gas_refund = (state.status == EVMC_SUCCESS) ? state.gas_refund : 0;
 
     assert(state.output_size != 0 || state.output_offset == 0);
+#ifdef EVMONE_WORD_LAYOUT
+    if (state.output_size != 0)
+    {
+        // The output leaves the frame in the layout its consumer reads: the W data of phase 0 for
+        // the EVM frame that made the call, byte order for the host (a transaction, a system call
+        // and the code a successful creation deploys). The storage of W data is whole words.
+        const auto* const src = &state.memory[state.output_offset];
+        const auto size = state.output_size;
+        const bool deployed = state.status == EVMC_SUCCESS &&
+                              (state.msg->kind == EVMC_CREATE || state.msg->kind == EVMC_CREATE2);
+        const bool word_output = (state.msg->flags & wl::FLAG_WORD_OUTPUT) != 0 && !deployed;
+        const auto storage = word_output ? wl::round_up4(size) : size;
+        auto* const buffer = static_cast<uint8_t*>(std::malloc(storage));
+        if (buffer == nullptr) [[unlikely]]
+            std::terminate();
+        if (word_output)
+        {
+            reinterpret_cast<wl::word_t*>(buffer)[storage / 4 - 1] = 0;
+            wl::copy_w2w(buffer, src, size);
+        }
+        else
+            wl::copy_w2b(buffer, src, size);
+        evmc_result result{};
+        result.status_code = state.status;
+        result.gas_left = gas_left;
+        result.gas_refund = gas_refund;
+        result.output_data = buffer;
+        result.output_size = size;
+        result.release = evmc_free_result_memory;
+        result.state_gas = state.state_gas;
+        return result;
+    }
+#endif
     return evmc::Result{state.status, gas_left, gas_refund,
         state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size,
         state.state_gas}

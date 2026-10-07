@@ -9,6 +9,7 @@
 #include <evmone/constants.hpp>
 #include <evmone/state_gas.hpp>
 #include <evmone/vm.hpp>
+#include <evmone/word_layout.hpp>
 
 namespace evmone::state
 {
@@ -574,7 +575,12 @@ bytes32 Host::get_block_hash(int64_t block_number) const noexcept
 void Host::emit_log(const address& addr, const uint8_t* data, size_t data_size,
     const bytes32 topics[], size_t topics_count) noexcept
 {
+#ifdef EVMONE_WORD_LAYOUT
+    // The data is a W pointer into the memory of the frame: one converting copy into the log.
+    m_logs.push_back({addr, wl::to_bytes(data, data_size), {topics, topics + topics_count}});
+#else
     m_logs.push_back({addr, {data, data_size}, {topics, topics + topics_count}});
+#endif
 }
 
 evmc_access_status Host::access_account(const address& addr) noexcept
