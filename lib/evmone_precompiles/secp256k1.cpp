@@ -891,6 +891,10 @@ constexpr AffinePoint PHI_G_ODD[size_t{1} << (G_WNAF_W - 2)] = {
 /// Digits of a width-W NAF of a scalar below 2^128: the carry may add one more.
 constexpr unsigned WNAF_LEN = 129;
 
+/// A 32-bit word of a uint256 (stored as 64-bit words): may alias them, where plain uint32_t
+/// loads need not see the stores of the uint64_t words.
+typedef uint32_t __attribute__((may_alias)) word32;
+
 /// Writes the width-W NAF of the scalar below 2^128 with 32-bit words w[0..3]: naf[i] is the
 /// digit of 2^i, 0 or odd with |naf[i]| < 2^(W-1), and at least W-1 zeros follow each non-zero
 /// one, so a 128-bit scalar has 128/(W+1) non-zero digits on average where its plain NAF has

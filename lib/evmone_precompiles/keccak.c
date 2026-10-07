@@ -261,10 +261,6 @@ static inline ALWAYS_INLINE uint64_t load_le_any(const uint8_t* data)
     __builtin_memcpy(&word, data, sizeof(word));
     return to_le64(word);
 }
-#endif
-
-#if defined(AIRBENDER)
-typedef uint32_t __attribute__((may_alias)) keccak_word32;
 
 /// The word holding the last 0-3 input bytes and the padding byte after them.
 static inline ALWAYS_INLINE uint32_t tail_word(const uint8_t* t, size_t r)

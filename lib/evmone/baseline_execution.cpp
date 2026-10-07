@@ -838,7 +838,7 @@ constexpr bool push1_fuses(Opcode op) noexcept
 /// word down, so every source word is read before it is overwritten. (v >> 1) >> rs is
 /// v >> (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
 template <unsigned WS, unsigned I>
-[[gnu::always_inline]] inline void shl_word(uint32_t* x, unsigned bs, unsigned rs) noexcept
+[[gnu::always_inline]] inline void shl_word(word32* x, unsigned bs, unsigned rs) noexcept
 {
     if constexpr (I < WS)
         x[I] = 0;
@@ -849,7 +849,7 @@ template <unsigned WS, unsigned I>
 }
 
 template <unsigned WS>
-[[gnu::always_inline]] inline void shl_words(uint32_t* x, unsigned bs) noexcept
+[[gnu::always_inline]] inline void shl_words(word32* x, unsigned bs) noexcept
 {
     const unsigned rs = 31 - bs;
     shl_word<WS, 7>(x, bs, rs);
@@ -864,7 +864,7 @@ template <unsigned WS>
 
 /// Word I of x >>= 32 * WS + bs, in place, written from the least significant word up.
 template <unsigned WS, unsigned I>
-[[gnu::always_inline]] inline void shr_word(uint32_t* x, unsigned bs, unsigned rs) noexcept
+[[gnu::always_inline]] inline void shr_word(word32* x, unsigned bs, unsigned rs) noexcept
 {
     if constexpr (I + WS > 7)
         x[I] = 0;
@@ -875,7 +875,7 @@ template <unsigned WS, unsigned I>
 }
 
 template <unsigned WS>
-[[gnu::always_inline]] inline void shr_words(uint32_t* x, unsigned bs) noexcept
+[[gnu::always_inline]] inline void shr_words(word32* x, unsigned bs) noexcept
 {
     const unsigned rs = 31 - bs;
     shr_word<WS, 0>(x, bs, rs);

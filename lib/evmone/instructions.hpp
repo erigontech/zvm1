@@ -360,10 +360,6 @@ inline void sub(StackTop stack) noexcept
 }
 
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
-/// A 32-bit word of a uint256 (stored as 64-bit words): may alias them. Named, since `auto` would
-/// deduce plain uint32_t and GCC is then free to drop the stores as dead stores to 64-bit words.
-typedef uint32_t __attribute__((may_alias)) word32;
-
 /// Leading zeros of a non-zero word. The call-free one on rv32, where libgcc's __clzsi2 is a call.
 [[gnu::always_inline]] inline unsigned clz_nonzero(uint32_t x) noexcept
 {

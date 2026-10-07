@@ -129,8 +129,8 @@ public:
         // Every size is a multiple of 32 and m_data comes from the 8-aligned allocator, so the new
         // extent is whole, word-aligned 32-byte words: store them inline, rather than calling
         // memset for the usual 1 to 3 of them.
-        auto* w = reinterpret_cast<uint32_t*>(&m_data[m_size]);
-        auto* const end = reinterpret_cast<uint32_t*>(&m_data[new_size]);
+        wl::word_t* w = reinterpret_cast<wl::word_t*>(&m_data[m_size]);
+        wl::word_t* const end = reinterpret_cast<wl::word_t*>(&m_data[new_size]);
         // Not unrolled further: the growth is one 32-byte word 72% of the time, and GCC's 8-way
         // unrolling of this loop spent 8 instructions per call picking the remainder's entry.
 #pragma GCC unroll 1
