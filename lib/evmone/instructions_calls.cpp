@@ -236,8 +236,12 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
-    const auto result = state.host.call(msg);
+    auto result = state.host.call(msg);
+#ifdef EVMONE_WORD_LAYOUT
+    state.return_data.take(result);
+#else
     state.return_data.assign(result.output_data, result.output_size);
+#endif
     stack.top() = result.status_code == EVMC_SUCCESS;
 
     if (const auto copy_size = std::min(output_size, result.output_size); copy_size > 0)
@@ -364,14 +368,18 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     msg.flags = wl::FLAG_WORD_OUTPUT;  // The REVERT data is read as return data.
 #endif
 
-    const auto result = state.host.call(msg);
+    auto result = state.host.call(msg);
     gas_left -= msg.gas - result.gas_left;
     state.gas_refund += result.gas_refund;
     absorb_child_state_gas(gas_left, state, result);
     if (new_account_charged && result.status_code != EVMC_SUCCESS)
         state.state_gas.refill(gas_left, NEW_ACCOUNT_STATE_GAS);
 
+#ifdef EVMONE_WORD_LAYOUT
+    state.return_data.take(result);
+#else
     state.return_data.assign(result.output_data, result.output_size);
+#endif
     if (result.status_code == EVMC_SUCCESS)
         stack.top() = intx::be::load<uint256>(msg.recipient);
 

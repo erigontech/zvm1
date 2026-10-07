@@ -1198,10 +1198,12 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
             (max_buffer_size < input_index) ? max_buffer_size : static_cast<size_t>(input_index);
         const auto dst = static_cast<size_t>(mem_index);
 #ifdef EVMONE_WORD_LAYOUT
-        // The host writes bytes: into a buffer, and then into the memory.
-        auto* const buffer = wl::scratch(s);
-        const auto num_bytes_copied = state.host.copy_code(addr, src, buffer, s);
-        wl::copy_b2w(&state.memory[dst], buffer, num_bytes_copied);
+        // The host writes bytes in byte order, into the memory itself, which then turns them into
+        // the layout: a buffer would be as large as the size asked for, not the code there is.
+        const auto num_bytes_copied = wl::write_b2w(&state.memory[dst], s,
+            [&state, &addr, src, s](uint8_t* p) noexcept {
+                return state.host.copy_code(addr, src, p, s);
+            });
         if (const auto num_bytes_to_clear = s - num_bytes_copied; num_bytes_to_clear > 0)
             wl::zero(&state.memory[dst + num_bytes_copied], num_bytes_to_clear);
 #else

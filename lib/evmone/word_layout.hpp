@@ -49,11 +49,12 @@ using word_t = uint32_t __attribute__((may_alias));
 [[nodiscard]] inline constexpr size_t round_up4(size_t n) noexcept { return (n + 3) & ~size_t{3}; }
 
 #ifdef EVMONE_RV32_DISPATCH_TEST
-/// What the conversions cost, counted in the native test build only: its tests bound it by the
-/// gas a program pays.
+/// What the conversions and buffers below cost, counted in the native test build only: its tests
+/// bound both by the gas a program pays.
 struct Usage
 {
     uint64_t converted = 0;  ///< Bytes copied from W data into byte order.
+    uint64_t allocated = 0;  ///< Bytes allocated for the storage of Buffer and scratch().
 };
 inline Usage usage;
 #endif
@@ -322,6 +323,57 @@ inline void swap_words(uint8_t* p, size_t words) noexcept
     }
 }
 
+/// Lets @p write, which stores at most @p n > 0 bytes in byte order at the pointer it is given and
+/// returns how many it stored, store them at the W pointer d without a buffer. It stores byte i at
+/// d + i, in the word of logical byte i but at its mirror position: the whole words written are
+/// reversed afterwards, and the words at the ends are rebuilt from the bytes written and from what
+/// they held before, as the write may cover bytes of theirs outside [d, d + n). Returns the number
+/// of bytes stored; the bytes of [d, d + n) after them are left to the caller.
+template <typename Write>
+inline size_t write_b2w(uint8_t* d, size_t n, Write write) noexcept
+{
+    const auto word_of = [](uint8_t* p) noexcept {
+        return p - (reinterpret_cast<uintptr_t>(p) & 3);
+    };
+    uint8_t first_before[4];
+    uint8_t last_before[4];
+    std::memcpy(first_before, word_of(d), 4);
+    std::memcpy(last_before, word_of(d + n - 1), 4);
+
+    const size_t written = write(d);
+    if (written == 0)
+        return 0;
+    const uint8_t* const end = d + written;
+    const auto rebuild = [&](uint8_t* w) noexcept {
+        uint8_t stored[4];
+        std::memcpy(stored, w, 4);
+        for (size_t j = 0; j < 4; ++j)
+        {
+            const uint8_t* const logical = w + (3 - j);  // The logical address of byte j.
+            if (logical < d)
+                w[j] = first_before[j];
+            else if (logical < end)
+                w[j] = stored[3 - j];
+            else if (logical >= d + n)
+                w[j] = last_before[j];
+            else
+                w[j] = 0;
+        }
+    };
+    uint8_t* middle = d;
+    if (!is_aligned4(d))
+    {
+        middle = word_of(d) + 4;
+        rebuild(word_of(d));
+    }
+    uint8_t* const middle_end = word_of(d + written);
+    if (middle < middle_end)
+        swap_words(middle, static_cast<size_t>(middle_end - middle) / 4);
+    if (!is_aligned4(end) && middle_end >= middle)
+        rebuild(middle_end);
+    return written;
+}
+
 /// The n bytes at the W pointer p as a byte string, written once: a string constructed to a size
 /// first zeroes it.
 [[nodiscard]] inline evmc::bytes to_bytes(const uint8_t* p, size_t n)
@@ -339,6 +391,23 @@ inline void swap_words(uint8_t* p, size_t words) noexcept
     return b;
 }
 
+/// The capacity of a buffer that holds @p capacity bytes and must hold @p n: at least twice the
+/// old one. The guest never frees memory, and a buffer that grew to each larger request exactly
+/// would allocate the sum of a growing run of them; this way all its storage together stays below
+/// 4 times the largest request.
+[[nodiscard]] inline constexpr size_t grown_capacity(size_t n, size_t capacity) noexcept
+{
+    return std::max(n, 2 * capacity);
+}
+
+/// Accounts for @p n bytes of storage allocated for a buffer.
+inline void count_allocated([[maybe_unused]] size_t n) noexcept
+{
+#ifdef EVMONE_RV32_DISPATCH_TEST
+    usage.allocated += n;
+#endif
+}
+
 /// A byte buffer that only grows. The guest never frees memory, so a buffer that is made again for
 /// every use of the same kind (the input of a precompile or the data of a hash over 50000 bytes,
 /// 50000 times in a block) would exhaust it: these keep and reuse their storage.
@@ -353,18 +422,17 @@ public:
     {
         if (n > m_capacity)
         {
-            m_data.reset(new uint8_t[n]);
-            m_capacity = n;
+            m_capacity = grown_capacity(n, m_capacity);
+            m_data.reset(new uint8_t[m_capacity]);
+            count_allocated(m_capacity);
         }
         return m_data.get();
     }
-
-    [[nodiscard]] const uint8_t* data() const noexcept { return m_data.get(); }
 };
 
-/// A buffer of @p n bytes that the hash, the precompiles and the code copy share: they use it only
-/// within one call that does not run the EVM, so no use is open when the next starts. A larger
-/// request keeps the contents of a smaller one in the same call. It starts
+/// A buffer of @p n bytes that the hash and the precompiles share: they use it only within one
+/// call that does not run the EVM, so no use is open when the next starts. A larger request keeps
+/// the contents of a smaller one in the same call. It starts
 /// @p Offset bytes after an 8-byte boundary. The hash wants the boundary (it reads 64-bit lanes);
 /// the precompiles take an offset of 4, which is no multiple of 32: the copies they make from
 /// their input then take the word path, not the BigInt MEMCOPY that a source aligned to 32 bytes
@@ -385,11 +453,13 @@ template <size_t Offset = 0>
     if (n + Offset > capacity)
     {
         // The contents are kept: MODEXP's input grows once its first bytes are in.
-        auto* const grown = new uint8_t[n + Offset];
+        const auto grown_size = grown_capacity(n + Offset, capacity);
+        auto* const grown = new uint8_t[grown_size];
         std::copy_n(storage, capacity, grown);
         delete[] storage;
         storage = grown;
-        capacity = n + Offset;
+        capacity = grown_size;
+        count_allocated(capacity);
     }
     return storage + Offset;
 }
@@ -405,24 +475,48 @@ template <size_t Offset = 0>
 
 /// The return data of a frame: the output of the last call, W data of phase 0 whose storage is
 /// rounded up to whole words, with the size in bytes kept apart. A byte string would drop the
-/// partial last word and put its terminator on a byte of the data.
+/// partial last word and put its terminator on a byte of the data. The output stays where the
+/// call's result put it: a copy would cost an allocation for each larger output on the guest.
 class ReturnData
 {
-    Buffer m_buffer;
+    /// The output and the function that releases it; the rest of its result is not kept.
+    evmc_result m_owner{};
     size_t m_size = 0;
 
+    void release() noexcept
+    {
+        if (m_owner.release != nullptr)
+            m_owner.release(&m_owner);
+    }
+
 public:
+    ReturnData() noexcept = default;
+    ReturnData(ReturnData&& other) noexcept : m_owner{other.m_owner}, m_size{other.m_size}
+    {
+        other.m_owner.release = nullptr;
+    }
+    ReturnData& operator=(ReturnData&&) = delete;
+    ~ReturnData() { release(); }
+
     [[nodiscard]] size_t size() const noexcept { return m_size; }
     [[nodiscard]] bool empty() const noexcept { return m_size == 0; }
-    [[nodiscard]] const uint8_t* data() const noexcept { return m_buffer.data(); }
+    [[nodiscard]] const uint8_t* data() const noexcept { return m_owner.output_data; }
     void clear() noexcept { m_size = 0; }
 
-    /// Takes the W data of phase 0 and @p size bytes at @p src, whose storage is rounded up.
-    void assign(const uint8_t* src, size_t size) noexcept
+    /// Takes over the output of @p result, the W data of phase 0 in storage rounded up to whole
+    /// words (see make_execution_result()). The result keeps its fields, but no longer releases
+    /// the output.
+    void take(evmc::Result& result) noexcept
     {
-        if (size != 0)
-            std::memcpy(m_buffer.get(round_up4(size)), src, round_up4(size));
-        m_size = size;
+        m_size = result.output_size;
+        if (m_size == 0)
+            return;
+        release();
+        auto& raw = result.raw();
+        m_owner.output_data = raw.output_data;
+        m_owner.output_size = raw.output_size;
+        m_owner.release = raw.release;
+        raw.release = nullptr;
     }
 };
 }  // namespace evmone::wl
