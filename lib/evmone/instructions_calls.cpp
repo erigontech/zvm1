@@ -391,3 +391,13 @@ template Result create_impl<OP_CREATE>(
 template Result create_impl<OP_CREATE2>(
     StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 }  // namespace evmone::instr::core
+
+#ifdef EVMONE_WORD_LAYOUT
+namespace evmone::wl
+{
+void free_output(const evmc_result* result) noexcept
+{
+    std::free(const_cast<uint8_t*>(result->output_data));
+}
+}  // namespace evmone::wl
+#endif

@@ -706,6 +706,46 @@ TEST_P(evm, returndatacopy)
     EXPECT_EQ(bytes_view(result.output_data, result.output_size), call_output);
 }
 
+#ifdef EVMONE_WORD_LAYOUT
+TEST_P(evm, returndatacopy_word_layout_partial_words)
+{
+    // The return data is in the layout, where the bytes of a partial last word sit at its end:
+    // every size, source offset and destination alignment, each byte where it belongs. Under ASan
+    // this also shows that no read leaves the output's storage.
+    static constexpr uint8_t call_output[]{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9};
+    host.call_result.output_data = call_output;
+    for (size_t size = 1; size <= std::size(call_output); ++size)
+    {
+        host.call_result.output_size = size;
+        for (size_t src = 0; src <= size; ++src)
+        {
+            for (size_t dst = 0; dst < 4; ++dst)
+            {
+                execute(delegatecall(0) + returndatacopy(dst, src, size - src) + ret(dst, size - src));
+                ASSERT_EQ(result.status_code, EVMC_SUCCESS);
+                EXPECT_EQ(hex(output), hex({call_output + src, size - src}));
+            }
+        }
+    }
+}
+
+#ifdef EVMONE_RV32_DISPATCH_TEST
+TEST_P(evm, word_layout_output_storage_is_checked)
+{
+    // An output in the layout takes whole words of storage, which a host that does not keep to the
+    // contract does not give: the test build stops at the call instead of reading past the output.
+    evmc::MockedHost plain_host;
+    static constexpr uint8_t call_output[]{1, 2, 3};
+    plain_host.call_result.output_data = call_output;
+    plain_host.call_result.output_size = std::size(call_output);
+    const auto code = delegatecall(0) + returndatacopy(0, 0, 3) + ret(0, 3);
+    msg.gas = 1000000;
+    EXPECT_DEATH(
+        (void)vm.execute(plain_host, rev, msg, code.data(), code.size()), "wl::alloc_output");
+}
+#endif
+#endif
+
 TEST_P(evm, returndatacopy_empty)
 {
     execute(delegatecall(0) + returndatacopy(0, 0, 0) + ret(0, 32));

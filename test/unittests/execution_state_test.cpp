@@ -80,7 +80,21 @@ TEST(execution_state, reset_advanced)
     st.memory.grow(64);
     st.msg = &msg;
     st.rev = EVMC_BYZANTIUM;
+#ifdef EVMONE_WORD_LAYOUT
+    {
+        // The return data takes over the output of a call: one byte, '0', in the layout.
+        auto* const data = evmone::wl::alloc_output(1);
+        data[3] = '0';  // Logical byte 0 of the word.
+        evmc_result output{};
+        output.output_data = data;
+        output.output_size = 1;
+        output.release = evmone::wl::free_output;
+        evmc::Result result{output};
+        st.return_data.take(result);
+    }
+#else
     st.return_data.push_back('0');
+#endif
     st.status = EVMC_FAILURE;
     st.output_offset = 3;
     st.output_size = 4;
