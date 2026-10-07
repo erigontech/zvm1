@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <evmc/hex.hpp>
+#include <evmone/word_layout.hpp>
 #include <gtest/gtest.h>
 #include <intx/intx.hpp>
+#include <test/state/precompiles.hpp>
 #include <test/state/precompiles_internal.hpp>
 #include <test/utils/utils.hpp>
 #ifdef EVMONE_PRECOMPILES_GMP
@@ -551,4 +553,46 @@ TEST(expmod, huge_inputs_analysis)
         EXPECT_LT(gas_cost, GAS_LIMIT);
         EXPECT_EQ(max_output_size, expected_output_size);
     }
+}
+
+TEST(expmod, lengths_summing_past_32_bits)
+{
+    // base_len 1 and exp_len 2^32 - 1 add up to 2^32, so the modulus (mod_len 1) lies past the
+    // input, whose last byte is the base: the result is one zero byte. Added in 32 bits, they put
+    // the modulus at the base and the exponent 4 GiB past the input. The lengths cost
+    // 1,717,986,905 gas at Byzantium, and more than the call's 1.8e9 from Berlin on.
+    using namespace evmc::literals;
+    const auto input = evmc::from_spaced_hex(
+        "0000000000000000000000000000000000000000000000000000000000000001 "
+        "00000000000000000000000000000000000000000000000000000000ffffffff "
+        "0000000000000000000000000000000000000000000000000000000000000001 07")
+                           .value();
+    EXPECT_EQ(evmone::state::expmod_analyze(input, EVMC_BYZANTIUM).gas_cost, 1'717'986'905);
+
+    evmc_message msg{};
+    msg.gas = 1'800'000'000;
+    msg.code_address = 0x05_address;
+    msg.input_data = input.data();
+    msg.input_size = input.size();
+    const auto result = evmone::state::call_precompile(EVMC_BYZANTIUM, msg);
+    EXPECT_EQ(result.status_code, EVMC_SUCCESS);
+    EXPECT_EQ(result.gas_left, msg.gas - 1'717'986'905);
+    EXPECT_EQ(evmc::hex({result.output_data, result.output_size}), "00");
+
+    EXPECT_EQ(evmone::state::call_precompile(EVMC_BERLIN, msg).status_code, EVMC_OUT_OF_GAS);
+
+#ifdef EVMONE_WORD_LAYOUT
+    // The same input from an EVM frame, in the layout: the bytes converted for the precompile are
+    // sized by the same lengths.
+    std::vector<uint32_t> words(evmone::wl::round_up4(input.size()) / 4);
+    auto* const word_input = reinterpret_cast<uint8_t*>(words.data());
+    evmone::wl::copy_b2w(word_input, input.data(), input.size());
+    msg.input_data = word_input;
+    msg.flags = evmone::wl::FLAG_WORD_INPUT | evmone::wl::FLAG_WORD_OUTPUT;
+    const auto word_result = evmone::state::call_precompile(EVMC_BYZANTIUM, msg);
+    EXPECT_EQ(word_result.status_code, EVMC_SUCCESS);
+    EXPECT_EQ(word_result.gas_left, msg.gas - 1'717'986'905);
+    EXPECT_EQ(
+        evmc::hex(evmone::wl::to_bytes(word_result.output_data, word_result.output_size)), "00");
+#endif
 }
