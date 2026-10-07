@@ -137,8 +137,8 @@ inline void store_phase(uint8_t* p, const uint8_t* x) noexcept
             : [d] "r"(&x), [s] "r"(p), "m"(*reinterpret_cast<const Bytes*>(p)));
 #undef EVMONE_WL
 #else
-        auto* const d = reinterpret_cast<word_t*>(&x);
-        const auto* const s = reinterpret_cast<const word_t*>(p);
+        word_t* const d = reinterpret_cast<word_t*>(&x);
+        const word_t* const s = reinterpret_cast<const word_t*>(p);
         for (unsigned k = 0; k < 8; ++k)
             d[7 - k] = s[k];
 #endif
@@ -162,8 +162,8 @@ inline void store_phase(uint8_t* p, const uint8_t* x) noexcept
             : [d] "r"(p), [s] "r"(&x), "m"(*reinterpret_cast<const Bytes*>(&x)));
 #undef EVMONE_WL
 #else
-        auto* const d = reinterpret_cast<word_t*>(p);
-        const auto* const s = reinterpret_cast<const word_t*>(&x);
+        word_t* const d = reinterpret_cast<word_t*>(p);
+        const word_t* const s = reinterpret_cast<const word_t*>(&x);
         for (unsigned k = 0; k < 8; ++k)
             d[k] = s[7 - k];
 #endif

@@ -1118,8 +1118,9 @@ public:
         }
         else
         {
-            auto* d = reinterpret_cast<uint32_t*>(&A);
-            const auto* s = reinterpret_cast<const uint32_t*>(&x);
+            typedef uint32_t __attribute__((may_alias)) word;
+            word* const d = reinterpret_cast<word*>(&A);
+            const word* const s = reinterpret_cast<const word*>(&x);
             d[0]=s[0]; d[1]=s[1]; d[2]=s[2]; d[3]=s[3];
             d[4]=s[4]; d[5]=s[5]; d[6]=s[6]; d[7]=s[7];
         }
@@ -1348,8 +1349,9 @@ public:
             asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
         } else if (y_unaligned) {
             // Word copy from unaligned y into aligned yy_buf (8 word stores).
-            auto* d_ = reinterpret_cast<uint32_t*>(&yy_buf);
-            const auto* s_ = reinterpret_cast<const uint32_t*>(&y);
+            typedef uint32_t __attribute__((may_alias)) word;
+            word* const d_ = reinterpret_cast<word*>(&yy_buf);
+            const word* const s_ = reinterpret_cast<const word*>(&y);
             d_[0]=s_[0]; d_[1]=s_[1]; d_[2]=s_[2]; d_[3]=s_[3];
             d_[4]=s_[4]; d_[5]=s_[5]; d_[6]=s_[6]; d_[7]=s_[7];
         }
@@ -1409,8 +1411,9 @@ public:
             register uint32_t a2_ asm("x12") = 0x80;
             asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
         } else if (y_unaligned) {
-            auto* d_ = reinterpret_cast<uint32_t*>(&yy_buf);
-            const auto* s_ = reinterpret_cast<const uint32_t*>(&y);
+            typedef uint32_t __attribute__((may_alias)) word;
+            word* const d_ = reinterpret_cast<word*>(&yy_buf);
+            const word* const s_ = reinterpret_cast<const word*>(&y);
             d_[0]=s_[0]; d_[1]=s_[1]; d_[2]=s_[2]; d_[3]=s_[3];
             d_[4]=s_[4]; d_[5]=s_[5]; d_[6]=s_[6]; d_[7]=s_[7];
         }
@@ -1487,8 +1490,9 @@ public:
             register uint32_t a2_ asm("x12") = 0x80;
             asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2_) : "r"(a0_), "r"(a1_) : "memory");
         } else if (y_unaligned) {
-            auto* d_ = reinterpret_cast<uint32_t*>(&yy_buf);
-            const auto* s_ = reinterpret_cast<const uint32_t*>(&y);
+            typedef uint32_t __attribute__((may_alias)) word;
+            word* const d_ = reinterpret_cast<word*>(&yy_buf);
+            const word* const s_ = reinterpret_cast<const word*>(&y);
             d_[0]=s_[0]; d_[1]=s_[1]; d_[2]=s_[2]; d_[3]=s_[3];
             d_[4]=s_[4]; d_[5]=s_[5]; d_[6]=s_[6]; d_[7]=s_[7];
         }
