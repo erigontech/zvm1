@@ -4,11 +4,15 @@
 #pragma once
 
 #include <evmc/evmc.hpp>
+#include <evmc/utils.h>
 #include <intx/intx.hpp>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 
 /// EVMONE_WORD_LAYOUT: EVM memory is kept in the big-endian word layout on rv32, where the guest
@@ -37,9 +41,10 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
 namespace evmone::wl
 {
 /// Message flags of an evmc_message built by an EVM frame (see call_impl). The input is a W
-/// pointer into the caller's memory; the output is wanted as W data, phase 0, with its storage
-/// rounded up to a multiple of 4 bytes (see make_execution_result). Messages of a transaction or a
-/// system call carry neither: their input is byte order and so is their output.
+/// pointer into the caller's memory; the output is wanted as W data, phase 0, in storage from
+/// alloc_output(). Messages of a transaction or a system call carry neither: their input is byte
+/// order and so is their output. A host that answers these messages keeps to this, as the state
+/// Host does; one that does not know of them does not (see evmone's MockedHost tests).
 inline constexpr uint32_t FLAG_WORD_INPUT = 0x40000000;
 inline constexpr uint32_t FLAG_WORD_OUTPUT = 0x80000000;
 
@@ -58,6 +63,30 @@ struct Usage
 };
 inline Usage usage;
 #endif
+
+/// Storage for an output wanted as W data (FLAG_WORD_OUTPUT): @p size bytes rounded up to whole
+/// words, the bytes after the output zero. W data takes whole words: logical byte i of a partial
+/// last word lies past @p size, so storage of exactly @p size bytes could neither hold the output
+/// nor be read without reading past it. Every frame and host makes such an output here, and its
+/// result releases it with free_output().
+[[nodiscard]] inline uint8_t* alloc_output(size_t size) noexcept
+{
+    const auto storage = round_up4(size);
+    auto* const p = static_cast<uint8_t*>(std::malloc(storage));
+    if (storage != 0)
+    {
+        if (p == nullptr) [[unlikely]]
+            std::terminate();
+        reinterpret_cast<word_t*>(p)[storage / 4 - 1] = 0;
+    }
+    return p;
+}
+
+/// The release function of a result whose output comes from alloc_output(). The test build tells
+/// such outputs by its address (see ReturnData::take()), so it is defined once, in libevmone
+/// (instructions_calls.cpp), and exported: with evmone's hidden visibility, an inline function
+/// has one address in the executable and another in a shared libevmone.
+EVMC_EXPORT void free_output(const evmc_result* result) noexcept;
 
 /// The byte at logical address p + i.
 [[nodiscard]] inline uint8_t* at(const uint8_t* p, size_t i) noexcept
@@ -535,7 +564,17 @@ public:
     {
         other.m_owner.release = nullptr;
     }
-    ReturnData& operator=(ReturnData&&) = delete;
+    ReturnData& operator=(ReturnData&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            m_owner = other.m_owner;
+            m_size = other.m_size;
+            other.m_owner.release = nullptr;
+        }
+        return *this;
+    }
     ~ReturnData() { release(); }
 
     [[nodiscard]] size_t size() const noexcept { return m_size; }
@@ -543,16 +582,25 @@ public:
     [[nodiscard]] const uint8_t* data() const noexcept { return m_owner.output_data; }
     void clear() noexcept { m_size = 0; }
 
-    /// Takes over the output of @p result, the W data of phase 0 in storage rounded up to whole
-    /// words (see make_execution_result()). The result keeps its fields, but no longer releases
-    /// the output.
+    /// Takes over the output of @p result, the W data of phase 0 in storage from alloc_output().
+    /// The result keeps its fields, but no longer releases the output.
     void take(evmc::Result& result) noexcept
     {
         m_size = result.output_size;
         if (m_size == 0)
             return;
-        release();
         auto& raw = result.raw();
+#ifdef EVMONE_RV32_DISPATCH_TEST
+        // The reads of W data take the whole words of its storage. The test build checks that
+        // the output came from alloc_output(): from a host that kept it to its size, they would
+        // read past its end.
+        if (raw.release != &free_output)
+        {
+            std::fputs("evmone: a word-layout output not made by wl::alloc_output()\n", stderr);
+            std::abort();
+        }
+#endif
+        release();
         m_owner.output_data = raw.output_data;
         m_owner.output_size = raw.output_size;
         m_owner.release = raw.release;

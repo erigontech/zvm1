@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "test/utils/bytecode.hpp"
+#include "test/utils/word_layout_host.hpp"
 #include <evmc/evmc.hpp>
 #include <evmc/mocked_host.hpp>
 #include <evmone/evmone.h>
@@ -21,7 +22,11 @@ private:
 
 protected:
     evmone::VM& vm;
+#ifdef EVMONE_WORD_LAYOUT
+    WordLayoutMockedHost host;
+#else
     evmc::MockedHost host;
+#endif
 
     std::ostringstream trace_stream;
 

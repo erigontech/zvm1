@@ -285,26 +285,29 @@ inline evmc_result make_execution_result(ExecutionState& state, int64_t gas_left
         const bool deployed = state.status == EVMC_SUCCESS &&
                               (state.msg->kind == EVMC_CREATE || state.msg->kind == EVMC_CREATE2);
         const bool word_output = (state.msg->flags & wl::FLAG_WORD_OUTPUT) != 0 && !deployed;
-        const auto storage = word_output ? wl::round_up4(size) : size;
-        auto* const buffer = static_cast<uint8_t*>(std::malloc(storage));
-        if (buffer == nullptr) [[unlikely]]
-            std::terminate();
+        uint8_t* buffer = nullptr;
         if (word_output)
         {
-            reinterpret_cast<wl::word_t*>(buffer)[storage / 4 - 1] = 0;
+            buffer = wl::alloc_output(size);
             wl::copy_w2w(buffer, src, size);
         }
         else
+        {
+            buffer = static_cast<uint8_t*>(std::malloc(size));
+            if (buffer == nullptr) [[unlikely]]
+                std::terminate();
             wl::copy_w2b(buffer, src, size);
-        evmc_result result{};
-        result.status_code = state.status;
-        result.gas_left = gas_left;
-        result.gas_refund = gas_refund;
-        result.output_data = buffer;
-        result.output_size = size;
-        result.release = evmc_free_result_memory;
-        result.state_gas = state.state_gas;
-        return result;
+        }
+        // Every field initialized: zeroing the struct first costs stores that the compiler keeps.
+        return evmc_result{
+            .status_code = state.status,
+            .gas_left = gas_left,
+            .gas_refund = gas_refund,
+            .state_gas = state.state_gas,
+            .output_data = buffer,
+            .output_size = size,
+            .release = word_output ? wl::free_output : evmc_free_result_memory,
+        };
     }
 #endif
     return evmc::Result{state.status, gas_left, gas_refund,
