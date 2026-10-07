@@ -363,7 +363,7 @@ AuthOutcome process_authorization_list(State& state, uint64_t chain_id,
                 authority.code_changed = true;
                 authority.code = designation;
                 authority.code_hash = keccak256(designation);
-                state.mark_code_written();
+                state.add_changed_code_address(authority.code_hash, authority_addr);
             }
         }
 
@@ -558,13 +558,12 @@ bytes_view State::get_code(const address& addr)
     if (!a->code.empty())
         return a->code;
     // A stateless witness may omit a body this transaction already wrote (EIP-7928).
-    if (m_code_written)
+    const auto [first, last] = m_changed_code_addresses.equal_range(a->code_hash);
+    for (auto it = first; it != last; ++it)
     {
-        for (const auto& [_, m] : m_modified)
-        {
-            if (m.code_hash == a->code_hash && !m.code.empty())
-                return m.code;
-        }
+        const auto m = m_modified.find(it->second);
+        if (m != m_modified.end() && m->second.code_hash == a->code_hash && !m->second.code.empty())
+            return m->second.code;
     }
     // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
     // its 23-byte prefix, so copying the whole contract here would be pure waste.

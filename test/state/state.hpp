@@ -92,8 +92,9 @@ class State
     /// with information how to revert them.
     std::vector<JournalEntry> m_journal;
 
-    /// Set once at least one account's code has been written.
-    bool m_code_written = false;
+    /// Accounts whose code this transaction wrote, by code hash. Entries are never removed:
+    /// reverts and overwrites leave stale ones, which get_code() skips by re-checking the hash.
+    std::unordered_multimap<bytes32, address> m_changed_code_addresses;
 
 public:
     explicit State(const StateView& state_view) noexcept : m_initial{state_view} {}
@@ -130,7 +131,10 @@ public:
 
     bytes_view get_code(const address& addr);
 
-    void mark_code_written() noexcept { m_code_written = true; }
+    void add_changed_code_address(const bytes32& code_hash, const address& addr)
+    {
+        m_changed_code_addresses.emplace(code_hash, addr);
+    }
 
     StorageValue& get_storage(const address& addr, const bytes32& key);
 
