@@ -235,6 +235,39 @@ inline void copy_w2b(uint8_t* d, const uint8_t* s, size_t n) noexcept
         d[i] = *at(s, i);
 }
 
+/// Copies @p words whole words to the aligned W pointer d from the W pointer s, which is not
+/// aligned: each is the big-endian number of 4 bytes of s that straddle two of its words, their
+/// funnel shift. Forwards, or backwards where the ranges overlap with d above s.
+template <bool Overlap>
+inline void shift_words(uint8_t* d, const uint8_t* s, size_t words) noexcept
+{
+    const auto phase = reinterpret_cast<uintptr_t>(s) & 3;
+    const auto* const src = reinterpret_cast<const word_t*>(s - phase);
+    auto* const dst = reinterpret_cast<word_t*>(d);
+    const auto left = static_cast<unsigned>(8 * phase);
+    const auto right = 32 - left;
+    if (!Overlap || d < s)
+    {
+        uint32_t prev = src[0];
+        for (size_t k = 0; k < words; ++k)
+        {
+            const uint32_t next = src[k + 1];
+            dst[k] = (prev << left) | (next >> right);
+            prev = next;
+        }
+    }
+    else
+    {
+        uint32_t next = src[words];
+        for (size_t k = words; k-- != 0;)
+        {
+            const uint32_t prev = src[k];
+            dst[k] = (prev << left) | (next >> right);
+            next = prev;
+        }
+    }
+}
+
 /// Copies @p n bytes between W pointers. Only [d, d + n) is written. With @p Overlap the ranges may
 /// overlap, as memmove() allows, and the middle words move with it; without, memcpy() does.
 template <bool Overlap>
@@ -242,42 +275,49 @@ inline void copy_w2w_impl(uint8_t* d, const uint8_t* s, size_t n) noexcept
 {
     if (n == 0 || d == s)
         return;
-    if (((reinterpret_cast<uintptr_t>(d) ^ reinterpret_cast<uintptr_t>(s)) & 3) == 0)
+    const bool congruent =
+        ((reinterpret_cast<uintptr_t>(d) ^ reinterpret_cast<uintptr_t>(s)) & 3) == 0;
+    if (!congruent && n < 32)
     {
-        // Congruent: the whole words in the middle are the same bytes in both buffers, so they
-        // move as memory. The 0 to 3 bytes at each end are read before the move and written
-        // after it: a word move would take the neighbours' bytes along, and the move may
-        // overwrite them.
-        const size_t head = std::min(n, (4 - (reinterpret_cast<uintptr_t>(d) & 3)) & 3);
-        const size_t words = (n - head) / 4;
-        const size_t tail_at = head + words * 4;
-        uint8_t edge[6];
-        for (size_t k = 0; k < head; ++k)
-            edge[k] = *at(s, k);
-        for (size_t k = tail_at; k < n; ++k)
-            edge[3 + k - tail_at] = *at(s, k);
-        if (words != 0)
+        // Short and not congruent: byte by byte, in the direction that an overlap needs.
+        if (d < s)
         {
-            if constexpr (Overlap)
-                std::memmove(d + head, s + head, words * 4);
-            else
-                std::memcpy(d + head, s + head, words * 4);
+            for (size_t i = 0; i < n; ++i)
+                *at(d, i) = *at(s, i);
         }
-        for (size_t k = 0; k < head; ++k)
-            *at(d, k) = edge[k];
-        for (size_t k = tail_at; k < n; ++k)
-            *at(d, k) = edge[3 + k - tail_at];
+        else
+        {
+            for (size_t i = n; i-- != 0;)
+                *at(d, i) = *at(s, i);
+        }
+        return;
     }
-    else if (d < s)
+
+    // The 0 to 3 bytes at each end are read before the whole words in the middle move and written
+    // after them: a word move would take the neighbours' bytes along, and the move may overwrite
+    // them.
+    const size_t head = std::min(n, (4 - (reinterpret_cast<uintptr_t>(d) & 3)) & 3);
+    const size_t words = (n - head) / 4;
+    const size_t tail_at = head + words * 4;
+    uint8_t edge[6];
+    for (size_t k = 0; k < head; ++k)
+        edge[k] = *at(s, k);
+    for (size_t k = tail_at; k < n; ++k)
+        edge[3 + k - tail_at] = *at(s, k);
+    if (!congruent)
+        shift_words<Overlap>(d + head, s + head, words);
+    else if (words != 0)
     {
-        for (size_t i = 0; i < n; ++i)
-            *at(d, i) = *at(s, i);
+        // The whole words in the middle are the same bytes in both buffers: they move as memory.
+        if constexpr (Overlap)
+            std::memmove(d + head, s + head, words * 4);
+        else
+            std::memcpy(d + head, s + head, words * 4);
     }
-    else
-    {
-        for (size_t i = n; i-- != 0;)
-            *at(d, i) = *at(s, i);
-    }
+    for (size_t k = 0; k < head; ++k)
+        *at(d, k) = edge[k];
+    for (size_t k = tail_at; k < n; ++k)
+        *at(d, k) = edge[3 + k - tail_at];
 }
 
 /// Copies between W buffers that do not overlap.
