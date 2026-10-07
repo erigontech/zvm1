@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include <intx/intx.hpp>
 #include <test/utils/bytecode.hpp>
+#include <test/utils/word_layout_host.hpp>
 
 #define EXPECT_STATUS(STATUS_CODE)                                           \
     EXPECT_EQ(result.status_code, STATUS_CODE);                              \
@@ -55,7 +56,11 @@ protected:
     /// The total amount of gas used during execution.
     int64_t gas_used = 0;
 
+#ifdef EVMONE_WORD_LAYOUT
+    WordLayoutMockedHost host;
+#else
     evmc::MockedHost host;
+#endif
 
     evm() noexcept : vm{*GetParam()} {}
 

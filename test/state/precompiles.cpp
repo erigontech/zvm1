@@ -1116,21 +1116,30 @@ evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcep
     // Allocate buffer for the precompile's output and pass its ownership to evmc::Result.
     // TODO: This can be done more elegantly by providing constructor evmc::Result(std::unique_ptr).
 #ifdef EVMONE_WORD_LAYOUT
-    // The storage of W data is whole words.
-    const auto output_data =
-        new (std::nothrow) uint8_t[wl::round_up4(max_output_size)];  // TODO: handle nullptr.
+    // An output in the layout comes from wl::alloc_output().
+    const bool word_output = (msg.flags & wl::FLAG_WORD_OUTPUT) != 0;
+    const auto output_data = word_output ? wl::alloc_output(max_output_size) :
+                                           new (std::nothrow) uint8_t[max_output_size];
 #else
     const auto output_data = new (std::nothrow) uint8_t[max_output_size];  // TODO: handle nullptr.
 #endif
     const auto [status_code, output_size] =
         execute(input.data(), input.size(), output_data, max_output_size);
 #ifdef EVMONE_WORD_LAYOUT
-    if ((msg.flags & wl::FLAG_WORD_OUTPUT) != 0)
+    if (word_output)
     {
         // The bytes after the output in its last word are not written by the precompile.
         for (auto i = output_size; i < wl::round_up4(output_size); ++i)
             output_data[i] = 0;
         wl::swap_words(output_data, wl::round_up4(output_size) / 4);
+        return evmc::Result{{
+            .status_code = status_code,
+            .gas_left = status_code == EVMC_SUCCESS ? gas_left : 0,
+            .state_gas = {.left = msg.state_gas},
+            .output_data = output_data,
+            .output_size = output_size,
+            .release = wl::free_output,
+        }};
     }
 #endif
     return evmc::Result{{
