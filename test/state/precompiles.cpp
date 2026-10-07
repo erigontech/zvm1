@@ -200,7 +200,11 @@ PrecompileAnalysis expmod_analyze(bytes_view input, evmc_revision rev) noexcept
     const auto exp_len = static_cast<uint32_t>(exp_len256);
     const auto mod_len = static_cast<uint32_t>(mod_len256);
 
-    const auto adjusted_exp_len = calc_adjusted_exp_len(sizeof(input_header) + base_len, exp_len);
+    // The offset of the exponent, 96 + base_len, overflows a 32-bit size_t. Past the input, the
+    // exponent has no explicit bytes, as at the input's end.
+    const auto exp_off =
+        std::min(uint64_t{sizeof(input_header)} + base_len, uint64_t{input.size()});
+    const auto adjusted_exp_len = calc_adjusted_exp_len(static_cast<size_t>(exp_off), exp_len);
     const auto max_len = std::max(mod_len, base_len);
     const auto gas = umul(calc_mult_complexity(max_len), adjusted_exp_len) / final_divisor;
     const auto gas_clamped = std::clamp<uint128>(gas, min_gas, GasCostMax);
@@ -424,11 +428,13 @@ expmod_parse_input(
     const auto exp_len = intx::be::unsafe::load<uint32_t>(&input[LEN_SIZE + LEN32_OFF]);
     assert(intx::be::unsafe::load<uint32_t>(&input[2 * LEN_SIZE + LEN32_OFF]) == mod_len);
 
-    const size_t mod_off = base_len + exp_len;  // Cannot overflow if gas cost computed before.
-    const size_t payload_max_size = mod_off + mod_len;  // Input may contain extra bytes.
-    const std::span payload{
-        input + HEADER_SIZE, std::min(input_size - HEADER_SIZE, payload_max_size)};
-    const auto mod_explicit = payload.subspan(std::min(mod_off, payload.size()));
+    // In 64 bits: a call can pay for lengths whose sum overflows 32 bits (base_len 1 and exp_len
+    // 2^32 - 1 cost 1,717,986,905 gas before Berlin), and the modulus then lies past the input.
+    const auto mod_off = uint64_t{base_len} + exp_len;
+    const auto payload_size =  // Input may contain extra bytes.
+        std::min(uint64_t{input_size - HEADER_SIZE}, mod_off + mod_len);
+    const std::span payload{input + HEADER_SIZE, static_cast<size_t>(payload_size)};
+    const auto mod_explicit = payload.subspan(static_cast<size_t>(std::min(mod_off, payload_size)));
 
     // Handle the mod being zero early.
     // This serves two purposes:
