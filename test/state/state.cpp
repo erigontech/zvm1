@@ -269,6 +269,8 @@ AuthOutcome process_authorization_list(State& state, uint64_t chain_id,
     const auto new_account_state = STATE_BYTES_PER_NEW_ACCOUNT * cpsb;
 
     AuthOutcome out;
+    if (authorization_list.empty())
+        return out;
 
     // Leaves already written this transaction pay no ACCOUNT_WRITE: the sender's at inclusion
     // (nonce bump + fee), the recipient's on a value transfer. Later authorities join the set on
@@ -432,6 +434,7 @@ StateDiff State::build_diff(evmc_revision rev) const
         // TODO(clang): In AppleClang 15 emplace_back without StateDiff::Entry doesn't compile.
         //   NOLINTNEXTLINE(modernize-use-emplace)
         auto& a = diff.modified_accounts.emplace_back(StateDiff::Entry{addr, m.nonce, m.balance});
+        a.view_handle = m.view_handle;
 
         // Output only the new code.
         // TODO: Output also the code hash. It will be needed for DB update and MPT hash.
@@ -504,13 +507,15 @@ Account* State::find_slow(
         it->second.balance = cacc->balance;
         it->second.code_hash = cacc->code_hash;
         it->second.has_initial_storage = cacc->has_storage;
+        it->second.view_handle = cacc->handle;
         return &it->second;
     }
     if (const auto cacc = m_initial.get_account(addr); cacc)
         return &insert(addr, {.nonce = cacc->nonce,
                                  .balance = cacc->balance,
                                  .code_hash = cacc->code_hash,
-                                 .has_initial_storage = cacc->has_storage});
+                                 .has_initial_storage = cacc->has_storage,
+                                 .view_handle = cacc->handle});
     return nullptr;
 }
 
@@ -564,18 +569,21 @@ bytes_view State::get_code(const address& addr)
         return a->code;
     // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
     // its 23-byte prefix, so copying the whole contract here would be pure waste.
-    return m_initial.get_account_code(addr);
+    return m_initial.get_account_code_at(a->view_handle, addr);
 }
 
 Account& State::touch(const address& addr)
 {
-    auto& acc = get_or_insert(addr, {.erase_if_empty = true});
-    if (!acc.erase_if_empty && acc.is_empty())
+    // get_or_insert() inlined so that the 160-byte Account argument is built only on a miss.
+    auto* acc = find(addr);
+    if (acc == nullptr)
+        acc = &insert(addr, {.erase_if_empty = true});
+    if (!acc->erase_if_empty && acc->is_empty())
     {
-        journal_account_flags(addr, acc);
-        acc.erase_if_empty = true;
+        journal_account_flags(addr, *acc);
+        acc->erase_if_empty = true;
     }
-    return acc;
+    return *acc;
 }
 
 StorageValue& State::get_storage(const address& addr, const bytes32& key)
@@ -593,15 +601,19 @@ StorageValue& State::get_storage(const address& addr, const bytes32& key)
     }
     const auto [it, _] = acc->storage.try_emplace(key);
     if (!it->second.loaded)
-    {
-        // The slot may have been created by access_storage() without a fetch.
-        // Load the underlying value now; preserve access_status set earlier.
-        const auto initial_value = m_initial.get_storage(addr, key);
-        it->second.current = initial_value;
-        it->second.original = initial_value;
-        it->second.loaded = true;
-    }
+        load_storage(addr, acc->view_handle, key, it->second);
     return it->second;
+}
+
+void State::load_storage(
+    const address& addr, const void* view_handle, const bytes32& key, StorageValue& slot)
+{
+    // The slot may have been created by access_storage() without a fetch.
+    // Load the underlying value now; preserve access_status set earlier.
+    const auto initial_value = m_initial.get_storage_at(view_handle, addr, key);
+    slot.current = initial_value;
+    slot.original = initial_value;
+    slot.loaded = true;
 }
 
 void State::journal_balance_change(const address& addr, const intx::uint256& prev_balance)
@@ -918,7 +930,8 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     const TransactionProperties& tx_props)
 {
     State state{state_view};
-    auto& sender_acc = state.get_or_insert(tx.sender);
+    auto* const sender_found = state.find(tx.sender);
+    auto& sender_acc = sender_found != nullptr ? *sender_found : state.insert(tx.sender);
     assert(sender_acc.nonce < MAX_NONCE);  // Required for valid tx.
     ++sender_acc.nonce;                    // Bump sender nonce.
 

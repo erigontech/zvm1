@@ -6,6 +6,7 @@
 
 #include <evmc/evmc.hpp>
 #include <evmc/utils.h>
+#include <cstdlib>
 #include <memory>
 
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
@@ -13,8 +14,12 @@
 /// instead of over the whole code up front (10.7% of the analyzed bytes on mainnet lie past
 /// every target). EVMONE_RV32_DISPATCH_TEST builds it on the host for testing.
 #define EVMONE_LAZY_JUMPDESTS 1
+/// The JUMPDESTs go in a byte map (one byte per code position, nonzero at a JUMPDEST) instead of
+/// a bit set: the scan marks with one store and a jump tests with one byte load.
+#define EVMONE_JUMPDEST_BYTEMAP 1
 #else
 #define EVMONE_LAZY_JUMPDESTS 0
+#define EVMONE_JUMPDEST_BYTEMAP 0
 #endif
 
 namespace evmone
@@ -69,12 +74,33 @@ private:
 
 namespace baseline
 {
+#if EVMONE_JUMPDEST_BYTEMAP
+/// One byte per code position, nonzero at a JUMPDEST. The map must start zeroed and share its
+/// allocation with the code the scan reads: the scan finds a mark's address by an offset from
+/// the code's.
+using JumpdestMap = uint8_t*;
+#else
+using JumpdestMap = BitsetSpan;
+#endif
+
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// The analysis storage comes from calloc: the guest's calloc hands out fresh heap memory
+/// without clearing it again (see simple_allocator.cpp).
+struct FreeDeleter
+{
+    void operator()(uint8_t* p) const noexcept { std::free(p); }
+};
+using CodeStorage = std::unique_ptr<uint8_t[], FreeDeleter>;
+#else
+using CodeStorage = std::unique_ptr<uint8_t[]>;
+#endif
+
 /// Classifies the code positions in [from, limit) (and the ones a PUSH's data carries the scan
-/// past), setting the JUMPDEST bits in map, and returns the first position left unclassified.
+/// past), setting the JUMPDEST marks in map, and returns the first position left unclassified.
 /// The code must be the padded copy: the scan reads up to 7 bytes past limit. With limit at the
 /// code size this is the whole analysis.
 EVMC_EXPORT size_t scan_jumpdests(
-    BitsetSpan map, const uint8_t* code, size_t from, size_t limit) noexcept;
+    JumpdestMap map, const uint8_t* code, size_t from, size_t limit) noexcept;
 
 class CodeAnalysis
 {
@@ -83,25 +109,25 @@ private:
 
     /// Padded code for faster legacy code execution.
     /// If not nullptr m_code must point to it.
-    std::unique_ptr<uint8_t[]> m_padded_code;
+    CodeStorage m_padded_code;
 
-    BitsetSpan m_jumpdest_bitset{nullptr};
+    JumpdestMap m_jumpdest_map{nullptr};
 #if EVMONE_LAZY_JUMPDESTS
-    mutable size_t m_scanned = 0;  ///< Positions below this are classified in the bitset.
+    mutable size_t m_scanned = 0;  ///< Positions below this are classified in the map.
 #endif
 
 public:
     /// Constructor for legacy code.
-    CodeAnalysis(std::unique_ptr<uint8_t[]> padded_code, size_t code_size, BitsetSpan map)
+    CodeAnalysis(CodeStorage padded_code, size_t code_size, JumpdestMap map)
       : m_code{padded_code.get(), code_size},
         m_padded_code{std::move(padded_code)},
-        m_jumpdest_bitset{map}
+        m_jumpdest_map{map}
     {}
 
     /// Constructor for legacy code whose padded copy starts inside the owned storage.
-    CodeAnalysis(std::unique_ptr<uint8_t[]> storage, const uint8_t* padded_code,
-        size_t code_size, BitsetSpan map)
-      : m_code{padded_code, code_size}, m_padded_code{std::move(storage)}, m_jumpdest_bitset{map}
+    CodeAnalysis(CodeStorage storage, const uint8_t* padded_code, size_t code_size,
+        JumpdestMap map)
+      : m_code{padded_code, code_size}, m_padded_code{std::move(storage)}, m_jumpdest_map{map}
     {}
 
     /// The executable code. This is where the interpreter should start execution.
@@ -121,9 +147,13 @@ public:
 #if EVMONE_LAZY_JUMPDESTS
         if (position >= m_scanned) [[unlikely]]
             m_scanned = scan_jumpdests(
-                m_jumpdest_bitset, m_code.data(), m_scanned, static_cast<size_t>(position) + 1);
+                m_jumpdest_map, m_code.data(), m_scanned, static_cast<size_t>(position) + 1);
 #endif
-        return m_jumpdest_bitset.test(static_cast<size_t>(position));
+#if EVMONE_JUMPDEST_BYTEMAP
+        return m_jumpdest_map[position] != 0;
+#else
+        return m_jumpdest_map.test(static_cast<size_t>(position));
+#endif
     }
 };
 

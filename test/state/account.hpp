@@ -107,6 +107,9 @@ struct Account
     /// records the outcome in @a nonexistent.
     bool loaded = true;
 
+    /// The StateView's handle for this account (StateView::Account::handle), null if none.
+    const void* view_handle = nullptr;
+
     [[nodiscard]] bool is_empty() const noexcept
     {
         return nonce == 0 && balance == 0 && code_hash == EMPTY_CODE_HASH;

@@ -62,6 +62,39 @@ struct ExtFieldElem
 
     constexpr ExtFieldElem inv() const noexcept { return inverse(*this); }
 
+#if defined(AIRBENDER) && defined(__riscv)
+    /// In-place coefficient-wise addition and subtraction: each coefficient goes through
+    /// FieldElement's add_assign/sub_assign CSR block, with no temporary copies.
+    ExtFieldElem& operator+=(const ExtFieldElem& e) noexcept
+    {
+        for (size_t i = 0; i < DEGREE; ++i)
+            coeffs[i] += e.coeffs[i];
+        return *this;
+    }
+
+    ExtFieldElem& operator-=(const ExtFieldElem& e) noexcept
+    {
+        for (size_t i = 0; i < DEGREE; ++i)
+            coeffs[i] -= e.coeffs[i];
+        return *this;
+    }
+
+    /// A single named return value, so the copy is built directly in the caller's result.
+    static ExtFieldElem sum(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
+    {
+        ExtFieldElem res = e1;
+        res += e2;
+        return res;
+    }
+
+    static ExtFieldElem difference(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
+    {
+        ExtFieldElem res = e1;
+        res -= e2;
+        return res;
+    }
+#endif
+
     friend constexpr ExtFieldElem operator+(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
     {
 #if defined(SP1) || defined(SP1TURBO)
@@ -72,6 +105,10 @@ struct ExtFieldElem
                 reinterpret_cast<const size_t*>(e2.coeffs.data()));
             return res;
         }
+#endif
+#if defined(AIRBENDER) && defined(__riscv)
+        if (!std::is_constant_evaluated())
+            return sum(e1, e2);
 #endif
 
         auto res = e1.coeffs;
@@ -90,6 +127,10 @@ struct ExtFieldElem
                 reinterpret_cast<const size_t*>(e2.coeffs.data()));
             return res;
         }
+#endif
+#if defined(AIRBENDER) && defined(__riscv)
+        if (!std::is_constant_evaluated())
+            return difference(e1, e2);
 #endif
 
         auto res = e1.coeffs;
@@ -143,6 +184,14 @@ struct ExtFieldElem
     friend constexpr ExtFieldElem operator*(const ExtFieldElem& e, const Base& s) noexcept
     {
         auto res = e;
+#if defined(AIRBENDER) && defined(__riscv)
+        if (!std::is_constant_evaluated())
+        {
+            for (auto& c : res.coeffs)
+                c *= s;
+            return res;
+        }
+#endif
         for (auto& c : res.coeffs)
             c = c * s;
         return res;

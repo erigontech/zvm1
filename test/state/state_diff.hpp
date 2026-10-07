@@ -36,6 +36,9 @@ struct StateDiff
         /// The list of the account's storage modifications: key => new value.
         /// The value 0 means the storage entry is deleted.
         std::vector<std::pair<bytes32, bytes32>> modified_storage;
+
+        /// The StateView's handle for the account (Account::view_handle), null if none.
+        const void* view_handle = nullptr;
     };
 
     /// List of modified or created accounts.

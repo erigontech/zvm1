@@ -9,7 +9,9 @@
 #include "execution_state.hpp"
 #include "instructions_traits.hpp"
 #include "instructions_xmacro.hpp"
+#include "word_layout.hpp"
 #include <evmone_precompiles/keccak.hpp>
+#include <bit>
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
@@ -349,6 +351,104 @@ inline void sub(StackTop stack) noexcept
 #endif
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// A 32-bit word of a uint256 (stored as 64-bit words): may alias them. Named, since `auto` would
+/// deduce plain uint32_t and GCC is then free to drop the stores as dead stores to 64-bit words.
+typedef uint32_t __attribute__((may_alias)) word32;
+
+/// Leading zeros of a non-zero word. The call-free one on rv32, where libgcc's __clzsi2 is a call.
+[[gnu::always_inline]] inline unsigned clz_nonzero(uint32_t x) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    return intx::internal::div32::clz_nonzero(x);
+#else
+    return static_cast<unsigned>(std::countl_zero(x));
+#endif
+}
+
+/// Word I of x >> (32 * WS + bs), bs < 32, into q. Both shifts of the carried-in bits stay below
+/// 32 (a shift by 32 is undefined), as in the PUSH1 SHR handlers.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void shr_word_to(
+    word32* q, const word32* x, unsigned bs, unsigned rs) noexcept
+{
+    if constexpr (I + WS > 7)
+        q[I] = 0;
+    else if constexpr (I + WS == 7)
+        q[I] = x[7] >> bs;
+    else
+        q[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
+}
+
+/// q = x >> (32 * WS + bs), bs < 32. q and x are different uint256 (the divisor's stack slot and
+/// the dividend's), so every word of x is read before it can be overwritten.
+template <unsigned WS>
+[[gnu::always_inline]] inline void shr_words_to(word32* q, const word32* x, unsigned bs) noexcept
+{
+    const unsigned rs = 31 - bs;
+    shr_word_to<WS, 0>(q, x, bs, rs);
+    shr_word_to<WS, 1>(q, x, bs, rs);
+    shr_word_to<WS, 2>(q, x, bs, rs);
+    shr_word_to<WS, 3>(q, x, bs, rs);
+    shr_word_to<WS, 4>(q, x, bs, rs);
+    shr_word_to<WS, 5>(q, x, bs, rs);
+    shr_word_to<WS, 6>(q, x, bs, rs);
+    shr_word_to<WS, 7>(q, x, bs, rs);
+}
+
+/// v = x / v for a divisor whose top non-zero word is word T, with the OR of the words below it
+/// in `low`. It is a power of two only if that word has a single bit and nothing is below it:
+/// 2^224 + 1 has the single-bit top word 1.
+template <unsigned T>
+[[gnu::always_inline]] inline void div_top(
+    const uint256& x, uint256& v, uint32_t top, uint32_t low) noexcept
+{
+    if (((top & (top - 1)) | low) == 0)
+    {
+        shr_words_to<T>(reinterpret_cast<word32*>(&v), reinterpret_cast<const word32*>(&x),
+            31 - clz_nonzero(top));
+        return;
+    }
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The quotient alone, written straight into the divisor's slot, for a divisor of T + 1 words.
+    intx::internal::div32::udiv(x, v, v, T + 1);
+#else
+    v = x / v;
+#endif
+}
+
+inline void div(StackTop stack) noexcept
+{
+    // Powers of two of any width become word shifts into the divisor's slot. The words the zero
+    // test loads give the top non-zero word, and each branch below goes straight to its own case.
+    uint256& v = stack[1];
+    const uint256& x = stack[0];
+    const word32* const vw = reinterpret_cast<const word32*>(&v);
+    const uint32_t w0 = vw[0], w1 = vw[1], w2 = vw[2], w3 = vw[3];
+    const uint32_t w4 = vw[4], w5 = vw[5], w6 = vw[6], w7 = vw[7];
+    if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    if (w7 != 0)
+        div_top<7>(x, v, w7, w0 | w1 | w2 | w3 | w4 | w5 | w6);
+    else if (w6 != 0)
+        div_top<6>(x, v, w6, w0 | w1 | w2 | w3 | w4 | w5);
+    else if (w5 != 0)
+        div_top<5>(x, v, w5, w0 | w1 | w2 | w3 | w4);
+    else if (w4 != 0)
+        div_top<4>(x, v, w4, w0 | w1 | w2 | w3);
+    else if (w3 != 0)
+        div_top<3>(x, v, w3, w0 | w1 | w2);
+    else if (w2 != 0)
+        div_top<2>(x, v, w2, w0 | w1);
+    else if (w1 != 0)
+        div_top<1>(x, v, w1, w0);
+    else
+        div_top<0>(x, v, w0, 0);
+}
+#else
 inline void div(StackTop stack) noexcept
 {
     auto& v = stack[1];
@@ -376,6 +476,7 @@ inline void div(StackTop stack) noexcept
         v = stack[0] / v;
     }
 }
+#endif
 
 inline void sdiv(StackTop stack) noexcept
 {
@@ -405,7 +506,12 @@ inline void mod(StackTop stack) noexcept
             return;
         }
     }
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The remainder alone, written straight into the divisor's slot.
+    intx::internal::div32::urem(stack[0], v, v);
+#else
     v = stack[0] % v;
+#endif
 }
 
 inline void smod(StackTop stack) noexcept
@@ -467,6 +573,22 @@ inline void mulmod(StackTop stack) noexcept
     std::swap(x, m);
     // The result will be in the &m position (now containing x) as expected by EVM.
     sp1::mulmod(m, std::span<const uint256, 2>{&y, 2});
+#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The 512-bit product straight from MUL_LOW and MUL_HIGH, which overwrite their first operand:
+    // two copies of x, multiplied by y in its stack slot. Then only its remainder, into m's slot.
+    alignas(32) intx::uint512 p{intx::uint512::uninit_tag{}};
+    word32* const pw = reinterpret_cast<word32*>(&p);
+    const word32* const xw = reinterpret_cast<const word32*>(&x);
+    for (size_t i = 0; i < 8; ++i)
+        pw[i] = pw[i + 8] = xw[i];
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&pw[0]);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&y);
+    register uint32_t r12 asm("x12") = 0x08;  // MUL_LOW
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    r10 = reinterpret_cast<uintptr_t>(&pw[8]);
+    r12 = 0x10;  // MUL_HIGH
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+    intx::internal::div32::urem(p, m, m);
 #else
     m = intx::mulmod(x, y, m);
 #endif
@@ -782,6 +904,15 @@ inline void clz(StackTop stack) noexcept
     stack.top() = clz(stack.top());
 }
 
+#ifdef EVMONE_WORD_LAYOUT
+/// The hash of the n bytes at the W pointer p, which the hash reads as bytes. Out of line, to keep
+/// the conversion out of the interpreter loop.
+[[gnu::noinline]] inline ethash::hash256 keccak256_w(const uint8_t* p, size_t n) noexcept
+{
+    return ethash::keccak256(wl::scratch_copy(p, n), n);
+}
+#endif
+
 inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     const auto& index = stack.pop();
@@ -812,8 +943,12 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
         }
     }
 #endif
+#ifdef EVMONE_WORD_LAYOUT
+    size = intx::be::load<uint256>(keccak256_w(s != 0 ? &state.memory[i] : nullptr, s));
+#else
     auto data = s != 0 ? &state.memory[i] : nullptr;
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -874,6 +1009,17 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         const auto end = std::min(begin + 32, state.msg->input_size);
         const auto len = end - begin;
 
+#ifdef EVMONE_WORD_LAYOUT
+        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+        {
+            // The calldata of a call is the caller's memory.
+            if (len == 32) [[likely]]
+                wl::load_u256(index, state.msg->input_data + begin);
+            else
+                wl::load_u256_partial(index, state.msg->input_data + begin, len);
+        }
+        else
+#endif
         if (len == 32) [[likely]]
         {
             // Fast path: full 32-byte load, skip temporary buffer.
@@ -915,11 +1061,24 @@ inline Result calldatacopy(StackTop stack, int64_t gas_left, ExecutionState& sta
     if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    if (copy_size > 0)
+    {
+        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0)
+            wl::copy_w2w(&state.memory[dst], &state.msg->input_data[src], copy_size);
+        else
+            wl::copy_b2w(&state.memory[dst], &state.msg->input_data[src], copy_size);
+    }
+
+    if (s - copy_size > 0)
+        wl::zero(&state.memory[dst + copy_size], s - copy_size);
+#else
     if (copy_size > 0)
         std::memcpy(&state.memory[dst], &state.msg->input_data[src], copy_size);
 
     if (s - copy_size > 0)
         std::memset(&state.memory[dst + copy_size], 0, s - copy_size);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -950,11 +1109,19 @@ inline Result codecopy(StackTop stack, int64_t gas_left, ExecutionState& state) 
         return {EVMC_OUT_OF_GAS, gas_left};
 
     // TODO: Add unit tests for each combination of conditions.
+#ifdef EVMONE_WORD_LAYOUT
+    if (copy_size > 0)
+        wl::copy_b2w(&state.memory[dst], &state.original_code[src], copy_size);
+
+    if (s - copy_size > 0)
+        wl::zero(&state.memory[dst + copy_size], s - copy_size);
+#else
     if (copy_size > 0)
         std::memcpy(&state.memory[dst], &state.original_code[src], copy_size);
 
     if (s - copy_size > 0)
         std::memset(&state.memory[dst + copy_size], 0, s - copy_size);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1030,9 +1197,18 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
         const auto src =
             (max_buffer_size < input_index) ? max_buffer_size : static_cast<size_t>(input_index);
         const auto dst = static_cast<size_t>(mem_index);
+#ifdef EVMONE_WORD_LAYOUT
+        // The host writes bytes: into a buffer, and then into the memory.
+        auto* const buffer = wl::scratch(s);
+        const auto num_bytes_copied = state.host.copy_code(addr, src, buffer, s);
+        wl::copy_b2w(&state.memory[dst], buffer, num_bytes_copied);
+        if (const auto num_bytes_to_clear = s - num_bytes_copied; num_bytes_to_clear > 0)
+            wl::zero(&state.memory[dst + num_bytes_copied], num_bytes_to_clear);
+#else
         const auto num_bytes_copied = state.host.copy_code(addr, src, &state.memory[dst], s);
         if (const auto num_bytes_to_clear = s - num_bytes_copied; num_bytes_to_clear > 0)
             std::memset(&state.memory[dst + num_bytes_copied], 0, num_bytes_to_clear);
+#endif
     }
     else if (state.rev >= EVMC_AMSTERDAM)
     {
@@ -1072,8 +1248,13 @@ inline Result returndatacopy(StackTop stack, int64_t gas_left, ExecutionState& s
     if (const auto cost = copy_cost(s); (gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    if (s > 0)
+        wl::copy_w2w(&state.memory[dst], state.return_data.data() + src, s);
+#else
     if (s > 0)
         std::memcpy(&state.memory[dst], &state.return_data[src], s);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1151,7 +1332,9 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#ifdef EVMONE_WORD_LAYOUT
+    wl::load_u256(index, &state.memory[static_cast<size_t>(index)]);
+#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // Reverse the bytes straight into the stack slot.
     intx::be::unsafe::load_into(index, &state.memory[static_cast<size_t>(index)]);
 #else
@@ -1168,7 +1351,11 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    wl::store_u256(&state.memory[static_cast<size_t>(index)], value);
+#else
     intx::be::unsafe::store(&state.memory[static_cast<size_t>(index)], value);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -1180,7 +1367,12 @@ inline Result mstore8(StackTop stack, int64_t gas_left, ExecutionState& state) n
     if (!check_memory(gas_left, state.memory, index, 1))
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    // The byte of the address; the word holding it lies inside the memory (a multiple of 32).
+    state.memory[static_cast<size_t>(index) ^ 3] = static_cast<uint8_t>(value);
+#else
     state.memory[static_cast<size_t>(index)] = static_cast<uint8_t>(value);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -1191,14 +1383,17 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 /// Internal jump implementation for JUMP/JUMPI instructions.
 inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexcept
 {
+    // Bound once: the map read may alias the state, which makes the compiler load the pointer
+    // again for code().
+    const auto& analysis = *state.analysis.baseline;
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, use 32-bit word checks: dst must fit in word[0] (32-bit code offsets).
     const auto* w = reinterpret_cast<const uint32_t*>(&dst);
     const auto hi_part_is_nonzero = (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0;
-    if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(w[0])) [[unlikely]]
+    if (hi_part_is_nonzero || !analysis.check_jumpdest(w[0])) [[unlikely]]
 #else
     const auto hi_part_is_nonzero = (dst[3] | dst[2] | dst[1]) != 0;
-    if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(dst[0])) [[unlikely]]
+    if (hi_part_is_nonzero || !analysis.check_jumpdest(dst[0])) [[unlikely]]
 #endif
     {
         state.status = EVMC_BAD_JUMP_DESTINATION;
@@ -1206,9 +1401,9 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
     }
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    return &state.analysis.baseline->code()[w[0]];
+    return &analysis.code()[w[0]];
 #else
-    return &state.analysis.baseline->code()[static_cast<size_t>(dst[0])];
+    return &analysis.code()[static_cast<size_t>(dst[0])];
 #endif
 }
 
@@ -1246,9 +1441,19 @@ inline Result gas(StackTop stack, int64_t gas_left, ExecutionState& /*state*/) n
 inline void tload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& x = stack.top();
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The conversions write all 32 bytes, so the locals need no zero-initialization, and skip
+    // the zero words: most values have few significant words.
+    alignas(4) evmc_bytes32 key;
+    intx::be::unsafe::store(key.bytes, x);
+    alignas(4) const evmc_bytes32 value =
+        state.host.get_transient_storage_raw(state.msg->recipient, evmc::internal::as_cpp(&key));
+    intx::be::unsafe::load_aligned_into(x, value.bytes);
+#else
     const auto key = intx::be::store<evmc::bytes32>(x);
     const auto value = state.host.get_transient_storage(state.msg->recipient, key);
     x = intx::be::load<uint256>(value);
+#endif
 }
 
 inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
@@ -1256,9 +1461,19 @@ inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     if (state.in_static_mode())
         return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // As in tload().
+    alignas(4) evmc_bytes32 key;
+    intx::be::unsafe::store(key.bytes, stack.pop());
+    alignas(4) evmc_bytes32 value;
+    intx::be::unsafe::store_aligned(value.bytes, stack.pop());
+    state.host.set_transient_storage(
+        state.msg->recipient, evmc::internal::as_cpp(&key), evmc::internal::as_cpp(&value));
+#else
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
     state.host.set_transient_storage(state.msg->recipient, key, value);
+#endif
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -1432,7 +1647,29 @@ template <int N>
 inline void swap(StackTop stack) noexcept
 {
     static_assert(N >= 1 && N <= 16);
+#if defined(AIRBENDER) && defined(__riscv)
+    // fast_swap() with the two stack slots addressed from the stack end inside the asm: the
+    // offsets are immediates, so GCC does not compute both addresses into registers first.
+    alignas(32) char tmp_raw_[sizeof(uint256)];
+    asm volatile(
+        "mv x10, %[tmp]\n\t"
+        "addi x11, %[end], %[x]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        "addi x10, %[end], %[x]\n\t"
+        "addi x11, %[end], %[y]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        "addi x10, %[end], %[y]\n\t"
+        "mv x11, %[tmp]\n\t"
+        "li x12, 0x80\n\t"
+        "csrrw x0, 0x7CA, x0\n\t"
+        :
+        : [tmp] "r"(tmp_raw_), [end] "r"(stack.end()), [x] "I"(-32), [y] "I"(-32 * (N + 1))
+        : "x10", "x11", "x12", "memory");
+#else
     fast_swap(stack.top(), stack[N]);
+#endif
 }
 
 inline code_iterator dupn(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
@@ -1511,8 +1748,13 @@ inline Result mcopy(StackTop stack, int64_t gas_left, ExecutionState& state) noe
     if (const auto cost = copy_cost(size); (gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#ifdef EVMONE_WORD_LAYOUT
+    if (size > 0)
+        wl::move_w2w(&state.memory[dst], &state.memory[src], size);
+#else
     if (size > 0)
         std::memmove(&state.memory[dst], &state.memory[src], size);
+#endif
 
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1545,6 +1787,7 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
             topic = intx::be::store<evmc::bytes32>(stack.pop());
     }
 
+    // With the word layout the data is a W pointer; the state Host converts it.
     const auto data = s != 0 ? &state.memory[o] : nullptr;
     state.host.emit_log(state.msg->recipient, data, s, topics.data(), NumTopics);
     return {EVMC_SUCCESS, gas_left};

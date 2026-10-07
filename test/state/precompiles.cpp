@@ -15,6 +15,7 @@
 #include <evmone_precompiles/ripemd160.hpp>
 #include <evmone_precompiles/secp256k1.hpp>
 #include <evmone_precompiles/sha256.hpp>
+#include <evmone/word_layout.hpp>
 #include <intx/intx.hpp>
 #include <array>
 #include <bit>
@@ -967,17 +968,50 @@ evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcep
 
     const auto [analyze, execute] = EXECUTION_LOOKUP_TABLE[to_lookup_index(msg.code_address)];
 
+#ifdef EVMONE_WORD_LAYOUT
+    // The input of a call from an EVM frame is a W pointer into its memory; the precompile reads
+    // bytes, and the output goes back as W data if the frame asked for it. Only MODEXP and
+    // BLAKE2F read the input to price the call, the others its size: the input is converted
+    // first for those two, and for the rest once the call can pay, so that a call that runs out
+    // of gas costs no more than it did (a test makes 50000 of them with 50000 bytes of input).
+    const bool word_input = (msg.flags & wl::FLAG_WORD_INPUT) != 0;
+    const bool analysis_reads_input = analyze == expmod_analyze || analyze == blake2bf_analyze;
+    bytes_view input{word_input && analysis_reads_input ?
+                         wl::scratch_copy<4>(msg.input_data, msg.input_size) :
+                         msg.input_data,
+        msg.input_size};
+#else
     const bytes_view input{msg.input_data, msg.input_size};
+#endif
     const auto [gas_cost, max_output_size] = analyze(input, rev);
     const auto gas_left = msg.gas - gas_cost;
     if (gas_left < 0)
         return evmc::Result{EVMC_OUT_OF_GAS, {.left = msg.state_gas}};
+#ifdef EVMONE_WORD_LAYOUT
+    if (word_input && !analysis_reads_input)
+        input = {wl::scratch_copy<4>(msg.input_data, msg.input_size), msg.input_size};
+#endif
 
     // Allocate buffer for the precompile's output and pass its ownership to evmc::Result.
     // TODO: This can be done more elegantly by providing constructor evmc::Result(std::unique_ptr).
+#ifdef EVMONE_WORD_LAYOUT
+    // The storage of W data is whole words.
+    const auto output_data =
+        new (std::nothrow) uint8_t[wl::round_up4(max_output_size)];  // TODO: handle nullptr.
+#else
     const auto output_data = new (std::nothrow) uint8_t[max_output_size];  // TODO: handle nullptr.
+#endif
     const auto [status_code, output_size] =
-        execute(msg.input_data, msg.input_size, output_data, max_output_size);
+        execute(input.data(), input.size(), output_data, max_output_size);
+#ifdef EVMONE_WORD_LAYOUT
+    if ((msg.flags & wl::FLAG_WORD_OUTPUT) != 0)
+    {
+        // The bytes after the output in its last word are not written by the precompile.
+        for (auto i = output_size; i < wl::round_up4(output_size); ++i)
+            output_data[i] = 0;
+        wl::swap_words(output_data, wl::round_up4(output_size) / 4);
+    }
+#endif
     return evmc::Result{{
         .status_code = status_code,
         .gas_left = status_code == EVMC_SUCCESS ? gas_left : 0,

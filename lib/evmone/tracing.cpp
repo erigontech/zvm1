@@ -171,7 +171,15 @@ class InstructionTracer : public Tracer
 
         output_stack(stack_top, stack_height);
         if (!state.return_data.empty())
+        {
+#ifdef EVMONE_WORD_LAYOUT
+            m_out << R"(,"returnData":"0x)"
+                  << evmc::hex(wl::to_bytes(state.return_data.data(), state.return_data.size()))
+                  << '"';
+#else
             m_out << R"(,"returnData":"0x)" << evmc::hex(state.return_data) << '"';
+#endif
+        }
         m_out << R"(,"depth":)" << std::dec << (ctx.depth + 1);
         m_out << R"(,"refund":)" << std::dec << state.gas_refund;
         m_out << R"(,"opName":")" << get_name(opcode) << '"';

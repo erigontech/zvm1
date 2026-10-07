@@ -814,6 +814,7 @@ template <typename T>
 class AlignedArray
 {
     static_assert(std::is_trivially_destructible_v<T>);
+    static_assert(sizeof(T) % 32 == 0);  // every element stays 32-aligned
     std::unique_ptr<std::byte[]> raw_;
     T* p_;
 
@@ -943,6 +944,112 @@ unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
 /// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
 constexpr auto FP_ONE = Curve::Fp::one();
 
+/// dbl_inplace, madd_inplace and jadd_inplace rebind their operands through __builtin_assume_aligned(.., 32),
+/// so the inlined ModArith operations fold their alignment tests. Every caller passes 32-byte-aligned storage
+/// (FieldElement's value_ is alignas(32)); a misaligned operand would be undefined behavior and would make the
+/// BigInt CSR fault. There is no assert(): the guest is built with NDEBUG, and these functions do not exist on
+/// the host.
+static_assert(alignof(ecc::ProjPoint<Curve>) == 32 && alignof(AffinePoint) == 32 && alignof(Curve::Fp) == 32);
+
+/// x = x OP y on the BigInt delegation (x and y 32-byte aligned and distinct); returns the
+/// carry/borrow flag the operation leaves in x12.
+[[gnu::always_inline]] inline uint32_t bigint_op(void* x, const void* y, uint32_t op) noexcept
+{
+    register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(x);
+    register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(y);
+    register uint32_t a2 asm("x12") = op;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+    return a2;
+}
+constexpr uint32_t BIGINT_SUB = 0x02, BIGINT_SUB_AND_NEGATE = 0x04, BIGINT_MUL_LOW = 0x08,
+                   BIGINT_MUL_HIGH = 0x10;
+
+/// The GLV split of ecc::decompose(): k == k1 + k2 lambda (mod n) with |k1|, |k2| < 2^128.
+/// c1 = round(b2 k / n) and c2 = round(-b1 k / n) come from 384-bit shifted products with
+/// libsecp256k1's g1 = round(2^384 b2 / n) and g2 = round(2^384 (-b1) / n), and then
+/// k1 = k - c1 a1 - c2 a2 and k2 = -c1 b1 - c2 b2 are computed modulo 2^256: both are short
+/// (|ci - exact| <= 1/2 + 2^-127 bounds them by 0.64 * 2^128), so the top bit is the sign.
+/// All on the BigInt delegation: 2 MUL_HIGH, 4 MUL_LOW, 3 SUB and the negations.
+std::array<ecc::SignedScalar<uint256>, 2> split_lambda(const uint256& k) noexcept
+{
+    typedef uint32_t __attribute__((may_alias)) word;
+    alignas(32) static constexpr uint256 G1 =
+        0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
+    alignas(32) static constexpr uint256 G2 =
+        0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+    alignas(32) static constexpr uint256 A1 = Curve::X1;
+    alignas(32) static constexpr uint256 A2 = Curve::X2;
+    alignas(32) static constexpr uint256 MINUS_B1 = Curve::MINUS_Y1;
+    alignas(32) static constexpr uint256 B2 = Curve::Y2;
+    alignas(32) static constexpr uint256 ZERO = 0;
+    // The rounding constants are tied to the lattice: g = round(2^384 b / n) for b = b2 and -b1;
+    // their top halves are below 2^128 - 1, so c = (h >> 128) + bit 127 of h does not carry out;
+    // and (1/2 + 2^-129)(|a1| + |a2|) and (1/2 + 2^-129)(|b1| + |b2|) stay below 2^128.
+    constexpr auto round_384 = [](const uint256& b) noexcept {
+        return static_cast<uint256>(((intx::uint<512>{b} << 384) + (Curve::ORDER >> 1)) /
+                                    intx::uint<512>{Curve::ORDER});
+    };
+    static_assert(G1 == round_384(Curve::Y2) && G2 == round_384(Curve::MINUS_Y1));
+    static_assert(Curve::X1 * Curve::Y2 + Curve::X2 * Curve::MINUS_Y1 == Curve::ORDER);
+    static_assert((G1 >> 128) < (uint256{1} << 128) - 1 && (G2 >> 128) < (uint256{1} << 128) - 1);
+    static_assert((Curve::X1 + Curve::X2) / 2 + 1 < (uint256{1} << 128) &&
+                  (Curve::MINUS_Y1 + Curve::Y2) / 2 + 1 < (uint256{1} << 128));
+
+    alignas(32) word kw[8];
+    alignas(32) word h1[8];
+    alignas(32) word h2[8];
+    const word* const src = reinterpret_cast<const word*>(&k);
+    for (int i = 0; i < 8; ++i)
+        kw[i] = h1[i] = h2[i] = src[i];
+    bigint_op(h1, &G1, BIGINT_MUL_HIGH);
+    bigint_op(h2, &G2, BIGINT_MUL_HIGH);
+
+    // c = (h >> 128) + bit 127 of h, below 2^128 (h < g < 2^256 - 2^127), in two buffers each:
+    // the products below overwrite their first operand.
+    alignas(32) word c1a[8];
+    alignas(32) word c1b[8];
+    alignas(32) word c2a[8];
+    alignas(32) word c2b[8];
+    const auto round_shift = [](word* a, word* b, const word* h) noexcept {
+        uint32_t carry = h[3] >> 31;
+        for (int i = 0; i < 4; ++i)
+        {
+            const uint32_t v = h[4 + i] + carry;
+            carry = v < carry;
+            a[i] = b[i] = v;
+            a[4 + i] = b[4 + i] = 0;
+        }
+    };
+    round_shift(c1a, c1b, h1);
+    round_shift(c2a, c2b, h2);
+
+    bigint_op(c1a, &MINUS_B1, BIGINT_MUL_LOW);  // -c1 b1
+    bigint_op(c2a, &B2, BIGINT_MUL_LOW);        // c2 b2
+    bigint_op(c1a, c2a, BIGINT_SUB);            // k2 = -c1 b1 - c2 b2 (mod 2^256)
+    bigint_op(c1b, &A1, BIGINT_MUL_LOW);        // c1 a1
+    bigint_op(c2b, &A2, BIGINT_MUL_LOW);        // c2 a2
+    bigint_op(kw, c1b, BIGINT_SUB);
+    bigint_op(kw, c2b, BIGINT_SUB);             // k1 = k - c1 a1 - c2 a2 (mod 2^256)
+
+    const bool k1_neg = (kw[7] >> 31) != 0;
+    const bool k2_neg = (c1a[7] >> 31) != 0;
+    if (k1_neg)
+        bigint_op(kw, &ZERO, BIGINT_SUB_AND_NEGATE);
+    if (k2_neg)
+        bigint_op(c1a, &ZERO, BIGINT_SUB_AND_NEGATE);
+    std::array<ecc::SignedScalar<uint256>, 2> r;
+    r[0].sign = k1_neg;
+    r[1].sign = k2_neg;
+    word* const d1 = reinterpret_cast<word*>(&r[0].value);
+    word* const d2 = reinterpret_cast<word*>(&r[1].value);
+    for (int i = 0; i < 8; ++i)
+    {
+        d1[i] = kw[i];
+        d2[i] = c1a[i];
+    }
+    return r;
+}
+
 /// p = 2p in place, as the representative (X3/4 : Y3/8 : Z3/2) of ecc::dbl()'s a = 0 result
 /// (X3 : Y3 : Z3), i.e. with lambda = 1/2: with L = 3X^2/2 and T = XY^2, X' = L^2 - 2T,
 /// Y' = L(T - X') - Y^4 and Z' = YZ. (X : Y : Z) and (l^2 X : l^3 Y : l Z) are the same point and
@@ -950,9 +1057,10 @@ constexpr auto FP_ONE = Curve::Fp::one();
 /// x/z^2 and y/z^3), so one halving of X replaces the doublings in 2YZ, 4XY^2 and 8Y^4. Each
 /// coordinate is written into p as it dies, skipping the copies into the returned point and back
 /// (3 CSR MEMCOPY each way).
-__attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
+__attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p_) noexcept
 {
     using FE = Curve::Fp;
+    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
     auto& [x1, y1, z1] = p;
     DECL_FE_COPY(FE, yy, y1); yy *= y1;          // Y^2
     z1 *= y1;                                    // Z' = YZ
@@ -966,16 +1074,32 @@ __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p) noexcept
     y1.rsub(yy);                                 // Y' = L(T - X') - Y^4
 }
 
-/// p += (x2, y2), an affine point other than infinity, in place: ecc::add()'s mixed formula
-/// written into p's own coordinates as each one dies, skipping the copies through the returned
-/// point. Taking the coordinates apart lets a negated table point pass only its new y. With Live
-/// the caller knows p is not infinity either, which saves the 8-word test of z. Returns true if
-/// the sum is the point at infinity (p == -(x2, y2)), and then leaves p with z == 0.
+/// a == 0, testing the low word first: h is almost never 0, so the common case is a load and a
+/// branch where the full test ORs all 8 words.
+[[gnu::always_inline]] inline bool is_zero_low_first(const Curve::Fp& a) noexcept
+{
+    typedef uint32_t __attribute__((may_alias)) word;
+    if (*reinterpret_cast<const word*>(&a) != 0) [[likely]]
+        return false;
+    asm volatile("");  // keeps GCC from merging the low-word test back into the 8-word OR below
+    return a == 0;
+}
+
+/// p += (x2, y2), an affine point other than infinity, in place: the add-1998-cmo-2 formula with
+/// z2 = 1, written into p's own coordinates as each one dies, skipping the copies through the
+/// returned point. Its result (X3 : Y3 : Z3) is the same point as ecc::add()'s (4 X3 : 8 Y3 : 2 Z3),
+/// which is fine because callers use points only projectively (see dbl_inplace()). Taking the
+/// coordinates apart lets a negated table point pass only its new y. With Live the caller knows p
+/// is not infinity either, which saves the 8-word test of z. Returns true if the sum is the point
+/// at infinity (p == -(x2, y2)), and then leaves p with z == 0.
 template <bool Live = false>
 __attribute__((flatten)) bool madd_inplace(
-    ecc::ProjPoint<Curve>& p, const Curve::Fp& x2, const Curve::Fp& y2) noexcept
+    ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_, const Curve::Fp& y2_) noexcept
 {
     using FE = Curve::Fp;
+    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
+    const auto& x2 = *static_cast<const FE*>(__builtin_assume_aligned(&x2_, 32));
+    const auto& y2 = *static_cast<const FE*>(__builtin_assume_aligned(&y2_, 32));
     auto& [x1, y1, z1] = p;
     if constexpr (!Live)
     {
@@ -991,10 +1115,8 @@ __attribute__((flatten)) bool madd_inplace(
     DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
     z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
     h -= x1;                                     // h = u2 - x1
-    DECL_FE_COPY(FE, t1, h); t1 += h;            // 2h
-    DECL_FE_COPY(FE, i, t1); i *= t1;            // i = (2h)^2
-    z1z1 -= y1;                                  // t2 = s2 - y1
-    if (h == 0) [[unlikely]]
+    z1z1 -= y1;                                  // r = s2 - y1
+    if (is_zero_low_first(h)) [[unlikely]]
     {
         if (z1z1 == 0)  // p == (x2, y2)
         {
@@ -1004,16 +1126,16 @@ __attribute__((flatten)) bool madd_inplace(
         z1 = FE{};  // p == -(x2, y2): the sum is the point at infinity.
         return true;
     }
-    DECL_FE_COPY(FE, r, z1z1); r += z1z1;        // r = 2 t2
-    DECL_FE_COPY(FE, v, x1); v *= i;             // v = x1 i
-    i *= h;                                      // j = h i
-    x1 = r; x1 *= r;                             // r^2
-    x1 -= i; x1 -= v; x1 -= v;                   // x3 = r^2 - j - 2v
-    v -= x1;                                     // v - x3
-    i *= y1;                                     // y1 j
-    y1 = r; y1 *= v;                             // r (v - x3)
-    y1 -= i; y1 -= i;                            // y3 = r (v - x3) - 2 y1 j
-    z1 *= h; z1 += z1;                           // z3 = 2 z1 h
+    z1 *= h;                                     // z3 = z1 h
+    DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
+    h *= hh;                                     // h^3
+    hh *= x1;                                    // v = x1 h^2
+    x1 = z1z1; x1 *= z1z1;                       // r^2
+    x1 -= h; x1 -= hh; x1 -= hh;                 // x3 = r^2 - h^3 - 2v
+    hh -= x1;                                    // v - x3
+    y1 *= h;                                     // y1 h^3
+    z1z1 *= hh;                                  // r (v - x3)
+    y1.rsub(z1z1);                               // y3 = r (v - x3) - y1 h^3
     return false;
 }
 
@@ -1021,10 +1143,14 @@ __attribute__((flatten)) bool madd_inplace(
 /// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
 /// Returns true if the sum is the point at infinity, and then leaves p with z == 0.
 template <bool Live = false>
-__attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve::Fp& x2,
-    const Curve::Fp& y2, const Curve::Fp& z2) noexcept
+__attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_,
+    const Curve::Fp& y2_, const Curve::Fp& z2_) noexcept
 {
     using FE = Curve::Fp;
+    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
+    const auto& x2 = *static_cast<const FE*>(__builtin_assume_aligned(&x2_, 32));
+    const auto& y2 = *static_cast<const FE*>(__builtin_assume_aligned(&y2_, 32));
+    const auto& z2 = *static_cast<const FE*>(__builtin_assume_aligned(&z2_, 32));
     auto& [x1, y1, z1] = p;
     if constexpr (!Live)
     {
@@ -1044,7 +1170,7 @@ __attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p, const Curve
     z2z2 *= z2; z2z2 *= y1;                      // s1 = y1 z2^3
     h -= u1;                                     // h = u2 - u1
     z1z1 -= z2z2;                                // r = s2 - s1
-    if (h == 0) [[unlikely]]
+    if (is_zero_low_first(h)) [[unlikely]]
     {
         if (z1z1 == 0)  // p == (x2 : y2 : z2)
         {
@@ -1138,8 +1264,8 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
     const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
 {
     using Point = ecc::ProjPoint<Curve>;
-    const auto [a1, b1] = ecc::decompose<Curve>(u1);
-    const auto [a2, b2] = ecc::decompose<Curve>(u2);
+    const auto [a1, b1] = split_lambda(u1);
+    const auto [a2, b2] = split_lambda(u2);
 
     alignas(32) std::byte t_raw[R_TABLE_SIZE * sizeof(Point)];
     alignas(32) std::byte e_raw[2 * R_TABLE_SIZE * sizeof(Curve::Fp)];
@@ -1283,8 +1409,8 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
             continue;
         const auto u1 = -z[i] * r_inv[i];
         const auto u2 = s[i] * r_inv[i];
-        const auto [a1, b1] = ecc::decompose<Curve>(u1.value());
-        const auto [a2, b2] = ecc::decompose<Curve>(u2.value());
+        const auto [a1, b1] = split_lambda(u1.value());
+        const auto [a2, b2] = split_lambda(u2.value());
         k1a[i] = a1.value;
         k1b[i] = b1.value;
         k2a[i] = a2.value;
@@ -1295,18 +1421,15 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
     }
     batch_invert(t, fp_prefix, live.get(), n);
 
-    // The odd multiples 3R..15R: 2R in affine, then 7 mixed additions in Jacobian coordinates,
-    // their z batched into one inversion for the whole block. No addition can hit P == +/-Q:
-    // that needs (j +/- 2)R = 0 for some j <= 13, below the (prime) group order.
-    constexpr size_t M = R_TABLE_SIZE - 1;
+    // The odd multiples 3R..15R in affine coordinates: 2R from the batched 1/(2y), then
+    // (2j+1)R = (2j-1)R + 2R, one round per j over the whole block with the denominators
+    // x(2R) - x((2j-1)R) batched into one inversion. None of them is 0: that needs
+    // (2j-1)R = +/-2R, i.e. (2j-3)R = 0 or (2j+1)R = 0 for some j <= 7, below the (prime) group order.
+    constexpr size_t M = R_TABLE_SIZE;
     AlignedArray<AffinePoint> two_r(n);
-    AlignedArray<ecc::ProjPoint<Curve>> odd(n * M);
-    AlignedArray<Fp> odd_z(n * M), odd_prefix(n * M);
-    const std::unique_ptr<uint8_t[]> odd_live{new uint8_t[n * M]};
+    AlignedArray<AffinePoint> odd(n * M);  // odd[i * M + j] = (2j+1) R_i
     for (size_t i = 0; i < n; ++i)
     {
-        for (size_t j = 0; j < M; ++j)
-            odd_live[i * M + j] = live[i];
         if (!live[i])
             continue;
         auto lambda = rx[i];
@@ -1315,31 +1438,48 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         lambda += xx;
         lambda += xx;
         lambda *= t[i];  // 3x^2 / 2y
-        auto x2 = lambda;
-        x2 *= lambda;
-        x2 -= rx[i];
-        x2 -= rx[i];  // lambda^2 - 2x
-        auto y2 = rx[i];
-        y2 -= x2;
-        y2 *= lambda;
-        y2 -= ry[i];  // lambda (x - x2) - y
-        two_r[i] = AffinePoint{x2, y2};
-
-        auto& p = odd[i * M];
-        p.x = rx[i];
-        p.y = ry[i];
-        p.z = FP_ONE;
-        for (size_t j = 0;; ++j)
+        auto& d = two_r[i];
+        d.x = lambda;
+        d.x *= lambda;
+        d.x -= rx[i];
+        d.x -= rx[i];  // lambda^2 - 2x
+        d.y = rx[i];
+        d.y -= d.x;
+        d.y *= lambda;
+        d.y -= ry[i];  // lambda (x - x2) - y
+        odd[i * M].x = rx[i];
+        odd[i * M].y = ry[i];
+    }
+    for (size_t j = 1; j < M; ++j)
+    {
+        for (size_t i = 0; i < n; ++i)
         {
-            auto& p_j = odd[i * M + j];
-            madd_inplace<true>(p_j, two_r[i].x, two_r[i].y);
-            odd_z[i * M + j] = p_j.z;
-            if (j + 1 == M)
-                break;
-            odd[i * M + j + 1] = p_j;
+            if (!live[i])
+                continue;
+            t[i] = two_r[i].x;
+            t[i] -= odd[i * M + j - 1].x;
+        }
+        batch_invert(t, fp_prefix, live.get(), n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (!live[i])
+                continue;
+            const auto& p = odd[i * M + j - 1];
+            const auto& d = two_r[i];
+            auto& q = odd[i * M + j];
+            auto lambda = d.y;
+            lambda -= p.y;
+            lambda *= t[i];  // (y2 - y1) / (x2 - x1)
+            q.x = lambda;
+            q.x *= lambda;
+            q.x -= p.x;
+            q.x -= d.x;  // lambda^2 - x1 - x2
+            q.y = p.x;
+            q.y -= q.x;
+            q.y *= lambda;
+            q.y -= p.y;  // lambda (x1 - x3) - y1
         }
     }
-    batch_invert(odd_z, odd_prefix, odd_live.get(), n * M);
 
     const auto beta = Fp{Curve::BETA};
     for (size_t i = 0; i < n; ++i)
@@ -1362,21 +1502,8 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
             new (&tb[j]) AffinePoint{bx, neg_b ? ny : y};
             new (&tb[R_TABLE_SIZE + j]) AffinePoint{bx, neg_b ? y : ny};
         };
-        put(0, rx[i], ry[i]);
-        for (size_t j = 1; j < R_TABLE_SIZE; ++j)
-        {
-            // to_affine() with the batched z_inv.
-            const auto& q_j = odd[i * M + j - 1];
-            const auto& z_inv = odd_z[i * M + j - 1];
-            auto zz_inv = z_inv;
-            zz_inv *= z_inv;
-            auto x = q_j.x;
-            x *= zz_inv;
-            zz_inv *= z_inv;
-            auto y = q_j.y;
-            y *= zz_inv;
-            put(j, x, y);
-        }
+        for (size_t j = 0; j < R_TABLE_SIZE; ++j)
+            put(j, odd[i * M + j].x, odd[i * M + j].y);
 
         alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
         alignas(4) int8_t naf_b[WNAF_LEN + 3]{};

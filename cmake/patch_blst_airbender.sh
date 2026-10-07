@@ -21,6 +21,12 @@ path = sys.argv[1]
 with open(path) as f:
     src = f.read()
 
+def replace_once(src, old, new):
+    # A target that a blst upgrade moved would otherwise leave the generic code in silently.
+    if old not in src:
+        sys.exit("ERR: patch target not found in no_asm.h: " + old.strip().splitlines()[0])
+    return src.replace(old, new, 1)
+
 airbender_384 = r"""/* Airbender BigInt CSR (0x7CA) accelerated 384-bit Montgomery arithmetic.
  * AIRBENDER_BIGINT_CSR marker for idempotent patching.
  *
@@ -279,7 +285,7 @@ MUL_MONT_IMPL(384)
 #endif
 """
 
-src = src.replace('MUL_MONT_IMPL(384)', airbender_384, 1)
+src = replace_once(src, 'MUL_MONT_IMPL(384)', airbender_384)
 print("Patched mul_mont_384/sqr_mont_384")
 
 # Patch ADD_MOD_IMPL(384) to use CSR ADD/SUB for the low 256-bit chunk.
@@ -351,7 +357,7 @@ inline void add_mod_384(vec384 ret, const vec384 a,
 #else
 ADD_MOD_IMPL(384)
 #endif"""
-src = src.replace(old_add_384, new_add_384, 1)
+src = replace_once(src, old_add_384, new_add_384)
 print("Patched add_mod_384 with CSR ADD/SUB")
 
 # Patch SUB_MOD_IMPL(384) to use CSR SUB/ADD for the low 256-bit chunk.
@@ -411,7 +417,7 @@ inline void sub_mod_384(vec384 ret, const vec384 a,
 #else
 SUB_MOD_IMPL(384)
 #endif"""
-src = src.replace(old_sub_384, new_sub_384, 1)
+src = replace_once(src, old_sub_384, new_sub_384)
 print("Patched sub_mod_384 with CSR SUB/ADD")
 
 # Patch REDC_MONT_IMPL(384, 768)
@@ -424,7 +430,7 @@ REDC_MONT_IMPL(384, 768)
 #else
 REDC_MONT_IMPL(384, 768)
 #endif"""
-src = src.replace(old_redc, new_redc, 1)
+src = replace_once(src, old_redc, new_redc)
 print("Patched REDC_MONT_IMPL(384, 768)")
 
 # Patch FROM_MONT_IMPL(384)
@@ -441,11 +447,11 @@ inline void from_mont_384(vec384 ret, const vec384 a,
 #else
 FROM_MONT_IMPL(384)
 #endif"""
-src = src.replace(old_from, new_from, 1)
+src = replace_once(src, old_from, new_from)
 print("Patched FROM_MONT_IMPL(384)")
 
-# Patch mul_mont_384x: redirect mul_mont_n(... NLIMBS(384)) -> mul_mont_384
-# The generic mul_mont_n is O(n^2) scalar CIOS; mul_mont_384 uses BigInt CSR.
+# Patch mul_mont_384x and sqr_mont_384x: Fp2 multiplication and squaring with one reduction
+# per output on CSR 768-bit products (the generic versions use 12-limb scalar arithmetic).
 old_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
                           const vec384 p, limb_t n0)
 {
@@ -460,21 +466,278 @@ old_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x 
     sub_mod_n(ret[1], bb, aa, p, NLIMBS(384));
     sub_mod_n(ret[1], ret[1], cc, p, NLIMBS(384));
 }"""
-new_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
+new_mul384x = r"""#ifdef AIRBENDER_BIGINT_CSR
+/*
+ * Fp2 multiplication and squaring with lazy reduction.
+ *
+ * A 384x384-bit product is seven CSR multiplications, while a modular addition or
+ * subtraction is CSR calls plus a software chain over the top 128 bits, and every
+ * mul_mont_384 ends in its own reduction. So instead of Karatsuba over mul_mont_384
+ * (3 multiplications, 2 additions, 3 subtractions), each output is formed as an
+ * unreduced 768-bit value and reduced once:
+ *     mul: re = a0*b0 - a1*b1 (+ about p^2 if negative)
+ *          im = (a0 + a1)*(b0 + b1) - a0*b0 - a1*b1
+ *     sqr: re = (a0 + a1)*(a0 - a1 + p), im = a0*(2*a1)
+ * For inputs up to p (every blst Fp value is fully reduced) these are at most 4p^2, far
+ * below p*2^384, so the Montgomery reduction yields a value below 2p and one conditional
+ * subtraction makes it canonical. Canonical residues are unique: the results equal the
+ * Karatsuba ones bit for bit. Lazily reduced values must not be passed in.
+ *
+ * The CSR order within each step keeps x10 or x11 unchanged between consecutive calls
+ * where it can, which saves the address moves.
+ */
+
+static const limb_t _bls_one[8] _BLS_ALIGN32 = { 1, 0, 0, 0, 0, 0, 0, 0 };
+/* The lift for a negative a0*b0 - a1*b1: p*m*2^256 with m = ceil(p/2^256), the multiple of p
+ * just above p^2 whose low 256 bits are zero, as its chunks 1 and 2 */
+static const limb_t _bls_lift1[8] _BLS_ALIGN32 = {
+    0x877be448, 0x2449cc23, 0x01ba3f46, 0xe26c7ad2,
+    0x42482cdb, 0x6592bbf3, 0xe9e333ea, 0xf913acb7
+};
+static const limb_t _bls_lift2[8] _BLS_ALIGN32 = {
+    0x7ff0c107, 0xf4a0f220, 0xa41018b0, 0xf2a919a4,
+    0xa22f25e9, 0x4bd278ea, 0xb8c35fc7, 0x02a437a4
+};
+
+/* Split a 384-bit value into lo = words 0..7 and hi = words 8..11, zero-padded. */
+static inline __attribute__((always_inline))
+void _bls_split384(limb_t lo[8], limb_t hi[8], const limb_t a[12])
+{
+    lo[0]=a[0]; lo[1]=a[1]; lo[2]=a[2]; lo[3]=a[3];
+    lo[4]=a[4]; lo[5]=a[5]; lo[6]=a[6]; lo[7]=a[7];
+    _bls_pad128(hi, a+8);
+}
+
+/*
+ * t0 + t1*2^256 + t2*2^512 = x*y for x = xl + xh*2^256 and y = yl + yh*2^256, xh and yh
+ * below 2^128, consuming xl, xh and yl: the last product of each is formed in place, which
+ * saves a copy, and t2 is formed in xl. The carries out of t1 go into t2 as ADD carry-ins;
+ * t2 itself cannot carry out since x*y < 2^768. s is scratch.
+ */
+static inline __attribute__((always_inline))
+void _bls_mul384(limb_t t0[8], limb_t t1[8], limb_t s[8],
+                 limb_t xl[8], limb_t xh[8], limb_t yl[8], const limb_t yh[8])
+{
+    limb_t k1, k2;
+
+    _bls_copy256(t0, xl);
+    _bls_copy256(t1, xl);
+    _bls_copy256(s, xl);
+    _bls_csr(s, yh, 0x08);                             /* lo(xl*yh) */
+    _bls_csr(xl, yh, 0x10);                            /* t2 = hi(xl*yh) */
+    _bls_csr(t0, yl, 0x08);                            /* lo(xl*yl) */
+    _bls_csr(t1, yl, 0x10);                            /* hi(xl*yl) */
+    k1 = _bls_csr(t1, s, 0x01);
+    _bls_copy256(s, xh);
+    _bls_csr(s, yl, 0x08);                             /* lo(xh*yl) */
+    k2 = _bls_csr(t1, s, 0x01);
+    _bls_csr(yl, xh, 0x10);                            /* hi(xh*yl) */
+    _bls_csr(xh, yh, 0x08);                            /* xh*yh */
+    _bls_csr(xl, yl, 0x01 | k1 << 6);
+    _bls_csr(xl, xh, 0x01 | k2 << 6);
+}
+
+/*
+ * t -= u for 768-bit values whose difference is known to be non-negative. SUB takes no
+ * borrow-in, so a chunk's borrow is a separate SUB of one; a chunk that borrowed is nonzero,
+ * so that SUB cannot borrow as well.
+ */
+static inline __attribute__((always_inline))
+void _bls_sub768(limb_t t0[8], limb_t t1[8], limb_t t2[8],
+                 const limb_t u0[8], const limb_t u1[8], const limb_t u2[8])
+{
+    limb_t b0, b1;
+
+    b0 = _bls_csr(t0, u0, 0x02);
+    b1 = _bls_csr(t1, u1, 0x02);
+    if (b0)
+        b1 |= _bls_csr(t1, _bls_one, 0x02);
+    _bls_csr(t2, u2, 0x02);
+    if (b1)
+        _bls_csr(t2, _bls_one, 0x02);
+}
+
+/* ret -= p, out of line: the reductions below rarely need it. */
+static __attribute__((noinline))
+void _bls_sub_p(limb_t ret[12])
+{
+    (void)_bls_sub384(ret, ret, _bls_P);
+}
+
+/*
+ * ret = t * 2^-384 mod p for t = t0 + t1*2^256 + t2*2^512 at most 4p^2, by two Montgomery
+ * rounds of 256 and 128 bits (n0 = -1/p mod 2^256). The quotient stays below 2p, so no
+ * chunk carries out and one subtraction of p makes it canonical. t0, t1, t2, s0 and s1
+ * are clobbered.
+ */
+static inline __attribute__((always_inline))
+void _bls_redc768(vec384 ret, limb_t t0[8], limb_t t1[8], limb_t t2[8],
+                  limb_t s0[8], limb_t s1[8])
+{
+    limb_t c, d;
+
+    /* Round 1: m1 = t0*n0 mod 2^256. t0 + lo(m1*p_lo) is 2^256 unless t0 is zero, so the
+     * carry into t1 is (t0 != 0), and the rest of (t + m1*p) / 2^256 is
+     * t1 + hi(m1*p_lo) + m1*p_hi + t2*2^256. */
+    c = t0[0] | t0[1];
+    if (c == 0)
+        c = t0[2] | t0[3] | t0[4] | t0[5] | t0[6] | t0[7];
+    c = c != 0;
+    _bls_csr(t0, _bls_np_lo, 0x08);                    /* m1 */
+    _bls_copy256(s0, t0);
+    _bls_copy256(s1, t0);
+    _bls_csr(s1, _bls_p_hi, 0x08);                     /* lo(m1*p_hi) */
+    _bls_csr(t0, _bls_p_hi, 0x10);                     /* hi(m1*p_hi) < 2^128 */
+    _bls_csr(s0, _bls_p_lo, 0x10);                     /* hi(m1*p_lo) */
+    c = _bls_csr(t1, s0, 0x01 | c << 6);
+    d = _bls_csr(t1, s1, 0x01);
+    _bls_csr(t2, t0, 0x01 | c << 6);
+    if (d)
+        _bls_csr(t2, _bls_one, 0x01);
+
+    /* Round 2: m2 = t1*n0 mod 2^128 clears the low 128 bits of t1. */
+    _bls_copy256(s0, t1);
+    _bls_csr(s0, _bls_np_lo, 0x08);
+    s0[4] = 0; s0[5] = 0; s0[6] = 0; s0[7] = 0;        /* m2 */
+    _bls_copy256(s1, s0);
+    _bls_copy256(t0, s0);
+    _bls_csr(t0, _bls_p_lo, 0x10);                     /* hi(m2*p_lo) < 2^128 */
+    _bls_csr(s1, _bls_p_lo, 0x08);                     /* lo(m2*p_lo) */
+    _bls_csr(s0, _bls_p_hi, 0x08);                     /* m2*p_hi < 2^256 */
+    c = _bls_csr(t1, s1, 0x01);
+    _bls_csr(t2, t0, 0x01 | c << 6);
+    _bls_csr(t2, s0, 0x01);
+
+    ret[0]  = t1[4];  ret[1]  = t1[5];  ret[2]  = t1[6];  ret[3]  = t1[7];
+    ret[4]  = t2[0];  ret[5]  = t2[1];  ret[6]  = t2[2];  ret[7]  = t2[3];
+    ret[8]  = t2[4];  ret[9]  = t2[5];  ret[10] = t2[6];  ret[11] = t2[7];
+    if (_bls_ge384(ret, _bls_P))
+        _bls_sub_p(ret);
+}
+
+__attribute__((noinline))
+void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
+                   const vec384 p, limb_t n0)
+{
+    limb_t a0l[8] _BLS_ALIGN32, a0h[8] _BLS_ALIGN32;
+    limb_t a1l[8] _BLS_ALIGN32, a1h[8] _BLS_ALIGN32;
+    limb_t b0l[8] _BLS_ALIGN32, b0h[8] _BLS_ALIGN32;
+    limb_t b1l[8] _BLS_ALIGN32, b1h[8] _BLS_ALIGN32;
+    limb_t sal[8] _BLS_ALIGN32, sah[8] _BLS_ALIGN32;
+    limb_t sbl[8] _BLS_ALIGN32, sbh[8] _BLS_ALIGN32;
+    limb_t r0[8] _BLS_ALIGN32, r1[8] _BLS_ALIGN32;
+    limb_t q0[8] _BLS_ALIGN32, q1[8] _BLS_ALIGN32;
+    limb_t k0[8] _BLS_ALIGN32, k1[8] _BLS_ALIGN32;
+    limb_t s[8] _BLS_ALIGN32;
+    limb_t borrow, c;
+
+    (void)p; (void)n0;
+
+    /* ret may alias a or b: all inputs are read before ret is written */
+    _bls_split384(a0l, a0h, a[0]);
+    _bls_split384(a1l, a1h, a[1]);
+    _bls_split384(b0l, b0h, b[0]);
+    _bls_split384(b1l, b1h, b[1]);
+
+    /* sa = a0 + a1 and sb = b0 + b1, each at most 2p */
+    _bls_copy256(sal, a0l);
+    c = _bls_csr(sal, a1l, 0x01);
+    _bls_copy256(sah, a0h);
+    _bls_csr(sah, a1h, 0x01 | c << 6);
+    _bls_copy256(sbl, b0l);
+    c = _bls_csr(sbl, b1l, 0x01);
+    _bls_copy256(sbh, b0h);
+    _bls_csr(sbh, b1h, 0x01 | c << 6);
+
+    /* k = sa*sb, r = a0*b0 and q = a1*b1; their top chunks form in sal, a0l and a1l */
+    _bls_mul384(k0, k1, s, sal, sah, sbl, sbh);
+    _bls_mul384(r0, r1, s, a0l, a0h, b0l, b0h);
+    _bls_mul384(q0, q1, s, a1l, a1h, b1l, b1h);
+
+    /* im = k - r - q = a0*b1 + a1*b0, below 2p^2 */
+    _bls_sub768(k0, k1, sal, r0, r1, a0l);
+    _bls_sub768(k0, k1, sal, q0, q1, a1l);
+
+    /* re = r - q, plus the lift when negative */
+    borrow = _bls_csr(r0, q0, 0x02);
+    c = _bls_csr(r1, q1, 0x02);
+    if (borrow)
+        c |= _bls_csr(r1, _bls_one, 0x02);
+    borrow = _bls_csr(a0l, a1l, 0x02);
+    if (c)
+        borrow |= _bls_csr(a0l, _bls_one, 0x02);
+    if (borrow) {                       /* modulo 2^768 */
+        c = _bls_csr(r1, _bls_lift1, 0x01);
+        _bls_csr(a0l, _bls_lift2, 0x01 | c << 6);
+    }
+
+    _bls_redc768(ret[0], r0, r1, a0l, s, b1h);
+    _bls_redc768(ret[1], k0, k1, sal, s, b1h);
+}
+
+__attribute__((noinline))
+void sqr_mont_384x(vec384x ret, const vec384x a, const vec384 p, limb_t n0)
+{
+    limb_t a0l[8] _BLS_ALIGN32, a0h[8] _BLS_ALIGN32, a1l[8] _BLS_ALIGN32;
+    limb_t uh[8] _BLS_ALIGN32, vl[8] _BLS_ALIGN32, vh[8] _BLS_ALIGN32;
+    limb_t wl[8] _BLS_ALIGN32, wh[8] _BLS_ALIGN32;
+    limb_t r0[8] _BLS_ALIGN32, r1[8] _BLS_ALIGN32;
+    limb_t q0[8] _BLS_ALIGN32, q1[8] _BLS_ALIGN32, s[8] _BLS_ALIGN32;
+    limb_t x0 = a[0][8], x1 = a[0][9], x2 = a[0][10], x3 = a[0][11];
+    limb_t y0 = a[1][8], y1 = a[1][9], y2 = a[1][10], y3 = a[1][11];
+    limb_t cu, cv, bv, cw;
+    llimb_t t;
+    long long d;
+
+    (void)p; (void)n0;
+
+    /* ret may alias a: all of a is read before ret is written */
+    _bls_split384(a0l, a0h, a[0]);
+    a1l[0]=a[1][0]; a1l[1]=a[1][1]; a1l[2]=a[1][2]; a1l[3]=a[1][3];
+    a1l[4]=a[1][4]; a1l[5]=a[1][5]; a1l[6]=a[1][6]; a1l[7]=a[1][7];
+
+    /* w = 2*a1, v = a0 - a1 + p and u = a0 + a1, each at most 2p: CSR on the low 256 bits
+     * (u in place of a1, last), software on the top 128 */
+    _bls_copy256(wl, a1l);
+    cw = _bls_csr(wl, a1l, 0x01);
+    _bls_copy256(vl, a0l);
+    bv = _bls_csr(vl, a1l, 0x02);
+    cv = _bls_csr(vl, _bls_p_lo, 0x01);
+    cu = _bls_csr(a1l, a0l, 0x01);
+
+    t = (llimb_t)x0 + y0 + cu;                 uh[0] = (limb_t)t;
+    t = (llimb_t)x1 + y1 + (t >> 32);          uh[1] = (limb_t)t;
+    t = (llimb_t)x2 + y2 + (t >> 32);          uh[2] = (limb_t)t;
+    uh[3] = x3 + y3 + (limb_t)(t >> 32);
+    uh[4] = 0; uh[5] = 0; uh[6] = 0; uh[7] = 0;
+
+    /* the low chunk passed on cv - bv, in [-1, 1] */
+    d = (long long)x0 - y0 + _bls_P[8] + cv - bv;      vh[0] = (limb_t)d;
+    d = (long long)x1 - y1 + _bls_P[9] + (d >> 32);    vh[1] = (limb_t)d;
+    d = (long long)x2 - y2 + _bls_P[10] + (d >> 32);   vh[2] = (limb_t)d;
+    vh[3] = x3 - y3 + _bls_P[11] + (limb_t)(d >> 32);
+    vh[4] = 0; vh[5] = 0; vh[6] = 0; vh[7] = 0;
+
+    wh[0] = y0 << 1 | cw;
+    wh[1] = y1 << 1 | y0 >> 31;
+    wh[2] = y2 << 1 | y1 >> 31;
+    wh[3] = y3 << 1 | y2 >> 31;
+    wh[4] = 0; wh[5] = 0; wh[6] = 0; wh[7] = 0;
+
+    /* re = u*v at most 4p^2 and im = a0*w at most 2p^2, consuming their factors; the top
+     * chunks form in a1l (u) and a0l */
+    _bls_mul384(r0, r1, s, a1l, uh, vl, vh);
+    _bls_mul384(q0, q1, s, a0l, a0h, wl, wh);
+
+    _bls_redc768(ret[0], r0, r1, a1l, s, vh);
+    _bls_redc768(ret[1], q0, q1, a0l, s, vh);
+}
+#else
+void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
                           const vec384 p, limb_t n0)
 {
     vec384 aa, bb, cc;
 
-#ifdef AIRBENDER_BIGINT_CSR
-    add_mod_384(aa, a[0], a[1], p);
-    add_mod_384(bb, b[0], b[1], p);
-    mul_mont_384(bb, bb, aa, p, n0);
-    mul_mont_384(aa, a[0], b[0], p, n0);
-    mul_mont_384(cc, a[1], b[1], p, n0);
-    sub_mod_384(ret[0], aa, cc, p);
-    sub_mod_384(ret[1], bb, aa, p);
-    sub_mod_384(ret[1], ret[1], cc, p);
-#else
     add_mod_n(aa, a[0], a[1], p, NLIMBS(384));
     add_mod_n(bb, b[0], b[1], p, NLIMBS(384));
     mul_mont_n(bb, bb, aa, p, n0, NLIMBS(384));
@@ -483,10 +746,10 @@ new_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x 
     sub_mod_n(ret[0], aa, cc, p, NLIMBS(384));
     sub_mod_n(ret[1], bb, aa, p, NLIMBS(384));
     sub_mod_n(ret[1], ret[1], cc, p, NLIMBS(384));
-#endif
-}"""
-src = src.replace(old_mul384x, new_mul384x, 1)
-print("Patched mul_mont_384x -> mul_mont_384 + add/sub_mod_384")
+}
+#endif"""
+src = replace_once(src, old_mul384x, new_mul384x)
+print("Patched mul_mont_384x and sqr_mont_384x with lazy reduction")
 
 # Patch sgn0_pty_mont_384: redirect from_mont_n -> from_mont_384
 old_sgn0_384 = """inline limb_t sgn0_pty_mont_384(const vec384 a, const vec384 p, limb_t n0)
@@ -509,7 +772,7 @@ new_sgn0_384 = """inline limb_t sgn0_pty_mont_384(const vec384 a, const vec384 p
 
     return sgn0_pty_mod_n(tmp, p, NLIMBS(384));
 }"""
-src = src.replace(old_sgn0_384, new_sgn0_384, 1)
+src = replace_once(src, old_sgn0_384, new_sgn0_384)
 print("Patched sgn0_pty_mont_384 -> from_mont_384")
 
 # Patch sgn0_pty_mont_384x: redirect from_mont_n -> from_mont_384
@@ -536,7 +799,7 @@ new_sgn0_384x = """inline limb_t sgn0_pty_mont_384x(const vec384x a, const vec38
 
     return sgn0_pty_mod_384x(tmp, p);
 }"""
-src = src.replace(old_sgn0_384x, new_sgn0_384x, 1)
+src = replace_once(src, old_sgn0_384x, new_sgn0_384x)
 print("Patched sgn0_pty_mont_384x -> from_mont_384")
 
 # Patch sqr_n_mul_mont_383: redirect mul_mont_nonred_n/mul_mont_n -> mul_mont_384
@@ -569,44 +832,18 @@ new_sqr_n_mul = """void sqr_n_mul_mont_383(vec384 ret, const vec384 a, size_t co
     mul_mont_n(ret, ret, b, p, n0, NLIMBS(384));
 #endif
 }"""
-src = src.replace(old_sqr_n_mul, new_sqr_n_mul, 1)
+src = replace_once(src, old_sqr_n_mul, new_sqr_n_mul)
 print("Patched sqr_n_mul_mont_383 -> mul_mont_384")
 
-# Patch sqr_mont_382x: redirect mul_mont_nonred_n -> mul_mont_384
-old_sqr_382x = """    /* "mul_mont_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));" */
-    mul_mont_nonred_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));
-
-    /* "add_mod_n(ret[1], ret[1], ret[1], p, NLIMBS(384));" */
-    for (carry=0, i=0; i<NLIMBS(384); i++) {
-        limb_t a_i = ret[1][i];
-        ret[1][i] = a_i<<1 | carry;
-        carry = a_i>>(LIMB_T_BITS-1);
-    }
-
-    /* "mul_mont_n(ret[0], t0, t1, p, n0, NLIMBS(384));" */
-    mul_mont_nonred_n(ret[0], t0, t1, p, n0, NLIMBS(384));"""
-new_sqr_382x = """    /* "mul_mont_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));" */
-#ifdef AIRBENDER_BIGINT_CSR
-    mul_mont_384(ret[1], a[0], a[1], p, n0);
-#else
-    mul_mont_nonred_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));
+# Keep vect.c's reference sqr_mont_384x out: the lazy-reduction one is defined with mul_mont_384x.
+old_sqr384x_ref = """#define sqr_mont_384x sqr_mont_384x
+"""
+new_sqr384x_ref = """#ifndef AIRBENDER_BIGINT_CSR
+#define sqr_mont_384x sqr_mont_384x
 #endif
-
-    /* "add_mod_n(ret[1], ret[1], ret[1], p, NLIMBS(384));" */
-    for (carry=0, i=0; i<NLIMBS(384); i++) {
-        limb_t a_i = ret[1][i];
-        ret[1][i] = a_i<<1 | carry;
-        carry = a_i>>(LIMB_T_BITS-1);
-    }
-
-    /* "mul_mont_n(ret[0], t0, t1, p, n0, NLIMBS(384));" */
-#ifdef AIRBENDER_BIGINT_CSR
-    mul_mont_384(ret[0], t0, t1, p, n0);
-#else
-    mul_mont_nonred_n(ret[0], t0, t1, p, n0, NLIMBS(384));
-#endif"""
-src = src.replace(old_sqr_382x, new_sqr_382x, 1)
-print("Patched sqr_mont_382x -> mul_mont_384")
+"""
+src = replace_once(src, old_sqr384x_ref, new_sqr384x_ref)
+print("Patched sqr_mont_384x -> lazy-reduction version")
 
 with open(path, 'w') as f:
     f.write(src)

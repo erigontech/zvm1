@@ -93,7 +93,12 @@ class State
     std::vector<JournalEntry> m_journal;
 
 public:
-    explicit State(const StateView& state_view) noexcept : m_initial{state_view} {}
+    explicit State(const StateView& state_view) noexcept : m_initial{state_view}
+    {
+        // Growing from empty moves every variant entry through a jump table at each doubling;
+        // the guest's bump allocator makes the up-front block nearly free.
+        m_journal.reserve(128);
+    }
     State(const State&) = delete;
     State(State&&) = delete;
     State& operator=(State&&) = delete;
@@ -133,6 +138,11 @@ public:
     bytes_view get_code(const address& addr);
 
     StorageValue& get_storage(const address& addr, const bytes32& key);
+
+    /// Fetches the value of a slot that access_storage() created without a fetch.
+    /// @p view_handle is Account::view_handle of the account @p addr.
+    void load_storage(
+        const address& addr, const void* view_handle, const bytes32& key, StorageValue& slot);
 
     StateDiff build_diff(evmc_revision rev) const;
 

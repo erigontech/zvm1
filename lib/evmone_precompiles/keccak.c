@@ -102,13 +102,13 @@ static inline __attribute__((always_inline)) void buf_zero_state_from(size_t off
         : [off] "r"(off), [b] "r"(buf));
 }
 
-/// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting buf[] in place.
+/// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting the 256-byte-aligned state s in place.
 /// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
 /// scans for exactly 649 contiguous csrrw instructions.
-static inline __attribute__((always_inline)) void keccak_permute_buf(void)
+static inline __attribute__((always_inline)) void keccak_permute_at(uint64_t* s)
 {
     register uint32_t ctrl __asm__("x10") = 0;
-    register void*    sptr __asm__("x11") = (void*)buf;
+    register void*    sptr __asm__("x11") = (void*)s;
     __asm__ __volatile__(
         ".rept 649\n"
         "  csrrw x0, 0x7CB, x0\n"
@@ -117,6 +117,13 @@ static inline __attribute__((always_inline)) void keccak_permute_buf(void)
         : "r"(sptr)
         : "memory"
     );
+}
+
+/// The same on buf[]. The delegation takes any 256-byte-aligned state in RAM, so the snapshot pool
+/// of ethash_keccak256_resume() is permuted in place by keccak_permute_at() too.
+static inline __attribute__((always_inline)) void keccak_permute_buf(void)
+{
+    keccak_permute_at(buf);
 }
 
 /// Keccak-f[1600] on any state. keccak() keeps its state in buf[] itself, so once inlined there
@@ -248,6 +255,122 @@ static inline ALWAYS_INLINE uint64_t load_le_any(const uint8_t* data)
     uint64_t word;
     __builtin_memcpy(&word, data, sizeof(word));
     return to_le64(word);
+}
+#endif
+
+#if defined(AIRBENDER)
+typedef uint32_t __attribute__((may_alias)) keccak_word32;
+
+/// The word holding the last 0-3 input bytes and the padding byte after them.
+static inline ALWAYS_INLINE uint32_t tail_word(const uint8_t* t, size_t r)
+{
+    if (r == 0)
+        return 1;
+    uint32_t w = (uint32_t)1 << (8 * r);
+    w |= t[0];
+    if (r >= 2)
+        w |= (uint32_t)t[1] << 8;
+    if (r == 3)
+        w |= (uint32_t)t[2] << 16;
+    return w;
+}
+
+/// XORs the last incomplete block (rem < 136 bytes, 4-aligned data) and the padding byte into s.
+static inline ALWAYS_INLINE void absorb_last_aligned(keccak_word32* s, const uint8_t* data, size_t rem)
+{
+    const keccak_word32* const d = (const keccak_word32*)data;
+    const size_t m = rem / 4;
+    switch (m)
+    {
+    case 33: s[32] ^= d[32]; /* fallthrough */
+    case 32: s[31] ^= d[31]; /* fallthrough */
+    case 31: s[30] ^= d[30]; /* fallthrough */
+    case 30: s[29] ^= d[29]; /* fallthrough */
+    case 29: s[28] ^= d[28]; /* fallthrough */
+    case 28: s[27] ^= d[27]; /* fallthrough */
+    case 27: s[26] ^= d[26]; /* fallthrough */
+    case 26: s[25] ^= d[25]; /* fallthrough */
+    case 25: s[24] ^= d[24]; /* fallthrough */
+    case 24: s[23] ^= d[23]; /* fallthrough */
+    case 23: s[22] ^= d[22]; /* fallthrough */
+    case 22: s[21] ^= d[21]; /* fallthrough */
+    case 21: s[20] ^= d[20]; /* fallthrough */
+    case 20: s[19] ^= d[19]; /* fallthrough */
+    case 19: s[18] ^= d[18]; /* fallthrough */
+    case 18: s[17] ^= d[17]; /* fallthrough */
+    case 17: s[16] ^= d[16]; /* fallthrough */
+    case 16: s[15] ^= d[15]; /* fallthrough */
+    case 15: s[14] ^= d[14]; /* fallthrough */
+    case 14: s[13] ^= d[13]; /* fallthrough */
+    case 13: s[12] ^= d[12]; /* fallthrough */
+    case 12: s[11] ^= d[11]; /* fallthrough */
+    case 11: s[10] ^= d[10]; /* fallthrough */
+    case 10: s[9] ^= d[9]; /* fallthrough */
+    case 9: s[8] ^= d[8]; /* fallthrough */
+    case 8: s[7] ^= d[7]; /* fallthrough */
+    case 7: s[6] ^= d[6]; /* fallthrough */
+    case 6: s[5] ^= d[5]; /* fallthrough */
+    case 5: s[4] ^= d[4]; /* fallthrough */
+    case 4: s[3] ^= d[3]; /* fallthrough */
+    case 3: s[2] ^= d[2]; /* fallthrough */
+    case 2: s[1] ^= d[1]; /* fallthrough */
+    case 1: s[0] ^= d[0]; /* fallthrough */
+    case 0:
+        break;
+    default:
+        __builtin_unreachable();
+    }
+    s[m] ^= tail_word(data + 4 * m, rem % 4);
+}
+
+/// Copies a short input (size < 136, 4-aligned data) with its padding byte into the zero state s.
+/// Returns the number of words written.
+static inline ALWAYS_INLINE size_t copy_short_aligned(keccak_word32* s, const uint8_t* data, size_t size)
+{
+    const keccak_word32* const d = (const keccak_word32*)data;
+    const size_t m = size / 4;
+    switch (m)
+    {
+    case 33: s[32] = d[32]; /* fallthrough */
+    case 32: s[31] = d[31]; /* fallthrough */
+    case 31: s[30] = d[30]; /* fallthrough */
+    case 30: s[29] = d[29]; /* fallthrough */
+    case 29: s[28] = d[28]; /* fallthrough */
+    case 28: s[27] = d[27]; /* fallthrough */
+    case 27: s[26] = d[26]; /* fallthrough */
+    case 26: s[25] = d[25]; /* fallthrough */
+    case 25: s[24] = d[24]; /* fallthrough */
+    case 24: s[23] = d[23]; /* fallthrough */
+    case 23: s[22] = d[22]; /* fallthrough */
+    case 22: s[21] = d[21]; /* fallthrough */
+    case 21: s[20] = d[20]; /* fallthrough */
+    case 20: s[19] = d[19]; /* fallthrough */
+    case 19: s[18] = d[18]; /* fallthrough */
+    case 18: s[17] = d[17]; /* fallthrough */
+    case 17: s[16] = d[16]; /* fallthrough */
+    case 16: s[15] = d[15]; /* fallthrough */
+    case 15: s[14] = d[14]; /* fallthrough */
+    case 14: s[13] = d[13]; /* fallthrough */
+    case 13: s[12] = d[12]; /* fallthrough */
+    case 12: s[11] = d[11]; /* fallthrough */
+    case 11: s[10] = d[10]; /* fallthrough */
+    case 10: s[9] = d[9]; /* fallthrough */
+    case 9: s[8] = d[8]; /* fallthrough */
+    case 8: s[7] = d[7]; /* fallthrough */
+    case 7: s[6] = d[6]; /* fallthrough */
+    case 6: s[5] = d[5]; /* fallthrough */
+    case 5: s[4] = d[4]; /* fallthrough */
+    case 4: s[3] = d[3]; /* fallthrough */
+    case 3: s[2] = d[2]; /* fallthrough */
+    case 2: s[1] = d[1]; /* fallthrough */
+    case 1: s[0] = d[0]; /* fallthrough */
+    case 0:
+        break;
+    default:
+        __builtin_unreachable();
+    }
+    s[m] = tail_word(data + 4 * m, size % 4);
+    return m + 1;
 }
 #endif
 
@@ -620,6 +743,14 @@ static inline ALWAYS_INLINE void absorb_input(
         size -= block_words * WORD_SIZE;
     }
 
+#if defined(AIRBENDER)
+    if (misalign == 0)
+    {
+        absorb_last_aligned((keccak_word32*)state, reader.data, size);
+        return;
+    }
+#endif
+
     const size_t last_words = size / WORD_SIZE;  // Whole words of the last, incomplete block.
     absorb_words(state, last_words, &reader);
     size %= WORD_SIZE;
@@ -716,6 +847,18 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
             // Fast path: copy full 4-byte words when data is 4-byte aligned.
             if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
             {
+                const size_t words = copy_short_aligned((keccak_word32*)buf, data, size);
+                buf_zero_state_from(4 * words);
+                buf[16] |= 0x8000000000000000ULL;
+                keccak_permute_buf();
+                hash.word64s[0] = to_le64(buf[0]);
+                hash.word64s[1] = to_le64(buf[1]);
+                hash.word64s[2] = to_le64(buf[2]);
+                hash.word64s[3] = to_le64(buf[3]);
+                return hash;
+            }
+            if (0)
+            {
                 const uint32_t* dW = (const uint32_t*)d;
                 size_t full_words = remaining / 4;
                 for (size_t j = 0; j < full_words; ++j)
@@ -766,6 +909,108 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
     }
 #endif
     keccak(hash.word64s, 256, data, size);
+    return hash;
+}
+
+/// Copies the 25 lanes of the state in buf[] to the pool slot. Word by word and unrolled: a loop
+/// GCC recognizes as a copy becomes a memcpy call, and the guest's memcpy is the BigInt delegation.
+#if defined(AIRBENDER)
+static inline ALWAYS_INLINE void save_buf_lanes(uint64_t* slot)
+{
+    const keccak_word32* const s = (const keccak_word32*)buf;
+    keccak_word32* const d = (keccak_word32*)slot;
+    size_t i;
+#pragma GCC unroll 50
+    for (i = 0; i < 2 * 25; ++i)
+        d[i] = s[i];
+}
+#endif
+
+union ethash_hash256 ethash_keccak256_snap(
+    const uint8_t* data, size_t size, size_t blocks, uint64_t* slot)
+{
+    union ethash_hash256 hash;
+    const size_t block_words = (1600 - 256 * 2) / 8 / WORD_SIZE;
+#if defined(AIRBENDER)
+    // keccak() with a copy of the state after every block, kept when it is the blocks-th. The state
+    // lives in buf[] as there: the snapshot is the only extra work.
+    {
+        const keccak_word32* const s = (const keccak_word32*)data;
+        keccak_word32* const d = (keccak_word32*)buf;
+        size_t i;
+#pragma GCC unroll 34
+        for (i = 0; i < 2 * block_words; ++i)
+            d[i] = s[i];
+#pragma GCC unroll 32
+        for (; i < 2 * 25; ++i)
+            d[i] = 0;
+    }
+    size_t done = 1;
+    for (;;)
+    {
+        keccak_permute_buf();
+        data += block_words * WORD_SIZE;
+        size -= block_words * WORD_SIZE;
+        if (done == blocks)
+            save_buf_lanes(slot);
+        if (size < block_words * WORD_SIZE)
+            break;
+        struct word_reader reader = {data, 0, 0};
+        absorb_words(buf, block_words, &reader);
+        ++done;
+    }
+    absorb_last_aligned((keccak_word32*)buf, data, size);
+    buf[block_words - 1] ^= 0x8000000000000000;
+    keccak_permute_buf();
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(buf[i]);
+#else
+    uint64_t state[25] = {0};
+    struct word_reader reader = {data, 0, 0};
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        absorb_words(state, block_words, &reader);
+        keccakf1600_best(state);
+    }
+    for (size_t i = 0; i < 25; ++i)
+        slot[i] = state[i];
+    absorb_input(state, block_words, reader.data, size - blocks * block_words * WORD_SIZE, 0);
+    state[block_words - 1] ^= 0x8000000000000000;
+    keccakf1600_best(state);
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(state[i]);
+#endif
+    return hash;
+}
+
+union ethash_hash256 ethash_keccak256_resume(
+    uint64_t* slot, size_t blocks, const uint8_t* data, size_t size)
+{
+    union ethash_hash256 hash;
+    const size_t block_words = (1600 - 256 * 2) / 8 / WORD_SIZE;
+    data += blocks * block_words * WORD_SIZE;
+    size -= blocks * block_words * WORD_SIZE;
+#if defined(AIRBENDER)
+    // The slot is permuted where it is, and consumed. Lanes 25..30 of it are the delegation's
+    // scratch and need no initialization (see buf_zero_state_from()).
+    while (size >= block_words * WORD_SIZE)
+    {
+        struct word_reader reader = {data, 0, 0};
+        absorb_words(slot, block_words, &reader);
+        keccak_permute_at(slot);
+        data += block_words * WORD_SIZE;
+        size -= block_words * WORD_SIZE;
+    }
+    absorb_last_aligned((keccak_word32*)slot, data, size);
+    slot[block_words - 1] ^= 0x8000000000000000;
+    keccak_permute_at(slot);
+#else
+    absorb_input(slot, block_words, data, size, 0);
+    slot[block_words - 1] ^= 0x8000000000000000;
+    keccakf1600_best(slot);
+#endif
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(slot[i]);
     return hash;
 }
 
@@ -832,11 +1077,21 @@ static NO_INLINE void keccak64_memo_fill(
     // byte, zeros, and the last block bit, which lane 16 holds alone.
     ethash_w32* const state = (ethash_w32*)buf;
     size_t i;
+    // The input is memory in the word layout: each word holds the big-endian number of its 4
+    // bytes, where the state takes them as the little-endian number. The key stays as it is, the
+    // hit path compares and indexes the words as they come. Byte copies take two instructions a
+    // byte; the barrier keeps GCC from merging them into shifts to swap, which take more.
     for (i = 0; i < 16; ++i)
     {
         const uint32_t w = data[i];
         slot->key[i] = w;
-        state[i] = w;
+        const uint8_t* b = (const uint8_t*)&data[i];
+        __asm__("" : "+r"(b));
+        uint8_t* const sb = (uint8_t*)&state[i];
+        sb[0] = b[3];
+        sb[1] = b[2];
+        sb[2] = b[1];
+        sb[3] = b[0];
     }
     state[16] = 0x01;
     // The offset is fixed here, so plain stores do without buf_zero_state_from()'s computed jump.
@@ -888,4 +1143,111 @@ NO_INLINE void ethash_keccak256_64_be(ethash_w32 out[8], const ethash_w32* data)
 miss:
     keccak64_memo_fill(out, data, slot);
 }
+#if defined(__riscv) && __riscv_xlen == 32
+/// The next word of the input from the non-determinism oracle (CSR 0x7C0), as the guest's reader
+/// takes it.
+static inline __attribute__((always_inline)) uint32_t read_input_word(void)
+{
+    uint32_t w;
+    __asm__ volatile("csrrw %0, 0x7C0, x0" : "=r"(w)::"memory");
+    return w;
+}
+
+/// Reads the ceil(@p size / 4) input words of a payload of @p size (more than 32) bytes into @p dst
+/// as they arrive and absorbs them into the state of its Keccak-256 hash on the way, so that the
+/// words are loaded once, not stored by the reader and loaded again by the hash. Returns 1 if the
+/// hash equals the 8 words at @p key, which the caller must have stored apart from @p dst.
+///
+/// The words reach @p dst whole, whatever follows the payload in its last word, but only the
+/// payload's bytes are absorbed: with those masked out, the unread bytes would let a key that
+/// hashes the payload extended by one to three of them pass for the payload's own.
+///
+/// Keeps the state in buf[] as ethash_keccak256() does, so it must not run inside a hash.
+NO_INLINE int ethash_keccak256_read_verify(ethash_w32* dst, size_t size, const ethash_w32* key)
+{
+    ethash_w32* const s = (ethash_w32*)buf;
+    size_t i;
+    size_t rem = size;
+    size_t m;
+    size_t r;
+    uint32_t pad;
+    if (rem >= 136)
+    {
+        // The state starts at zero: the first block is stored, not XORed in, and the rest of the
+        // state zeroed.
+#pragma GCC unroll 34
+        for (i = 0; i < 34; ++i)
+        {
+            const uint32_t w = read_input_word();
+            dst[i] = w;
+            s[i] = w;
+        }
+#pragma GCC unroll 16
+        for (; i < 50; ++i)
+            s[i] = 0;
+        keccak_permute_buf();
+        dst += 34;
+        rem -= 136;
+        while (rem >= 136)
+        {
+#pragma GCC unroll 34
+            for (i = 0; i < 34; ++i)
+            {
+                const uint32_t w = read_input_word();
+                dst[i] = w;
+                s[i] ^= w;
+            }
+            keccak_permute_buf();
+            dst += 34;
+            rem -= 136;
+        }
+        m = rem / 4;
+        r = rem % 4;
+        for (i = 0; i < m; ++i)
+        {
+            const uint32_t w = read_input_word();
+            dst[i] = w;
+            s[i] ^= w;
+        }
+        // The padding byte follows the payload's last byte, in the word that holds it.
+        pad = (uint32_t)1 << (8 * r);
+        if (r != 0)
+        {
+            const uint32_t w = read_input_word();
+            dst[m] = w;
+            pad |= w & (pad - 1);
+        }
+        s[m] ^= pad;
+        s[33] ^= 0x80000000u;
+    }
+    else
+    {
+        m = rem / 4;
+        r = rem % 4;
+        for (i = 0; i < m; ++i)
+        {
+            const uint32_t w = read_input_word();
+            dst[i] = w;
+            s[i] = w;
+        }
+        pad = (uint32_t)1 << (8 * r);
+        if (r != 0)
+        {
+            const uint32_t w = read_input_word();
+            dst[m] = w;
+            pad |= w & (pad - 1);
+        }
+        s[m] = pad;
+        buf_zero_state_from(4 * (m + 1));
+        s[33] |= 0x80000000u;
+    }
+    keccak_permute_buf();
+
+    uint32_t diff = 0;
+#pragma GCC unroll 8
+    for (i = 0; i < 8; ++i)
+        diff |= s[i] ^ key[i];
+    return diff == 0;
+}
+#endif
 #endif
