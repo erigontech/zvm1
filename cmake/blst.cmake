@@ -79,3 +79,29 @@ set_target_properties(
     IMPORTED_LOCATION ${SOURCE_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}blst${CMAKE_STATIC_LIBRARY_SUFFIX}
 )
 
+# Host builds compile upstream blst, so nothing else runs the code patch_blst_airbender.sh puts in:
+# patch a copy of the sources it touches and test it against a software model of the delegation.
+if(BUILD_TESTING AND NOT AIRBENDER AND NOT SP1 AND NOT CMAKE_CROSSCOMPILING
+        AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(BLST_TEST_DIR ${CMAKE_CURRENT_BINARY_DIR}/blst-airbender/src)
+    set(BLST_TEST_FILES vect.c vect.h bytes.h no_asm.h)
+    list(TRANSFORM BLST_TEST_FILES PREPEND ${SOURCE_DIR}/src/ OUTPUT_VARIABLE BLST_TEST_INPUTS)
+    list(TRANSFORM BLST_TEST_FILES PREPEND ${BLST_TEST_DIR}/)
+    add_custom_command(
+        OUTPUT ${BLST_TEST_FILES}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${BLST_TEST_DIR}
+        COMMAND ${CMAKE_COMMAND} -E copy ${BLST_TEST_INPUTS} ${BLST_TEST_DIR}
+        COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/patch_blst_airbender.sh
+        WORKING_DIRECTORY ${BLST_TEST_DIR}/..
+        DEPENDS blst ${CMAKE_CURRENT_LIST_DIR}/patch_blst_airbender.sh ${CMAKE_CURRENT_LIST_FILE}
+        COMMENT "Patching a copy of blst for blst_airbender_patch_test"
+        VERBATIM
+    )
+    add_executable(
+        blst_airbender_patch_test
+        ${CMAKE_CURRENT_LIST_DIR}/../test/blst/airbender_patch_test.c
+        ${BLST_TEST_DIR}/no_asm.h
+    )
+    target_include_directories(blst_airbender_patch_test PRIVATE ${BLST_TEST_DIR})
+    add_test(NAME blst_airbender_patch_test COMMAND blst_airbender_patch_test)
+endif()

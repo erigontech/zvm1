@@ -22,10 +22,13 @@ with open(path) as f:
     src = f.read()
 
 def replace_once(src, old, new):
-    # A target that a blst upgrade moved would otherwise leave the generic code in silently.
-    if old not in src:
-        sys.exit("ERR: patch target not found in no_asm.h: " + old.strip().splitlines()[0])
-    return src.replace(old, new, 1)
+    # A target that a blst upgrade moved or duplicated would otherwise leave generic code in
+    # silently.
+    n = src.count(old)
+    if n != 1:
+        sys.exit("ERR: patch target found %d times in no_asm.h, expected once: %s"
+                 % (n, old.strip().splitlines()[0]))
+    return src.replace(old, new)
 
 airbender_384 = r"""/* Airbender BigInt CSR (0x7CA) accelerated 384-bit Montgomery arithmetic.
  * AIRBENDER_BIGINT_CSR marker for idempotent patching.
@@ -41,6 +44,11 @@ airbender_384 = r"""/* Airbender BigInt CSR (0x7CA) accelerated 384-bit Montgome
 
 #define _BLS_ALIGN32 __attribute__((aligned(32)))
 
+#ifdef AIRBENDER_BIGINT_CSR_MODEL
+/* The native test (test/blst/airbender_patch_test.c) builds this code on the host and
+ * supplies a software model of the delegation. */
+limb_t _bls_csr(limb_t *mut, const limb_t *immut, limb_t mask);
+#else
 static inline __attribute__((always_inline))
 limb_t _bls_csr(limb_t *mut, const limb_t *immut, limb_t mask)
 {
@@ -51,6 +59,7 @@ limb_t _bls_csr(limb_t *mut, const limb_t *immut, limb_t mask)
                  : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
     return x12;
 }
+#endif
 
 /* Copy 256 bits (8 words) between aligned buffers using CSR MEMCOPY. */
 static inline __attribute__((always_inline))
@@ -475,13 +484,24 @@ new_mul384x = r"""#ifdef AIRBENDER_BIGINT_CSR
  * mul_mont_384 ends in its own reduction. So instead of Karatsuba over mul_mont_384
  * (3 multiplications, 2 additions, 3 subtractions), each output is formed as an
  * unreduced 768-bit value and reduced once:
- *     mul: re = a0*b0 - a1*b1 (+ about p^2 if negative)
+ *     mul: re = a0*b0 - a1*b1 (+ a multiple of about p^2 if negative)
  *          im = (a0 + a1)*(b0 + b1) - a0*b0 - a1*b1
- *     sqr: re = (a0 + a1)*(a0 - a1 + p), im = a0*(2*a1)
- * For inputs up to p (every blst Fp value is fully reduced) these are at most 4p^2, far
- * below p*2^384, so the Montgomery reduction yields a value below 2p and one conditional
- * subtraction makes it canonical. Canonical residues are unique: the results equal the
- * Karatsuba ones bit for bit. Lazily reduced values must not be passed in.
+ *     sqr: re = (a0 + a1)*v with v = a0 - a1 + p (+ p if negative), im = a0*(2*a1)
+ * Canonical residues are unique: the results equal the Karatsuba ones bit for bit.
+ *
+ * blst keeps every Fp value fully reduced, but like the Karatsuba multiply these accept
+ * coefficients up to 2p. For coefficients below 2p, with 2^256 < p and 8p < 0.82*2^384:
+ *   - a0 + a1, b0 + b1 and 2*a1 are below 4p < 2^383, so every factor is a 384-bit value
+ *     whose top chunk is below 2^128, and (a0 + a1)*(b0 + b1) < 16p^2 < 2^768;
+ *   - mul: im = a0*b1 + a1*b0 < 8p^2; re is in (-4p^2, 4p^2), and a negative re takes the
+ *     lift L, at least p^2 and below p^2 + p*2^256 < 2p^2, until it turns non-negative (once
+ *     for canonical inputs, at most four times), which leaves it below L;
+ *   - sqr: v is in (-p, 3p) and negative only for a1 above a0 + p (so a0 < p), when v + p
+ *     is in (0, p); u = a0 + a1 times v is at most ((u + v)/2)^2 = (a0 + p/2)^2 < 6.25p^2,
+ *     or (a0 + p)^2 < 4p^2 with v + p; im = 2*a0*a1 < 8p^2.
+ * So every reduced value t is below 8p^2 < p*2^384: the Montgomery quotient
+ * (t + m*p)/2^384 with m < 2^384 is below t/2^384 + p < 2p, and one conditional subtraction
+ * makes it canonical.
  *
  * The CSR order within each step keeps x10 or x11 unchanged between consecutive calls
  * where it can, which saves the address moves.
@@ -489,7 +509,9 @@ new_mul384x = r"""#ifdef AIRBENDER_BIGINT_CSR
 
 static const limb_t _bls_one[8] _BLS_ALIGN32 = { 1, 0, 0, 0, 0, 0, 0, 0 };
 /* The lift for a negative a0*b0 - a1*b1: p*m*2^256 with m = ceil(p/2^256), the multiple of p
- * just above p^2 whose low 256 bits are zero, as its chunks 1 and 2 */
+ * just above p^2 whose low 256 bits are zero, as its chunks 1 and 2. A larger lift would
+ * cover coefficients up to 2p in one addition, but it would also raise the reduced values of
+ * canonical inputs and so how often the final subtraction runs. */
 static const limb_t _bls_lift1[8] _BLS_ALIGN32 = {
     0x877be448, 0x2449cc23, 0x01ba3f46, 0xe26c7ad2,
     0x42482cdb, 0x6592bbf3, 0xe9e333ea, 0xf913acb7
@@ -565,10 +587,10 @@ void _bls_sub_p(limb_t ret[12])
 }
 
 /*
- * ret = t * 2^-384 mod p for t = t0 + t1*2^256 + t2*2^512 at most 4p^2, by two Montgomery
- * rounds of 256 and 128 bits (n0 = -1/p mod 2^256). The quotient stays below 2p, so no
- * chunk carries out and one subtraction of p makes it canonical. t0, t1, t2, s0 and s1
- * are clobbered.
+ * ret = t * 2^-384 mod p for t = t0 + t1*2^256 + t2*2^512 below p*2^384, by two Montgomery
+ * rounds of 256 and 128 bits (n0 = -1/p mod 2^256). The quotients stay below
+ * t/2^256 + p < 2^512 and t/2^384 + p < 2p, so no chunk carries out and one subtraction
+ * of p makes it canonical. t0, t1, t2, s0 and s1 are clobbered.
  */
 static inline __attribute__((always_inline))
 void _bls_redc768(vec384 ret, limb_t t0[8], limb_t t1[8], limb_t t2[8],
@@ -639,7 +661,7 @@ void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
     _bls_split384(b0l, b0h, b[0]);
     _bls_split384(b1l, b1h, b[1]);
 
-    /* sa = a0 + a1 and sb = b0 + b1, each at most 2p */
+    /* sa = a0 + a1 and sb = b0 + b1, each below 4p */
     _bls_copy256(sal, a0l);
     c = _bls_csr(sal, a1l, 0x01);
     _bls_copy256(sah, a0h);
@@ -654,11 +676,11 @@ void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
     _bls_mul384(r0, r1, s, a0l, a0h, b0l, b0h);
     _bls_mul384(q0, q1, s, a1l, a1h, b1l, b1h);
 
-    /* im = k - r - q = a0*b1 + a1*b0, below 2p^2 */
+    /* im = k - r - q = a0*b1 + a1*b0, below 8p^2 */
     _bls_sub768(k0, k1, sal, r0, r1, a0l);
     _bls_sub768(k0, k1, sal, q0, q1, a1l);
 
-    /* re = r - q, plus the lift when negative */
+    /* re = r - q, plus the lift while negative */
     borrow = _bls_csr(r0, q0, 0x02);
     c = _bls_csr(r1, q1, 0x02);
     if (borrow)
@@ -666,9 +688,11 @@ void mul_mont_384x(vec384x ret, const vec384x a, const vec384x b,
     borrow = _bls_csr(a0l, a1l, 0x02);
     if (c)
         borrow |= _bls_csr(a0l, _bls_one, 0x02);
-    if (borrow) {                       /* modulo 2^768 */
-        c = _bls_csr(r1, _bls_lift1, 0x01);
-        _bls_csr(a0l, _bls_lift2, 0x01 | c << 6);
+    if (borrow) {                       /* modulo 2^768, until the sum carries out */
+        do {
+            c = _bls_csr(r1, _bls_lift1, 0x01);
+            c = _bls_csr(a0l, _bls_lift2, 0x01 | c << 6);
+        } while (c == 0);
     }
 
     _bls_redc768(ret[0], r0, r1, a0l, s, b1h);
@@ -696,8 +720,8 @@ void sqr_mont_384x(vec384x ret, const vec384x a, const vec384 p, limb_t n0)
     a1l[0]=a[1][0]; a1l[1]=a[1][1]; a1l[2]=a[1][2]; a1l[3]=a[1][3];
     a1l[4]=a[1][4]; a1l[5]=a[1][5]; a1l[6]=a[1][6]; a1l[7]=a[1][7];
 
-    /* w = 2*a1, v = a0 - a1 + p and u = a0 + a1, each at most 2p: CSR on the low 256 bits
-     * (u in place of a1, last), software on the top 128 */
+    /* w = 2*a1, v = a0 - a1 + p and u = a0 + a1, each below 4p and v above -p: CSR on the
+     * low 256 bits (u in place of a1, last), software on the top 128 */
     _bls_copy256(wl, a1l);
     cw = _bls_csr(wl, a1l, 0x01);
     _bls_copy256(vl, a0l);
@@ -718,14 +742,21 @@ void sqr_mont_384x(vec384x ret, const vec384x a, const vec384 p, limb_t n0)
     vh[3] = x3 - y3 + _bls_P[11] + (limb_t)(d >> 32);
     vh[4] = 0; vh[5] = 0; vh[6] = 0; vh[7] = 0;
 
+    /* v is negative (|v| < 2^383, so bit 383 is its sign) only for a1 above a0 + p: add p */
+    if (vh[3] >> 31) {
+        cv = _bls_csr(vl, _bls_p_lo, 0x01);
+        _bls_csr(vh, _bls_p_hi, 0x01 | cv << 6);
+        vh[4] = 0;                      /* the carry out of the top 128 bits */
+    }
+
     wh[0] = y0 << 1 | cw;
     wh[1] = y1 << 1 | y0 >> 31;
     wh[2] = y2 << 1 | y1 >> 31;
     wh[3] = y3 << 1 | y2 >> 31;
     wh[4] = 0; wh[5] = 0; wh[6] = 0; wh[7] = 0;
 
-    /* re = u*v at most 4p^2 and im = a0*w at most 2p^2, consuming their factors; the top
-     * chunks form in a1l (u) and a0l */
+    /* re = u*v and im = a0*w, both below 8p^2, consuming their factors; the top chunks form
+     * in a1l (u) and a0l */
     _bls_mul384(r0, r1, s, a1l, uh, vl, vh);
     _bls_mul384(q0, q1, s, a0l, a0h, wl, wh);
 
