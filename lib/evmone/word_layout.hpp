@@ -48,6 +48,16 @@ using word_t = uint32_t __attribute__((may_alias));
 
 [[nodiscard]] inline constexpr size_t round_up4(size_t n) noexcept { return (n + 3) & ~size_t{3}; }
 
+#ifdef EVMONE_RV32_DISPATCH_TEST
+/// What the conversions cost, counted in the native test build only: its tests bound it by the
+/// gas a program pays.
+struct Usage
+{
+    uint64_t converted = 0;  ///< Bytes copied from W data into byte order.
+};
+inline Usage usage;
+#endif
+
 /// The byte at logical address p + i.
 [[nodiscard]] inline uint8_t* at(const uint8_t* p, size_t i) noexcept
 {
@@ -206,6 +216,9 @@ inline void copy_b2w(uint8_t* d, const uint8_t* s, size_t n) noexcept
 /// Copies @p n bytes from the W pointer s to the byte-order buffer d.
 inline void copy_w2b(uint8_t* d, const uint8_t* s, size_t n) noexcept
 {
+#ifdef EVMONE_RV32_DISPATCH_TEST
+    usage.converted += n;
+#endif
     size_t i = 0;
     for (; i < n && !is_aligned4(s + i); ++i)
         d[i] = *at(s, i);
@@ -350,7 +363,8 @@ public:
 };
 
 /// A buffer of @p n bytes that the hash, the precompiles and the code copy share: they use it only
-/// within one call that does not run the EVM, so no use is open when the next starts. It starts
+/// within one call that does not run the EVM, so no use is open when the next starts. A larger
+/// request keeps the contents of a smaller one in the same call. It starts
 /// @p Offset bytes after an 8-byte boundary. The hash wants the boundary (it reads 64-bit lanes);
 /// the precompiles take an offset of 4, which is no multiple of 32: the copies they make from
 /// their input then take the word path, not the BigInt MEMCOPY that a source aligned to 32 bytes
@@ -370,8 +384,11 @@ template <size_t Offset = 0>
 #endif
     if (n + Offset > capacity)
     {
+        // The contents are kept: MODEXP's input grows once its first bytes are in.
+        auto* const grown = new uint8_t[n + Offset];
+        std::copy_n(storage, capacity, grown);
         delete[] storage;
-        storage = new uint8_t[n + Offset];
+        storage = grown;
         capacity = n + Offset;
     }
     return storage + Offset;

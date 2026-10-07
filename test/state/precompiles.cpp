@@ -113,16 +113,22 @@ PrecompileAnalysis blake2bf_analyze(bytes_view input, evmc_revision) noexcept
     return {input.size() == 213 ? intx::be::unsafe::load<uint32_t>(input.data()) : GasCostMax, 64};
 }
 
-PrecompileAnalysis expmod_analyze(bytes_view input, evmc_revision rev) noexcept
+namespace
+{
+/// The analysis of MODEXP for an input of @p input_size bytes, of which it reads the header and
+/// the head of the exponent through @p read: read(offset, n) is a view of the n bytes of the input
+/// at offset, all of which exist.
+template <typename Read>
+PrecompileAnalysis expmod_analyze_impl(size_t input_size, Read read, evmc_revision rev) noexcept
 {
     using namespace intx;
 
-    const auto calc_adjusted_exp_len = [input, rev](size_t offset, uint32_t len) noexcept {
+    const auto calc_adjusted_exp_len = [input_size, &read, rev](
+                                           size_t offset, uint32_t len) noexcept {
         const auto head_len = std::min(size_t{len}, size_t{32});
         const auto head_explicit_bytes =
-            offset < input.size() ?
-                input.substr(offset, std::min(head_len, input.size() - offset)) :
-                bytes_view{};
+            offset < input_size ? read(offset, std::min(head_len, input_size - offset)) :
+                                  bytes_view{};
 
         const auto top_byte_index = head_explicit_bytes.find_first_not_of(uint8_t{0});
         const auto exp_bit_width =
@@ -175,8 +181,7 @@ PrecompileAnalysis expmod_analyze(bytes_view input, evmc_revision rev) noexcept
 
     static constexpr size_t INPUT_HEADER_REQUIRED_SIZE = 3 * sizeof(uint256);
     uint8_t input_header[INPUT_HEADER_REQUIRED_SIZE]{};
-    // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
-    std::copy_n(input.data(), std::min(input.size(), INPUT_HEADER_REQUIRED_SIZE), input_header);
+    std::ranges::copy(read(0, std::min(input_size, INPUT_HEADER_REQUIRED_SIZE)), input_header);
 
     const auto base_len256 = be::unsafe::load<uint256>(&input_header[0]);
     const auto exp_len256 = be::unsafe::load<uint256>(&input_header[32]);
@@ -206,6 +211,14 @@ PrecompileAnalysis expmod_analyze(bytes_view input, evmc_revision rev) noexcept
     const auto gas = umul(calc_mult_complexity(max_len), adjusted_exp_len) / final_divisor;
     const auto gas_clamped = std::clamp<uint128>(gas, min_gas, GasCostMax);
     return {static_cast<int64_t>(gas_clamped), mod_len};
+}
+}  // namespace
+
+PrecompileAnalysis expmod_analyze(bytes_view input, evmc_revision rev) noexcept
+{
+    return expmod_analyze_impl(
+        input.size(),
+        [input](size_t offset, size_t n) noexcept { return input.substr(offset, n); }, rev);
 }
 
 PrecompileAnalysis point_evaluation_analyze(bytes_view, evmc_revision) noexcept
@@ -932,6 +945,121 @@ PrecompileLookupIndex to_lookup_index(const evmc::address& addr) noexcept
     return static_cast<PrecompileLookupIndex>(
         (addr.bytes[ADDRESS_SIZE - 2] << 8) | addr.bytes[ADDRESS_SIZE - 1]);
 }
+
+#ifdef EVMONE_WORD_LAYOUT
+constexpr PrecompileLookupIndex EXPMOD_INDEX = 0x05;
+constexpr PrecompileLookupIndex BLAKE2BF_INDEX = 0x09;
+
+/// The input of a call from an EVM frame is a W pointer into the frame's memory, and precompiles
+/// read bytes: the input is converted, but only as far as the precompile reads it. The memory is
+/// paid for once and most precompiles cost the same for any input size, so converting the rest
+/// would make each call as expensive as its input is long, for the same gas.
+///
+/// The number of bytes at the start of an input of @p input_size bytes that the precompile at
+/// @p index gets as its input (MODEXP: see analyze_word_input()). They give the result of
+/// the whole input: ecrecover, ecadd and ecmul read a prefix of fixed size and pad a shorter input
+/// with zeros, and a precompile of one input size fails any other size, the empty input included,
+/// before it reads a byte. The others read all of their input and are priced by its size.
+size_t word_input_read_size(PrecompileLookupIndex index, size_t input_size) noexcept
+{
+    const auto exactly = [input_size](size_t size) noexcept {
+        return input_size == size ? size : 0;
+    };
+    switch (index)
+    {
+    case 0x01:  // ecrecover
+    case 0x06:  // ecadd
+        return std::min(input_size, size_t{128});
+    case 0x07:  // ecmul
+        return std::min(input_size, size_t{96});
+    case BLAKE2BF_INDEX:
+        return exactly(213);
+    case 0x0a:  // point_evaluation
+        return exactly(192);
+    case 0x0b:  // bls12_g1add
+        return exactly(2 * BLS12_G1_POINT_SIZE);
+    case 0x0d:  // bls12_g2add
+        return exactly(2 * BLS12_G2_POINT_SIZE);
+    case 0x10:  // bls12_map_fp_to_g1
+        return exactly(BLS12_FIELD_ELEMENT_SIZE);
+    case 0x11:  // bls12_map_fp2_to_g2
+        return exactly(2 * BLS12_FIELD_ELEMENT_SIZE);
+    case 0x0100:  // p256verify
+        return exactly(160);
+    default:
+        return input_size;
+    }
+}
+
+/// What call_precompile() needs of an input at a W pointer: the analysis, and the bytes that the
+/// precompile gets if the call can pay for them, which are converted only then, but for the few
+/// that MODEXP and BLAKE2F price the call by. Out of line, to keep the host's call path small.
+struct WordInput
+{
+    PrecompileAnalysis analysis;
+    bytes_view input;
+};
+
+[[gnu::noinline]] WordInput analyze_word_input(PrecompileLookupIndex index,
+    PrecompileAnalysis (*analyze)(bytes_view, evmc_revision) noexcept, const evmc_message& msg,
+    evmc_revision rev) noexcept
+{
+    const auto* const p = msg.input_data;
+    const auto size = msg.input_size;
+    if (index == EXPMOD_INDEX)
+    {
+        // The analysis reads the header and at most 32 bytes of the exponent. A prefix with the
+        // header, a base of up to 64 bytes and the head of the exponent, all of a common input,
+        // is converted at once, the rest of what the precompile reads once the call can pay.
+        static constexpr size_t HEADER_SIZE = 96;
+        static constexpr size_t PREFIX_SIZE = HEADER_SIZE + 64 + 32;
+        const auto prefix_size = std::min(size, PREFIX_SIZE);
+        auto* buffer = wl::scratch<4>(prefix_size);
+        wl::copy_w2b(buffer, p, prefix_size);
+        uint8_t head[32];
+        const auto analysis = expmod_analyze_impl(
+            size,
+            [&](size_t offset, size_t n) noexcept {
+                if (n <= prefix_size && offset <= prefix_size - n)
+                    return bytes_view{buffer + offset, n};
+                wl::copy_w2b(head, p + offset, n);
+                return bytes_view{head, n};
+            },
+            rev);
+        if (msg.gas < analysis.gas_cost)
+            return {analysis, {}};
+
+        // expmod_parse_input() reads nothing past the modulus, and nothing past the header when the
+        // modulus is empty, where the header alone gives the same empty output (as a short input).
+        // The base and exponent lengths are what it reads of them: their low 32 bits.
+        size_t read_size = std::min(size, HEADER_SIZE);
+        if (size > HEADER_SIZE && analysis.max_output_size != 0)
+        {
+            const size_t mod_off = intx::be::unsafe::load<uint32_t>(&buffer[28]) +
+                                   intx::be::unsafe::load<uint32_t>(&buffer[60]);
+            const size_t payload_max_size = mod_off + analysis.max_output_size;
+            read_size = HEADER_SIZE + std::min(size - HEADER_SIZE, payload_max_size);
+        }
+        if (read_size > prefix_size)
+        {
+            buffer = wl::scratch<4>(read_size);
+            wl::copy_w2b(buffer + prefix_size, p + prefix_size, read_size - prefix_size);
+        }
+        return {analysis, {buffer, read_size}};
+    }
+
+    const auto read_size = word_input_read_size(index, size);
+    if (index == BLAKE2BF_INDEX)  // Priced by its first 4 bytes, of 213 or none.
+    {
+        const bytes_view input{wl::scratch_copy<4>(p, read_size), read_size};
+        return {analyze(input, rev), input};
+    }
+    const auto analysis = analyze({p, size}, rev);  // The others read only the size of the input.
+    if (msg.gas < analysis.gas_cost)
+        return {analysis, {}};
+    return {analysis, {wl::scratch_copy<4>(p, read_size), read_size}};
+}
+#endif
 }  // namespace
 
 bool is_precompile(evmc_revision rev, const evmc::address& addr) noexcept
@@ -966,31 +1094,24 @@ evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcep
 
     assert(msg.gas >= 0);
 
-    const auto [analyze, execute] = EXECUTION_LOOKUP_TABLE[to_lookup_index(msg.code_address)];
+    const auto index = to_lookup_index(msg.code_address);
+    const auto [analyze, execute] = EXECUTION_LOOKUP_TABLE[index];
 
 #ifdef EVMONE_WORD_LAYOUT
     // The input of a call from an EVM frame is a W pointer into its memory; the precompile reads
-    // bytes, and the output goes back as W data if the frame asked for it. Only MODEXP and
-    // BLAKE2F read the input to price the call, the others its size: the input is converted
-    // first for those two, and for the rest once the call can pay, so that a call that runs out
-    // of gas costs no more than it did (a test makes 50000 of them with 50000 bytes of input).
-    const bool word_input = (msg.flags & wl::FLAG_WORD_INPUT) != 0;
-    const bool analysis_reads_input = analyze == expmod_analyze || analyze == blake2bf_analyze;
-    bytes_view input{word_input && analysis_reads_input ?
-                         wl::scratch_copy<4>(msg.input_data, msg.input_size) :
-                         msg.input_data,
-        msg.input_size};
+    // bytes, and the output goes back as W data if the frame asked for it.
+    const bytes_view msg_input{msg.input_data, msg.input_size};
+    const auto [analysis, input] = (msg.flags & wl::FLAG_WORD_INPUT) != 0 ?
+                                       analyze_word_input(index, analyze, msg, rev) :
+                                       WordInput{analyze(msg_input, rev), msg_input};
+    const auto [gas_cost, max_output_size] = analysis;
 #else
     const bytes_view input{msg.input_data, msg.input_size};
-#endif
     const auto [gas_cost, max_output_size] = analyze(input, rev);
+#endif
     const auto gas_left = msg.gas - gas_cost;
     if (gas_left < 0)
         return evmc::Result{EVMC_OUT_OF_GAS, {.left = msg.state_gas}};
-#ifdef EVMONE_WORD_LAYOUT
-    if (word_input && !analysis_reads_input)
-        input = {wl::scratch_copy<4>(msg.input_data, msg.input_size), msg.input_size};
-#endif
 
     // Allocate buffer for the precompile's output and pass its ownership to evmc::Result.
     // TODO: This can be done more elegantly by providing constructor evmc::Result(std::unique_ptr).
