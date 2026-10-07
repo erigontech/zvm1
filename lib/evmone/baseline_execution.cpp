@@ -244,7 +244,7 @@ struct Position
 /// x != 0, word 0 first. A non-zero branch condition nearly always has a non-zero low word (a
 /// comparison result, a flag, a count or an address), so the other 7 words are read only when it is
 /// zero.
-[[gnu::always_inline]] inline bool nonzero256(const uint32_t* x) noexcept
+[[gnu::always_inline]] inline bool nonzero256(const word32* x) noexcept
 {
     if (x[0] != 0) [[likely]]
         return true;
@@ -253,7 +253,7 @@ struct Position
 
 /// x == 0, word 0 first, as nonzero256(). No branch hint: ISZERO's operand is zero more often than
 /// not, and a hint would move the jump, the common outcome, out of line.
-[[gnu::always_inline]] inline bool zero256(const uint32_t* x) noexcept
+[[gnu::always_inline]] inline bool zero256(const word32* x) noexcept
 {
     if (x[0] != 0)
         return false;
@@ -261,7 +261,7 @@ struct Position
 }
 
 /// a == b, word 0 first: values that differ nearly always differ in their low words.
-[[gnu::always_inline]] inline bool eq256(const uint32_t* a, const uint32_t* b) noexcept
+[[gnu::always_inline]] inline bool eq256(const word32* a, const word32* b) noexcept
 {
     if (a[0] != b[0])
         return false;
@@ -271,7 +271,7 @@ struct Position
 
 /// w == sel for a 32-bit sel, word 0 first: a function dispatcher compares one selector against
 /// many, so the low word nearly always decides.
-[[gnu::always_inline]] inline bool eq256_u32(const uint32_t* w, uint32_t sel) noexcept
+[[gnu::always_inline]] inline bool eq256_u32(const word32* w, uint32_t sel) noexcept
 {
     if (w[0] != sel) [[likely]]
         return false;
@@ -319,7 +319,7 @@ struct Position
     pos.stack_end -= 1;  // One pushed, two popped.
     asm("" : "+r"(pos.stack_end));  // Address the popped words from the new stack_end only.
     // The condition is the popped top item, under the pushed destination.
-    const bool taken = nonzero256(reinterpret_cast<const uint32_t*>(pos.stack_end));
+    const bool taken = nonzero256(reinterpret_cast<const word32*>(pos.stack_end));
     if (taken)
     {
         auto dst = static_cast<uint32_t>(pos.code_it[1]);
@@ -366,13 +366,13 @@ template <Opcode Op>
     }
     if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 10)))
         return fail(EVMC_OUT_OF_GAS);
-    const auto* const a = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const word32* const a = reinterpret_cast<const word32*>(pos.stack_end - 1);
     bool taken;
     if constexpr (Op == OP_ISZERO)
         taken = (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) == 0;
     else
     {
-        const auto* const b = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+        const word32* const b = reinterpret_cast<const word32*>(pos.stack_end - 2);
         taken = ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) | (a[4] ^ b[4]) |
                     (a[5] ^ b[5]) | (a[6] ^ b[6]) | (a[7] ^ b[7])) == 0;
     }
@@ -424,12 +424,12 @@ template <Opcode Op>
     pos.stack_end -= required;  // The comparison leaves one, PUSH2 one more, JUMPI takes two.
     asm("" : "+r"(pos.stack_end));  // Address the popped words from the new stack_end only.
     // The operands are the popped items: the top one a and, for EQ, b under it.
-    const auto* const a = reinterpret_cast<const uint32_t*>(pos.stack_end + (required - 1));
+    const word32* const a = reinterpret_cast<const word32*>(pos.stack_end + (required - 1));
     bool taken;
     if constexpr (Op == OP_ISZERO)
         taken = zero256(a);
     else
-        taken = eq256(a, reinterpret_cast<const uint32_t*>(pos.stack_end));
+        taken = eq256(a, reinterpret_cast<const word32*>(pos.stack_end));
     if (taken)
     {
         auto dst = static_cast<uint32_t>(pos.code_it[2]);
@@ -484,7 +484,7 @@ template <Opcode Op>
     sel = sel << 8 | c[4];
     asm("" : "+r"(sel));
     sel = sel << 8 | c[5];
-    const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const word32* const w = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const bool taken =
         ((w[0] ^ sel) | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
     if (taken)
@@ -532,7 +532,7 @@ template <Opcode Op>
     sel = sel << 8 | c[4];
     asm("" : "+r"(sel));
     sel = sel << 8 | c[5];
-    const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const word32* const w = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const bool taken = eq256_u32(w, sel);
     if (taken)
     {
@@ -553,7 +553,7 @@ template <Opcode Op>
 }
 
 /// a < b on the 32-bit words of two 256-bit values, most significant word first.
-[[gnu::always_inline]] inline bool lt256(const uint32_t* a, const uint32_t* b) noexcept
+[[gnu::always_inline]] inline bool lt256(const word32* a, const word32* b) noexcept
 {
 #pragma GCC unroll 8
     for (int i = 7; i > 0; --i)
@@ -586,8 +586,8 @@ template <Opcode Op>
         return fail(EVMC_OUT_OF_GAS);
     if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 3 + 10)))
         return fail(EVMC_OUT_OF_GAS);
-    const auto* const top = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
-    const auto* const second = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+    const word32* const top = reinterpret_cast<const word32*>(pos.stack_end - 1);
+    const word32* const second = reinterpret_cast<const word32*>(pos.stack_end - 2);
     // LT leaves top < second, GT leaves second < top; ISZERO inverts; JUMPI jumps on non-zero.
     const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
     pos.stack_end -= 2;  // The comparison leaves one of two, PUSH2 one more, JUMPI takes two.
@@ -624,8 +624,8 @@ template <Opcode Op>
     };
     if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + 1))
         return fail(EVMC_STACK_UNDERFLOW);
-    const auto* const top = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
-    const auto* const second = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+    const word32* const top = reinterpret_cast<const word32*>(pos.stack_end - 1);
+    const word32* const second = reinterpret_cast<const word32*>(pos.stack_end - 2);
     const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
     pos.stack_end -= 2;
     if (taken)
@@ -683,7 +683,7 @@ template <Opcode Op, bool TracingEnabled>
         // JUMP 8 and the landing JUMPDEST 1.
         if (charge_all(gas, 8 + 1)) [[likely]]
         {
-            const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+            const word32* const w = reinterpret_cast<const word32*>(pos.stack_end - 1);
             const uint32_t dst = w[0];
             const auto& analysis = *state.analysis.baseline;
             if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||
@@ -816,7 +816,7 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// The push itself: the immediate is the byte before the successor.
 [[gnu::always_inline]] inline void push1_commit(Position& pos) noexcept
 {
-    auto* const w = reinterpret_cast<uint32_t*>(pos.stack_end);
+    word32* const w = reinterpret_cast<word32*>(pos.stack_end);
     w[0] = pos.code_it[-1];
     w[1] = 0;
     w[2] = 0;
@@ -838,7 +838,7 @@ constexpr bool push1_fuses(Opcode op) noexcept
 /// word down, so every source word is read before it is overwritten. (v >> 1) >> rs is
 /// v >> (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
 template <unsigned WS, unsigned I>
-[[gnu::always_inline]] inline void shl_word(uint32_t* x, unsigned bs, unsigned rs) noexcept
+[[gnu::always_inline]] inline void shl_word(word32* x, unsigned bs, unsigned rs) noexcept
 {
     if constexpr (I < WS)
         x[I] = 0;
@@ -849,7 +849,7 @@ template <unsigned WS, unsigned I>
 }
 
 template <unsigned WS>
-[[gnu::always_inline]] inline void shl_words(uint32_t* x, unsigned bs) noexcept
+[[gnu::always_inline]] inline void shl_words(word32* x, unsigned bs) noexcept
 {
     const unsigned rs = 31 - bs;
     shl_word<WS, 7>(x, bs, rs);
@@ -864,7 +864,7 @@ template <unsigned WS>
 
 /// Word I of x >>= 32 * WS + bs, in place, written from the least significant word up.
 template <unsigned WS, unsigned I>
-[[gnu::always_inline]] inline void shr_word(uint32_t* x, unsigned bs, unsigned rs) noexcept
+[[gnu::always_inline]] inline void shr_word(word32* x, unsigned bs, unsigned rs) noexcept
 {
     if constexpr (I + WS > 7)
         x[I] = 0;
@@ -875,7 +875,7 @@ template <unsigned WS, unsigned I>
 }
 
 template <unsigned WS>
-[[gnu::always_inline]] inline void shr_words(uint32_t* x, unsigned bs) noexcept
+[[gnu::always_inline]] inline void shr_words(word32* x, unsigned bs) noexcept
 {
     const unsigned rs = 31 - bs;
     shr_word<WS, 0>(x, bs, rs);
@@ -911,7 +911,7 @@ template <Opcode Op>
             return fail(EVMC_STACK_UNDERFLOW);
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
-        auto* const x = reinterpret_cast<uint32_t*>(pos.stack_end - 1);
+        word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
         const unsigned bs = imm & 31;
         switch (imm >> 5)  // The word shift: a byte is below 256, so there is no "all out" case.
         {
@@ -1003,7 +1003,7 @@ template <Opcode Op>
     const uint32_t a = pos.code_it[-1];
     const uint32_t b = pos.code_it[1];
     // c = a << b: a byte shifted by b < 256 lands in words b / 32 and b / 32 + 1.
-    auto* const c = reinterpret_cast<uint32_t*>(pos.stack_end);
+    word32* const c = reinterpret_cast<word32*>(pos.stack_end);
     c[0] = 0;
     c[1] = 0;
     c[2] = 0;
@@ -1088,7 +1088,7 @@ template <Opcode Op>
     {
         if (INTX_UNLIKELY(!deduct_gas(gas, 8)))
             return fail(EVMC_OUT_OF_GAS);
-        const auto* const w = reinterpret_cast<const uint32_t*>(s - 2);
+        const word32* const w = reinterpret_cast<const word32*>(s - 2);
         const uint32_t dst = w[0];
         const auto& analysis = *state.analysis.baseline;
         if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||

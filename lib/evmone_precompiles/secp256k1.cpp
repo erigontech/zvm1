@@ -141,8 +141,9 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
         // Work with 32-bit words directly for 128-bit scalars.
         uint32_t aw[4], bww[4];
         {
-            const auto* ka = reinterpret_cast<const uint32_t*>(&k2a);
-            const auto* kb = reinterpret_cast<const uint32_t*>(&k2b);
+            typedef uint32_t __attribute__((may_alias)) word;
+            const word* const ka = reinterpret_cast<const word*>(&k2a);
+            const word* const kb = reinterpret_cast<const word*>(&k2b);
             for (int j = 0; j < 4; ++j) { aw[j] = ka[j]; bww[j] = kb[j]; }
         }
 
@@ -890,13 +891,17 @@ constexpr AffinePoint PHI_G_ODD[size_t{1} << (G_WNAF_W - 2)] = {
 /// Digits of a width-W NAF of a scalar below 2^128: the carry may add one more.
 constexpr unsigned WNAF_LEN = 129;
 
+/// A 32-bit word of a uint256 (stored as 64-bit words): may alias them, where plain uint32_t
+/// loads need not see the stores of the uint64_t words.
+typedef uint32_t __attribute__((may_alias)) word32;
+
 /// Writes the width-W NAF of the scalar below 2^128 with 32-bit words w[0..3]: naf[i] is the
 /// digit of 2^i, 0 or odd with |naf[i]| < 2^(W-1), and at least W-1 zeros follow each non-zero
 /// one, so a 128-bit scalar has 128/(W+1) non-zero digits on average where its plain NAF has
 /// 128/3. naf must be zeroed (WNAF_LEN digits). Returns the index past the top non-zero digit.
 /// This is libsecp256k1's secp256k1_ecmult_wnaf().
 template <unsigned W, typename Digit>
-unsigned wnaf(Digit* naf, const uint32_t* w) noexcept
+unsigned wnaf(Digit* naf, const word32* w) noexcept
 {
     const uint32_t x[6] = {w[0], w[1], w[2], w[3], 0, 0};
     // Trailing zeros of a non-zero word: rv32im has no ctz, so a de Bruijn lookup (5 instructions).
@@ -1294,10 +1299,10 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
     alignas(4) int16_t naf_ga[WNAF_LEN + 1]{};
     alignas(4) int16_t naf_gb[WNAF_LEN + 1]{};
     const auto top = std::max(
-        std::max(wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const uint32_t*>(&a2.value)),
-            wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const uint32_t*>(&b2.value))),
-        std::max(wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const uint32_t*>(&a1.value)),
-            wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&b1.value))));
+        std::max(wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const word32*>(&a2.value)),
+            wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const word32*>(&b2.value))),
+        std::max(wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const word32*>(&a1.value)),
+            wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const word32*>(&b1.value))));
 
     Point result;  // The point at infinity.
     bool started = false;  // As in msm_wnaf(): an addition that cancels the sum restarts it.
@@ -1509,10 +1514,10 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         alignas(4) int8_t naf_b[WNAF_LEN + 3]{};
         alignas(4) int16_t naf_ga[WNAF_LEN + 1]{};
         alignas(4) int16_t naf_gb[WNAF_LEN + 1]{};
-        const auto len_a = wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const uint32_t*>(&k2a[i]));
-        const auto len_b = wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const uint32_t*>(&k2b[i]));
-        const auto len_ga = wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const uint32_t*>(&k1a[i]));
-        const auto len_gb = wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const uint32_t*>(&k1b[i]));
+        const auto len_a = wnaf<R_WNAF_W>(naf_a, reinterpret_cast<const word32*>(&k2a[i]));
+        const auto len_b = wnaf<R_WNAF_W>(naf_b, reinterpret_cast<const word32*>(&k2b[i]));
+        const auto len_ga = wnaf<G_WNAF_W>(naf_ga, reinterpret_cast<const word32*>(&k1a[i]));
+        const auto len_gb = wnaf<G_WNAF_W>(naf_gb, reinterpret_cast<const word32*>(&k1b[i]));
 
         q[i] = msm_wnaf(signs[i] & 1, (signs[i] >> 1) & 1, naf_ga, naf_gb, naf_a, naf_b,
             std::max(std::max(len_a, len_b), std::max(len_ga, len_gb)), ta, tb);
