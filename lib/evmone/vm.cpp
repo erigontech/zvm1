@@ -121,6 +121,7 @@ ExecutionState& VM::get_execution_state(size_t depth) noexcept
     return m_execution_states[depth];
 }
 
+#if !EVMONE_LEAN_CODE_CACHE
 std::shared_ptr<baseline::CodeAnalysis> CodeCache::get(const evmc::bytes32& code_hash)
 {
     const auto it = map_.find(code_hash);
@@ -149,27 +150,11 @@ void CodeCache::put(const evmc::bytes32& code_hash, std::shared_ptr<baseline::Co
         lru_list_.pop_back();
     }
 }
-
+#endif
 
 bool VM::has_cached_execution() const noexcept
 {
     return execute == static_cast<decltype(execute)>(baseline::execute);
-}
-
-evmc::Result VM::execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
-    const evmc::bytes32& code_hash,
-    const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept
-{
-    auto p = m_code_cache.get(code_hash);
-    if (p == nullptr)
-    {
-        const auto code = get_code(msg.code_address);
-        p = std::make_shared<baseline::CodeAnalysis>(baseline::analyze(code));
-        m_code_cache.put(code_hash, p);
-    }
-
-    const auto& ca = *p;
-    return baseline::execute(*this, evmc::Host::get_interface(), host.to_context(), rev, msg, ca);
 }
 
 }  // namespace evmone
