@@ -686,7 +686,8 @@ inline void mulmod(StackTop stack) noexcept
     sp1::mulmod(m, std::span<const uint256, 2>{&y, 2});
 #elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // The 512-bit product straight from MUL_LOW and MUL_HIGH, which overwrite their first operand:
-    // two copies of x, multiplied by y in its stack slot. Then only its remainder, into m's slot.
+    // two copies of x, multiplied by y in its stack slot. Then only its remainder, into m's slot,
+    // in closed form for the sparse moduli that programs reduce by.
     alignas(32) intx::uint512 p{intx::uint512::uninit_tag{}};
     word32* const pw = reinterpret_cast<word32*>(&p);
     const word32* const xw = reinterpret_cast<const word32*>(&x);
@@ -699,7 +700,7 @@ inline void mulmod(StackTop stack) noexcept
     r10 = reinterpret_cast<uintptr_t>(&pw[8]);
     r12 = 0x10;  // MUL_HIGH
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-    intx::internal::div32::urem(p, m, m);
+    intx::internal::div32::mulmod_reduce(p, m);
 #else
     m = intx::mulmod(x, y, m);
 #endif
