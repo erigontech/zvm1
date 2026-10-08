@@ -7,24 +7,35 @@
 # MUL_LOW/MUL_HIGH/ADD, we reduce this to ~33 CSR calls + ~200 insns glue.
 #
 # Only CSR ADD carry-in (bit 6) is used; SUB borrow-in is NOT assumed.
+#
+# src/fp12_tower.c is patched too: the cyclotomic squaring forms each output
+# (3*t -/+ 2*a) with one fused sum and one reduction instead of three modular ops.
 set -e
 
 NO_ASM_H="src/no_asm.h"
 [ -f "$NO_ASM_H" ] || { echo "ERR: $NO_ASM_H not found (pwd=$(pwd))"; exit 1; }
 
-grep -q "AIRBENDER_BIGINT_CSR" "$NO_ASM_H" && { echo "Already patched"; exit 0; }
+FP12_TOWER_C="$(dirname "$NO_ASM_H")/fp12_tower.c"
+[ -f "$FP12_TOWER_C" ] || { echo "ERR: $FP12_TOWER_C not found (pwd=$(pwd))"; exit 1; }
 
-python3 - "$NO_ASM_H" << 'PYEOF'
+# Each file carries its own marker: a run that failed between the two writes must not
+# leave one of them unpatched behind an "Already patched" exit.
+if grep -q "AIRBENDER_BIGINT_CSR" "$NO_ASM_H" && grep -q "_cyc_3t_sub_2a" "$FP12_TOWER_C"; then
+    echo "Already patched"; exit 0
+fi
+
+python3 - "$NO_ASM_H" "$FP12_TOWER_C" << 'PYEOF'
 import sys
 
 path = sys.argv[1]
+fp12_path = sys.argv[2]
 with open(path) as f:
     src = f.read()
 
-def replace_once(src, old, new):
+def replace_once(src, old, new, name="no_asm.h"):
     # A target that a blst upgrade moved would otherwise leave the generic code in silently.
     if old not in src:
-        sys.exit("ERR: patch target not found in no_asm.h: " + old.strip().splitlines()[0])
+        sys.exit("ERR: patch target not found in " + name + ": " + old.strip().splitlines()[0])
     return src.replace(old, new, 1)
 
 airbender_384 = r"""/* Airbender BigInt CSR (0x7CA) accelerated 384-bit Montgomery arithmetic.
@@ -844,6 +855,229 @@ new_sqr384x_ref = """#ifndef AIRBENDER_BIGINT_CSR
 """
 src = replace_once(src, old_sqr384x_ref, new_sqr384x_ref)
 print("Patched sqr_mont_384x -> lazy-reduction version")
+
+# Cyclotomic squaring of fp12_tower.c: the outputs are 3*t - 2*a or 3*t + 2*a, each formed
+# and reduced once instead of by three modular operations (see the comment in the code).
+old_cyclotomic = """static void cyclotomic_sqr_fp12(vec384fp12 ret, const vec384fp12 a)
+{
+    vec384fp4 t0, t1, t2;
+
+    sqr_fp4(t0, a[0][0], a[1][1]);
+    sqr_fp4(t1, a[1][0], a[0][2]);
+    sqr_fp4(t2, a[0][1], a[1][2]);
+
+    sub_fp2(ret[0][0], t0[0],     a[0][0]);
+    add_fp2(ret[0][0], ret[0][0], ret[0][0]);
+    add_fp2(ret[0][0], ret[0][0], t0[0]);
+
+    sub_fp2(ret[0][1], t1[0],     a[0][1]);
+    add_fp2(ret[0][1], ret[0][1], ret[0][1]);
+    add_fp2(ret[0][1], ret[0][1], t1[0]);
+
+    sub_fp2(ret[0][2], t2[0],     a[0][2]);
+    add_fp2(ret[0][2], ret[0][2], ret[0][2]);
+    add_fp2(ret[0][2], ret[0][2], t2[0]);
+
+    mul_by_u_plus_1_fp2(t2[1], t2[1]);
+    add_fp2(ret[1][0], t2[1],     a[1][0]);
+    add_fp2(ret[1][0], ret[1][0], ret[1][0]);
+    add_fp2(ret[1][0], ret[1][0], t2[1]);
+
+    add_fp2(ret[1][1], t0[1],     a[1][1]);
+    add_fp2(ret[1][1], ret[1][1], ret[1][1]);
+    add_fp2(ret[1][1], ret[1][1], t0[1]);
+
+    add_fp2(ret[1][2], t1[1],     a[1][2]);
+    add_fp2(ret[1][2], ret[1][2], ret[1][2]);
+    add_fp2(ret[1][2], ret[1][2], t1[1]);
+}
+"""
+new_cyclotomic = r"""#ifdef AIRBENDER_BIGINT_CSR
+/*
+ * The cyclotomic squaring's outputs are 3*t - 2*a or 3*t + 2*a, which blst forms
+ * with three modular operations each. For canonical t and a (below p, as every
+ * Fp value produced here is), v = 3*t - 2*a + 2*p and v = 3*t + 2*a are below
+ * 5*p < 2^384, so each is summed once (low 256 bits on the CSR, top 128 in
+ * software) and reduced once: q*p with q estimated from the top word, which is
+ * low by at most one, then a subtraction of p that is rare except for zero
+ * coefficients (t = a = 0 gives v = 2*p). The result is the same residue the
+ * three modular operations give. The CSR carries are propagated explicitly; SUB
+ * borrow-in is not used.
+ * no_asm.h, which holds the shared CSR helpers, is included after this file.
+ */
+#define _CYC_ALIGN32 __attribute__((aligned(32)))
+
+static inline __attribute__((always_inline))
+limb_t _cyc_csr(limb_t *mut, const limb_t *immut, limb_t mask)
+{
+    register unsigned long x10 __asm__("x10") = (unsigned long)mut;
+    register unsigned long x11 __asm__("x11") = (unsigned long)immut;
+    register limb_t x12 __asm__("x12") = mask;
+    __asm__ __volatile__("csrrw x0, 0x7CA, x0"
+                         : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
+    return x12;
+}
+
+/* k*p for k = 0..4: low 256 bits (CSR operands) and top 128 bits */
+static const limb_t _cyc_kp_lo[5][8] _CYC_ALIGN32 = {
+    { 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0xffffaaab, 0xb9feffff, 0xb153ffff, 0x1eabfffe,
+      0xf6b0f624, 0x6730d2a0, 0xf38512bf, 0x64774b84 },
+    { 0xffff5556, 0x73fdffff, 0x62a7ffff, 0x3d57fffd,
+      0xed61ec48, 0xce61a541, 0xe70a257e, 0xc8ee9709 },
+    { 0xffff0001, 0x2dfcffff, 0x13fbffff, 0x5c03fffc,
+      0xe412e26c, 0x359277e2, 0xda8f383e, 0x2d65e28e },
+    { 0xfffeaaac, 0xe7fbffff, 0xc54ffffe, 0x7aaffffa,
+      0xdac3d890, 0x9cc34a83, 0xce144afd, 0x91dd2e13 }
+};
+static const limb_t _cyc_kp_hi[5][4] = {
+    { 0, 0, 0, 0 },
+    { 0x434bacd7, 0x4b1ba7b6, 0x397fe69a, 0x1a0111ea },
+    { 0x869759ae, 0x96374f6c, 0x72ffcd34, 0x340223d4 },
+    { 0xc9e30686, 0xe152f722, 0xac7fb3ce, 0x4e0335be },
+    { 0x0d2eb35d, 0x2c6e9ed9, 0xe5ff9a69, 0x680447a8 }
+};
+
+/* v's top word at least ceil(k*p / 2^352) implies v >= k*p, and below
+ * ceil((k+1)*p / 2^352) it implies v < (k+2)*p */
+#define _CYC_THR1 0x1a0111eb
+#define _CYC_THR2 0x340223d5
+#define _CYC_THR3 0x4e0335bf
+#define _CYC_THR4 0x680447a9
+
+/* ret -= p when ret >= p, for ret below 2p: out of line, as it is rare */
+static __attribute__((noinline)) void _cyc_reduce_once(limb_t ret[12])
+{
+    limb_t tmp[12], borrow = 0;
+    unsigned long long limbx;
+    size_t i;
+
+    for (i = 0; i < 12; i++) {
+        limb_t pi = i < 8 ? _cyc_kp_lo[1][i] : _cyc_kp_hi[1][i - 8];
+        limbx = (unsigned long long)ret[i] - pi - borrow;
+        tmp[i] = (limb_t)limbx;
+        borrow = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    }
+    if (!borrow)
+        for (i = 0; i < 12; i++)
+            ret[i] = tmp[i];
+}
+
+static inline __attribute__((always_inline))
+void _cyc_lin(vec384 ret, const vec384 t, const vec384 a, const int sub)
+{
+    limb_t T[8] _CYC_ALIGN32, A[8] _CYC_ALIGN32;
+    limb_t t8 = t[8], t9 = t[9], t10 = t[10], t11 = t[11];
+    limb_t a8 = a[8], a9 = a[9], a10 = a[10], a11 = a[11];
+    limb_t h0, h1, h2, h3, q, b, *r;
+    const limb_t *kh;
+    long long d;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        T[i] = t[i];
+        A[i] = a[i];
+    }
+
+    if (sub) {
+        /* T = t - a, A = t, A = 2t - a, T = 3t - 2a, T += 2p, mod 2^256; the second
+         * step carries out exactly when the first borrowed, which cancels it */
+        limb_t b1 = _cyc_csr(T, A, 0x02);
+        limb_t k;
+        _cyc_csr(A, T, 0x01);
+        k = _cyc_csr(A, T, 0x01);
+        k += _cyc_csr(T, A, 0x01);
+        k += _cyc_csr(T, _cyc_kp_lo[2], 0x01);
+        d = (long long)t8 * 3 - ((long long)a8 << 1) + 2 * (long long)_cyc_kp_hi[1][0]
+            + (long long)k - 2 * (long long)b1;
+        h0 = (limb_t)d;
+        d = (d >> 32) + (long long)t9 * 3 - ((long long)a9 << 1)
+            + 2 * (long long)_cyc_kp_hi[1][1];
+        h1 = (limb_t)d;
+        d = (d >> 32) + (long long)t10 * 3 - ((long long)a10 << 1)
+            + 2 * (long long)_cyc_kp_hi[1][2];
+        h2 = (limb_t)d;
+        h3 = (limb_t)(d >> 32) + t11 * 3 - (a11 << 1) + 2 * _cyc_kp_hi[1][3];
+        r = T;
+    } else {
+        /* A = a + t, T = 2t + a, A = 3t + 2a, mod 2^256: 2^256 carries 2*c1 + c2 + c3 */
+        unsigned long long x;
+        limb_t k = _cyc_csr(A, T, 0x01);
+        k = 2 * k + _cyc_csr(T, A, 0x01);
+        k += _cyc_csr(A, T, 0x01);
+        x = (unsigned long long)t8 * 3 + ((unsigned long long)a8 << 1) + k;
+        h0 = (limb_t)x;
+        x = (x >> 32) + (unsigned long long)t9 * 3 + ((unsigned long long)a9 << 1);
+        h1 = (limb_t)x;
+        x = (x >> 32) + (unsigned long long)t10 * 3 + ((unsigned long long)a10 << 1);
+        h2 = (limb_t)x;
+        h3 = (limb_t)(x >> 32) + t11 * 3 + (a11 << 1);
+        r = A;
+    }
+
+    /* v = h*2^256 + r < 5p */
+    q = (h3 >= _CYC_THR1) + (h3 >= _CYC_THR2) + (h3 >= _CYC_THR3) + (h3 >= _CYC_THR4);
+    b = _cyc_csr(r, _cyc_kp_lo[q], 0x02);
+    kh = _cyc_kp_hi[q];
+    d = (long long)h0 - kh[0] - b;
+    h0 = (limb_t)d;
+    d = (d >> 32) + (long long)h1 - kh[1];
+    h1 = (limb_t)d;
+    d = (d >> 32) + (long long)h2 - kh[2];
+    h2 = (limb_t)d;
+    h3 = h3 - kh[3] + (limb_t)(d >> 32);
+
+    for (i = 0; i < 8; i++)
+        ret[i] = r[i];
+    ret[8] = h0; ret[9] = h1; ret[10] = h2; ret[11] = h3;
+    if (h3 >= _cyc_kp_hi[1][3])                     /* v - q*p may be p or more */
+        _cyc_reduce_once(ret);
+}
+
+static __attribute__((noinline))
+void _cyc_3t_sub_2a(vec384 ret, const vec384 t, const vec384 a)
+{   _cyc_lin(ret, t, a, 1);   }
+
+static __attribute__((noinline))
+void _cyc_3t_add_2a(vec384 ret, const vec384 t, const vec384 a)
+{   _cyc_lin(ret, t, a, 0);   }
+
+static void cyclotomic_sqr_fp12(vec384fp12 ret, const vec384fp12 a)
+{
+    vec384fp4 t0, t1, t2;
+
+    sqr_fp4(t0, a[0][0], a[1][1]);
+    sqr_fp4(t1, a[1][0], a[0][2]);
+    sqr_fp4(t2, a[0][1], a[1][2]);
+
+    /* each coefficient reads a's before writing ret's, so ret may alias a */
+    _cyc_3t_sub_2a(ret[0][0][0], t0[0][0], a[0][0][0]);
+    _cyc_3t_sub_2a(ret[0][0][1], t0[0][1], a[0][0][1]);
+    _cyc_3t_sub_2a(ret[0][1][0], t1[0][0], a[0][1][0]);
+    _cyc_3t_sub_2a(ret[0][1][1], t1[0][1], a[0][1][1]);
+    _cyc_3t_sub_2a(ret[0][2][0], t2[0][0], a[0][2][0]);
+    _cyc_3t_sub_2a(ret[0][2][1], t2[0][1], a[0][2][1]);
+
+    mul_by_u_plus_1_fp2(t2[1], t2[1]);
+    _cyc_3t_add_2a(ret[1][0][0], t2[1][0], a[1][0][0]);
+    _cyc_3t_add_2a(ret[1][0][1], t2[1][1], a[1][0][1]);
+    _cyc_3t_add_2a(ret[1][1][0], t0[1][0], a[1][1][0]);
+    _cyc_3t_add_2a(ret[1][1][1], t0[1][1], a[1][1][1]);
+    _cyc_3t_add_2a(ret[1][2][0], t1[1][0], a[1][2][0]);
+    _cyc_3t_add_2a(ret[1][2][1], t1[1][1], a[1][2][1]);
+}
+#else
+""" + old_cyclotomic + """#endif
+"""
+with open(fp12_path) as f:
+    fp12_src = f.read()
+if "_cyc_3t_sub_2a" not in fp12_src:
+    fp12_src = replace_once(fp12_src, old_cyclotomic, new_cyclotomic, "fp12_tower.c")
+    print("Patched cyclotomic_sqr_fp12 -> fused outputs")
+
+# Write fp12_tower.c first: the shell's "Already patched" check needs both files marked.
+with open(fp12_path, 'w') as f:
+    f.write(fp12_src)
 
 with open(path, 'w') as f:
     f.write(src)
