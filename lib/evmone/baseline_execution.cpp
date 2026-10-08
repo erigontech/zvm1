@@ -72,31 +72,6 @@ namespace
     return floor;
 }
 
-#if EVMONE_RV32_DISPATCH
-/// gas_left -= cost; false once that is negative. cost is a non-negative 16-bit value.
-///
-/// On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and test
-/// its sign: 2 instructions. A borrow always leaves the low word negative (at least
-/// 2^32 - 2^15). A non-negative low word therefore borrowed nothing and is the exact 64-bit
-/// result, still non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes
-/// the full 64-bit path, which recovers the borrow from the new low word alone.
-[[gnu::always_inline]] inline bool deduct_gas(int64_t& gas_left, uint32_t cost) noexcept
-{
-    const auto g = static_cast<uint64_t>(gas_left);
-    auto lo = static_cast<uint32_t>(g) - cost;
-    asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
-    if (static_cast<int32_t>(lo) >= 0) [[likely]]
-    {
-        gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
-        return true;
-    }
-    const auto borrow = static_cast<uint32_t>(lo + cost < cost);
-    const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
-    gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
-    return gas_left >= 0;
-}
-#endif
-
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
@@ -1318,9 +1293,10 @@ template <Opcode Op>
         }
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
-        // check_memory() for an offset of one byte: no high words to test.
+        // check_memory() for an offset of one byte: no high words to test, and it is below the
+        // limit when the 32 bytes at it are inside the memory.
         auto& memory = state.memory;
-        if (imm + 32 > memory.size())
+        if (imm >= memory.limit32())
         {
             if (Op == OP_MSTORE && imm == 0x40 && memory.size() == 0)
             {

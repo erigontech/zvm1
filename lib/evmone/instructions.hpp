@@ -270,24 +270,73 @@ inline bool check_memory(
 }
 
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
-/// check_memory() for the 32 bytes of MSTORE. A store starting at or below the end of the memory
-/// grows it by one word (85% of MSTORE's growths on mainnet blocks), which is made here rather
-/// than in grow_memory(). From n to n + 1 words the cost is 3 + (n + 1)^2 / 512 - n^2 / 512
-/// (floored divisions), that is 3 + (n^2 % 512 + 2n + 1) / 512, and n^2 % 512 is the low 9 bits
-/// of the wrapped 32-bit square: exact at any size.
-inline bool check_memory_for_mstore(int64_t& gas_left, Memory& memory, const uint256& offset) noexcept
+/// gas_left -= cost; false once that is negative. cost is a non-negative 16-bit value.
+///
+/// On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and test
+/// its sign: 2 instructions. A borrow always leaves the low word negative (at least
+/// 2^32 - 2^15). A non-negative low word therefore borrowed nothing and is the exact 64-bit
+/// result, still non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes
+/// the full 64-bit path, which recovers the borrow from the new low word alone.
+[[gnu::always_inline]] inline bool deduct_gas(int64_t& gas_left, uint32_t cost) noexcept
+{
+    const auto g = static_cast<uint64_t>(gas_left);
+    auto lo = static_cast<uint32_t>(g) - cost;
+    asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
+    if (static_cast<int32_t>(lo) >= 0) [[likely]]
+    {
+        gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
+        return true;
+    }
+    const auto borrow = static_cast<uint32_t>(lo + cost < cost);
+    const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
+    gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
+    return gas_left >= 0;
+}
+
+/// check_memory() for a 32-byte access (MLOAD), which also gives the offset it checked.
+///
+/// The access lies inside the memory when the offset is below Memory::limit32(): one compare,
+/// where the size test adds 32 to the offset and compares the 64-bit sum. Above the limit the
+/// memory grows to the 64-bit end offset, as check_memory() does, which also takes the offsets
+/// near 4 GiB that a 32-bit sum would wrap.
+[[gnu::always_inline]] inline bool check_memory32(
+    int64_t& gas_left, Memory& memory, const uint256& offset, size_t& at) noexcept
 {
     const word32* const w = reinterpret_cast<const word32*>(&offset);
     if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
         return false;
 
-    const auto new_size = static_cast<uint64_t>(w[0]) + 32;
-    const auto size = memory.size();
+    const uint32_t w0 = w[0];
+    if (w0 >= memory.limit32())
+    {
+        gas_left = grow_memory(gas_left, memory, uint64_t{w0} + 32);
+        if (gas_left < 0) [[unlikely]]
+            return false;
+    }
+    at = w0;
+    return true;
+}
+
+/// check_memory32() for the 32 bytes of MSTORE. A store starting at or below the end of the memory
+/// grows it by one word (85% of MSTORE's growths on mainnet blocks), which is made here rather
+/// than in grow_memory(). From n to n + 1 words the cost is 3 + (n + 1)^2 / 512 - n^2 / 512
+/// (floored divisions), that is 3 + (n^2 % 512 + 2n + 1) / 512, and n^2 % 512 is the low 9 bits
+/// of the wrapped 32-bit square: exact at any size.
+inline bool check_memory_for_mstore(
+    int64_t& gas_left, Memory& memory, const uint256& offset, size_t& at) noexcept
+{
+    const word32* const w = reinterpret_cast<const word32*>(&offset);
+    if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
+        return false;
+
+    const uint32_t w0 = w[0];
     // Unlikely: GCC otherwise lays out the growth inline and the stores that do not grow the
     // memory (most of them) pay for the jump around it.
-    if (new_size > size) [[unlikely]]
+    if (w0 >= memory.limit32()) [[unlikely]]
     {
-        if (w[0] <= size && size + word_size <= memory.capacity())
+        // The store ends past the memory. A start at most at its end grows it by one word.
+        const auto size = memory.size();
+        if (w0 <= size && size + word_size <= memory.capacity())
         {
             const auto n = static_cast<uint32_t>(size >> 5);
             const auto cost = 3 + ((((n * n) & 511) + 2 * n + 1) >> 9);
@@ -295,13 +344,16 @@ inline bool check_memory_for_mstore(int64_t& gas_left, Memory& memory, const uin
             // register pair across every MSTORE.
             if ((gas_left -= cost) < 0)
                 return false;
-            memory.grow_word_for_store(w[0]);
-            return true;
+            memory.grow_word_for_store(w0);
         }
-        gas_left = grow_memory(gas_left, memory, new_size);
-        if (gas_left < 0) [[unlikely]]
-            return false;
+        else
+        {
+            gas_left = grow_memory(gas_left, memory, uint64_t{w0} + 32);
+            if (gas_left < 0) [[unlikely]]
+                return false;
+        }
     }
+    at = w0;
     return true;
 }
 #endif
@@ -1140,11 +1192,16 @@ inline void clz(StackTop stack) noexcept
 }
 #endif
 
-inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
+/// The general KECCAK256: any size and offset, growing the memory as needed.
+///
+/// On rv32 it is out of line, so that the fast path in keccak256() stays small enough to be
+/// inlined into the interpreter loop with it.
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+[[gnu::noinline]]
+#endif
+inline Result keccak256_general(
+    const uint256& index, uint256& size, int64_t gas_left, ExecutionState& state) noexcept
 {
-    const auto& index = stack.pop();
-    auto& size = stack.top();
-
     if (!check_memory(gas_left, state.memory, index, size))
         return {EVMC_OUT_OF_GAS, gas_left};
 
@@ -1179,6 +1236,61 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     return {EVMC_SUCCESS, gas_left};
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// Stores the hash of the 64 bytes at @p data as the number KECCAK256 pushes: the fast path's
+/// hash for what the memo does not take (a misaligned input). Out of line, to keep the number's
+/// byte reversal out of the interpreter loop.
+[[gnu::noinline]] inline void keccak256_64_plain(uint256& out, const uint8_t* data) noexcept
+{
+#ifdef EVMONE_WORD_LAYOUT
+    keccak256_w(out, data, 64);
+#else
+    out = intx::be::load<uint256>(ethash::keccak256(data, 64));
+#endif
+}
+#endif
+
+inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
+{
+    const auto& index = stack.pop();
+    auto& size = stack.top();
+
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+    // The usual hash is 64 bytes (the mapping slots, see keccak256_general()) at an offset inside
+    // the memory: there are no growth and no size to convert, and the 2 words cost 12 gas.
+    // Whatever else (another size, a size or offset above 32 bits, an end past the memory or
+    // wrapped around 4 GiB) takes the general code, which fails or grows as it always did.
+    const word32* const sw = reinterpret_cast<const word32*>(&size);
+    const word32* const iw = reinterpret_cast<const word32*>(&index);
+    if (sw[0] == 64 && (sw[1] | sw[2] | sw[3] | sw[4] | sw[5] | sw[6] | sw[7] | iw[1] | iw[2] |
+                           iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) == 0)
+    {
+        const uint32_t begin = iw[0];
+        const uint32_t end = begin + 64;
+        // The sum wraps for the offsets within 64 of 4 GiB: that is not an end inside the memory.
+        if (end >= begin && end <= state.memory.size()) [[likely]]
+        {
+            if (!deduct_gas(gas_left, 12))
+                return {EVMC_OUT_OF_GAS, gas_left};
+
+            const auto data = &state.memory[begin];
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+            if ((reinterpret_cast<uintptr_t>(data) & 3) == 0) [[likely]]
+            {
+                ethash_keccak256_64_be(reinterpret_cast<ethash_w32*>(&size),
+                    reinterpret_cast<const ethash_w32*>(data));
+                return {EVMC_SUCCESS, gas_left};
+            }
+#endif
+            // Hashed here, not by the general code: that would charge the 12 gas again.
+            keccak256_64_plain(size, data);
+            return {EVMC_SUCCESS, gas_left};
+        }
+    }
+#endif
+
+    return keccak256_general(index, size, gas_left, state);
+}
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
 /// Writes the 20 big-endian bytes at s (an address, at any alignment) to the stack slot at w as a
@@ -1269,12 +1381,33 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
-    // if index overflows 32 bits (any high word non-zero → index > any size_t value).
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+    // The whole word lies inside the input when the index is below cd_lim (input_size - 31, see
+    // ExecutionState): one compare, then the full load. The rest (a partial word, an index at or
+    // past the end or above 32 bits) takes the general code below.
     const word32* const iw = reinterpret_cast<const word32*>(&index);
     const bool index_overflows_32bit =
         (iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0;
+    if (!index_overflows_32bit && iw[0] < state.cd_lim)
+    {
+        const uint8_t* const src = state.msg->input_data + iw[0];
+#ifdef EVMONE_WORD_LAYOUT
+        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+            wl::load_u256(index, src);  // The calldata of a call is the caller's memory.
+        else
+#endif
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+            intx::be::unsafe::load_into(index, src);
+#else
+            index = intx::be::unsafe::load<uint256>(src);
+#endif
+        return;
+    }
+#endif
+
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
+    // if index overflows 32 bits (any high word non-zero → index > any size_t value).
     if (index_overflows_32bit || state.msg->input_size <= iw[0])
 #else
     if (state.msg->input_size < index)
@@ -1619,16 +1752,23 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
 {
     auto& index = stack.top();
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+    size_t at = 0;
+    if (!check_memory32(gas_left, state.memory, index, at))
+        return {EVMC_OUT_OF_GAS, gas_left};
+#else
     if (!check_memory(gas_left, state.memory, index, 32))
         return {EVMC_OUT_OF_GAS, gas_left};
+    const auto at = static_cast<size_t>(index);
+#endif
 
 #ifdef EVMONE_WORD_LAYOUT
-    wl::load_u256(index, &state.memory[static_cast<size_t>(index)]);
+    wl::load_u256(index, &state.memory[at]);
 #elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // Reverse the bytes straight into the stack slot.
-    intx::be::unsafe::load_into(index, &state.memory[static_cast<size_t>(index)]);
+    intx::be::unsafe::load_into(index, &state.memory[at]);
 #else
-    index = intx::be::unsafe::load<uint256>(&state.memory[static_cast<size_t>(index)]);
+    index = intx::be::unsafe::load<uint256>(&state.memory[at]);
 #endif
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1641,16 +1781,19 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
     // The fast path leaves a new word the store covers whole unzeroed: the store below writes
     // all 32 bytes.
-    if (!check_memory_for_mstore(gas_left, state.memory, index))
+    size_t at = 0;
+    if (!check_memory_for_mstore(gas_left, state.memory, index, at))
+        return {EVMC_OUT_OF_GAS, gas_left};
 #else
     if (!check_memory(gas_left, state.memory, index, 32))
-#endif
         return {EVMC_OUT_OF_GAS, gas_left};
+    const auto at = static_cast<size_t>(index);
+#endif
 
 #ifdef EVMONE_WORD_LAYOUT
-    wl::store_u256(&state.memory[static_cast<size_t>(index)], value);
+    wl::store_u256(&state.memory[at], value);
 #else
-    intx::be::unsafe::store(&state.memory[static_cast<size_t>(index)], value);
+    intx::be::unsafe::store(&state.memory[at], value);
 #endif
     return {EVMC_SUCCESS, gas_left};
 }
