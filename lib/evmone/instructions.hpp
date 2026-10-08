@@ -705,7 +705,10 @@ inline void mulmod(StackTop stack) noexcept
 #endif
 }
 
-inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
+/// Out of line, as before the word-store paths: inlined into the op wrapper and the interpreter
+/// loop it would change their size and layout for a rare instruction.
+[[gnu::noinline]] inline Result exp(
+    StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
 {
     const auto& base = stack.pop();
     auto& exponent = stack.top();
@@ -717,6 +720,42 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     if ((gas_left -= additional_cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+    // The result is written as words into the exponent's stack slot; the base is read as words.
+    word32* const ew = reinterpret_cast<word32*>(&exponent);
+    const word32* const bwd = reinterpret_cast<const word32*>(&base);
+
+    // exponent == 0 => result = 1 (also 0^0), with no loop setup.
+    if (exponent_significant_bytes == 0)
+    {
+        for (int i = 1; i < 8; ++i)
+            ew[i] = 0;
+        ew[0] = 1;
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    // Power-of-two base 2^j with j < 32 (2, 256, 2^16, ...): (2^j)^e mod 2^256 is 2^(j*e) if
+    // j*e < 256, else 0, and base 1 (j == 0) gives 1 for every exponent. That is a few word stores
+    // instead of the square-and-multiply loop. Other bases take the loop below.
+    const uint32_t b0 = bwd[0];
+    if ((bwd[1] | bwd[2] | bwd[3] | bwd[4] | bwd[5] | bwd[6] | bwd[7]) == 0 && b0 != 0 &&
+        (b0 & (b0 - 1)) == 0)
+    {
+        // j = log2(b0) by de Bruijn multiplication: __builtin_ctz is a libgcc call on rv32im.
+        static constexpr uint8_t debruijn_log2[32] = {0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15,
+            25, 17, 4, 8, 31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9};
+        const uint32_t j = debruijn_log2[(b0 * 0x077CB531u) >> 27];
+        // A one-byte exponent keeps j*e below 2^13; a longer one is at least 256 and j >= 1 gives 0
+        // (the product may wrap 32 bits, so it is not computed). Base 1 is tested first: 1^e = 1.
+        const uint32_t s = (j == 0) ? 0 : (exponent_significant_bytes == 1 ? j * ew[0] : 256);
+        for (int i = 0; i < 8; ++i)
+            ew[i] = 0;
+        if (s < 256)
+            ew[s >> 5] = uint32_t{1} << (s & 31);
+        return {EVMC_SUCCESS, gas_left};
+    }
+#endif
+
 #if defined(AIRBENDER) && defined(__riscv)
     // CSR-accelerated binary exponentiation.
     // We keep result and tmp as fixed aligned buffers and use CSR MUL_LOW + MEMCOPY
@@ -724,12 +763,14 @@ inline Result exp(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     // Each square: 1 MEMCOPY + 1 MUL_LOW (vs 4 memcpy + 1 MUL_LOW in generic path).
     // Each multiply-by-base: 1 MUL_LOW (vs 3 memcpy + 1 MUL_LOW in generic path).
 
-    // Handle base == 2 fast path (shift, no CSR benefit).
+#if __riscv_xlen != 32
+    // Handle base == 2 fast path (shift, no CSR benefit). On rv32 the path above covers it.
     if (base == 2)
     {
         exponent = uint256{1} << exponent;
         return {EVMC_SUCCESS, gas_left};
     }
+#endif
 
     // Copy exponent before overwriting with result.
     alignas(32) uint256 exp_copy = exponent;
