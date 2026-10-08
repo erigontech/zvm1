@@ -862,6 +862,76 @@ template <Opcode Op>
     pos.code_it += 6;
     return true;
 }
+
+/// Word I of x >>= 32 * WS + bs arithmetically, in place, written from the least significant word
+/// up, so every source word (I + WS and I + WS + 1) is read before it is overwritten. The words
+/// above the shifted top word take the sign, which the caller reads before any store.
+/// (v << 1) << rs is v << (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void sar_word(
+    word32* x, unsigned bs, unsigned rs, uint32_t sign) noexcept
+{
+    if constexpr (I + WS > 7)
+        x[I] = sign;
+    else if constexpr (I + WS == 7)
+        x[I] = static_cast<uint32_t>(static_cast<int32_t>(x[7]) >> bs);
+    else
+        x[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
+}
+
+template <unsigned WS>
+[[gnu::always_inline]] inline void sar_words(word32* x, unsigned bs, uint32_t sign) noexcept
+{
+    const unsigned rs = 31 - bs;
+    sar_word<WS, 0>(x, bs, rs, sign);
+    sar_word<WS, 1>(x, bs, rs, sign);
+    sar_word<WS, 2>(x, bs, rs, sign);
+    sar_word<WS, 3>(x, bs, rs, sign);
+    sar_word<WS, 4>(x, bs, rs, sign);
+    sar_word<WS, 5>(x, bs, rs, sign);
+    sar_word<WS, 6>(x, bs, rs, sign);
+    sar_word<WS, 7>(x, bs, rs, sign);
+}
+
+/// x >>= s arithmetically, for s below 256. instr::core::sar() builds two full 256-bit shifts
+/// (about 220 instructions on rv32); moving words takes about 25 to 60
+/// instructions from the shift decode through the last store.
+[[gnu::always_inline]] inline void sar_below_256(word32* x, unsigned s) noexcept
+{
+    const auto sign = static_cast<uint32_t>(static_cast<int32_t>(x[7]) >> 31);
+    const unsigned bs = s & 31;
+    switch ((s >> 5) & 7)  // The word shift; the mask spares the switch its range check.
+    {
+#define SAR_CASE(WS)                \
+    case WS:                        \
+        sar_words<WS>(x, bs, sign); \
+        break;
+        SAR_CASE(0)
+        SAR_CASE(1)
+        SAR_CASE(2)
+        SAR_CASE(3)
+        SAR_CASE(4)
+        SAR_CASE(5)
+        SAR_CASE(6)
+        SAR_CASE(7)
+#undef SAR_CASE
+    default:
+        intx::unreachable();
+    }
+}
+
+/// SAR with its shift y from the stack: x >>= y arithmetically, all sign bits from 256 on.
+[[gnu::always_inline]] inline void sar_stack(word32* x, const word32* y) noexcept
+{
+    if ((y[1] | y[2] | y[3] | y[4] | y[5] | y[6] | y[7]) == 0 && y[0] < 256) [[likely]]
+        sar_below_256(x, y[0]);
+    else
+    {
+        const auto sign = static_cast<uint32_t>(static_cast<int32_t>(x[7]) >> 31);
+        for (int i = 0; i < 8; ++i)
+            x[i] = sign;
+    }
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -958,6 +1028,16 @@ template <Opcode Op, bool TracingEnabled>
         state.status = status;
         return {nullptr, pos.stack_end};
     }
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_SAR)
+    {
+        // By words, after check_requirements(): the shift is the top item and the value under
+        // it takes the result.
+        sar_stack(reinterpret_cast<word32*>(pos.stack_end - 2),
+            reinterpret_cast<const word32*>(pos.stack_end - 1));
+        return {pos.code_it + 1, pos.stack_end - 1};
+    }
+#endif
     auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
 #if EVMONE_RV32_DISPATCH
     if constexpr (Op == OP_JUMP)
@@ -1043,10 +1123,10 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// 5 instructions whichever table it goes through. The PUSH1 handler therefore makes its own
 /// checks and dispatches the successor through push1_table, whose entries make the push and
 /// jump to the successor's handler (one extra instruction) or run the pair fused: SHL and SHR by
-/// an immediate (3.0M), MLOAD and MSTORE at an immediate offset (2.8M), ADD, AND, NOT and SWAP1
-/// with an immediate and the mask idiom PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the
-/// immediate from the code instead of writing it to the stack and reading it back, skip its
-/// 224-bit zero checks and one dispatch.
+/// an immediate (3.0M), SAR by an immediate, MLOAD and MSTORE at an immediate offset (2.8M), ADD,
+/// AND, NOT and SWAP1 with an immediate and the mask idiom PUSH1 PUSH1 SHL SUB (1.35M). The fused
+/// entries read the immediate from the code instead of writing it to the stack and reading it
+/// back, skip its 224-bit zero checks and one dispatch.
 /// Checks keep the separate instructions' order, so a failure stops with the same status.
 
 /// The push itself: the immediate is the byte before the successor.
@@ -1067,8 +1147,8 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// The successors that run fused with PUSH1 through push1_then().
 constexpr bool push1_fuses(Opcode op) noexcept
 {
-    return op == OP_SHL || op == OP_SHR || op == OP_MLOAD || op == OP_MSTORE || op == OP_ADD ||
-           op == OP_NOT || op == OP_SWAP1 || op == OP_AND;
+    return op == OP_SHL || op == OP_SHR || op == OP_SAR || op == OP_MLOAD || op == OP_MSTORE ||
+           op == OP_ADD || op == OP_NOT || op == OP_SWAP1 || op == OP_AND;
 }
 
 /// Word I of x <<= 32 * WS + bs, in place. Destinations are written from the most significant
@@ -1150,7 +1230,7 @@ template <Opcode Op>
         return false;
     };
     const uint32_t imm = pos.code_it[-1];
-    if constexpr (Op == OP_SHL || Op == OP_SHR)
+    if constexpr (Op == OP_SHL || Op == OP_SHR || Op == OP_SAR)
     {
         // Constantinople instructions: undefined before it, which check_requirements() tests
         // first, through the revision's cost table.
@@ -1162,6 +1242,12 @@ template <Opcode Op>
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
         word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+        if constexpr (Op == OP_SAR)
+        {
+            sar_below_256(x, imm);  // A byte: below 256.
+            pos.code_it += 1;
+            return true;
+        }
         const unsigned bs = imm & 31;
         switch (imm >> 5)  // The word shift: a byte is below 256, so there is no "all out" case.
         {
@@ -1300,7 +1386,11 @@ template <Opcode Op>
         return true;
     }
     else
+    {
+        // An opcode in push1_fuses() without a branch here would neither push nor advance.
+        static_assert(!push1_fuses(Op));
         return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
+    }
 }
 
 /// PUSH1 a PUSH1 b SHL SUB, the mask idiom (for 2^160 - 1 Solidity emits PUSH1 1 PUSH1 1 PUSH1
