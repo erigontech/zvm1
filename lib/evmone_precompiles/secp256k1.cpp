@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "secp256k1.hpp"
 #include "keccak.hpp"
+#include <vector>
 
 #if defined(SP1TURBO) || defined(SP1)
 #include <sp1_syscalls.hpp>
@@ -459,26 +460,32 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     return to_affine(Q);
 }
 
-std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
-    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
-    RecoveryMode mode) noexcept
-{
 #if defined(SP1TURBO) || defined(SP1)
-    // Validate r and s.
+namespace
+{
+/// Parses and range-checks the signature scalars as ecrecover() does.
+bool parse_signature(std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
+    RecoveryMode mode, Curve::Fr& r, Curve::Fr& s) noexcept
+{
     const auto opt_r = Curve::Fr::from_bytes(r_bytes);
     if (!opt_r.has_value() || *opt_r == 0)
-        return std::nullopt;
+        return false;
     const auto opt_s = mode == RecoveryMode::strict ?
                            Curve::Fr::from_bytes<Curve::Fr::Range::half>(s_bytes) :
                            Curve::Fr::from_bytes<Curve::Fr::Range::full>(s_bytes);
     if (!opt_s.has_value() || *opt_s == 0)
-        return std::nullopt;
-    const auto& r_fr = *opt_r;
-    const auto& s_fr = *opt_s;
+        return false;
+    r = *opt_r;
+    s = *opt_s;
+    return true;
+}
 
+/// ecrecover() after the scalar inversion, given r_inv = 1/r.
+std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> hash,
+    const Curve::Fr& r_fr, const Curve::Fr& s_fr, const Curve::Fr& r_inv, bool parity) noexcept
+{
     // Compute z, u1, u2 using FieldElement arithmetic.
     const auto z = Curve::Fr{intx::be::unsafe::load<uint256>(hash.data())};
-    const auto r_inv = 1 / r_fr;
     const auto u1 = (-z * r_inv).value();
     const auto u2 = (s_fr * r_inv).value();
     assert(u2 != 0);
@@ -515,6 +522,19 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     uint8_t serialized[64];
     sp1_point_to_bytes(serialized, sp1_Q);
     return to_address(serialized);
+}
+}  // namespace
+#endif
+
+std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
+    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
+    RecoveryMode mode) noexcept
+{
+#if defined(SP1TURBO) || defined(SP1)
+    Curve::Fr r_fr, s_fr;
+    if (!parse_signature(r_bytes, s_bytes, mode, r_fr, s_fr))
+        return std::nullopt;
+    return ecrecover_inverted(hash, r_fr, s_fr, 1 / r_fr, parity);
 #else
     // TODO(C++23): use std::optional::and_then.
     const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity, mode);
@@ -522,6 +542,44 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
         return std::nullopt;
 
     return to_address(*pubkey);
+#endif
+}
+
+void ecrecover_batch(std::span<const EcrecoverInput> in,
+    std::span<std::optional<evmc::address>> out, RecoveryMode mode) noexcept
+{
+    assert(out.size() == in.size());
+#if defined(SP1TURBO) || defined(SP1)
+    // Montgomery's trick: prefix[i] = product of the valid r before i; invert the full product
+    // once and peel each r^-1 off it walking back.
+    const auto n = in.size();
+    std::vector<Curve::Fr> r(n), s(n), prefix(n);
+    std::vector<uint8_t> valid(n);
+    auto prod = Curve::Fr::one();
+    for (size_t i = 0; i < n; ++i)
+    {
+        valid[i] = parse_signature(in[i].r, in[i].s, mode, r[i], s[i]);
+        if (valid[i])
+        {
+            prefix[i] = prod;
+            prod = prod * r[i];
+        }
+    }
+    auto inv = 1 / prod;  // r in [1, N) and N prime: prod != 0.
+    for (size_t i = n; i-- > 0;)
+    {
+        if (!valid[i])
+        {
+            out[i] = std::nullopt;
+            continue;
+        }
+        const auto r_inv = inv * prefix[i];
+        inv = inv * r[i];
+        out[i] = ecrecover_inverted(in[i].hash, r[i], s[i], r_inv, in[i].parity);
+    }
+#else
+    for (size_t i = 0; i < in.size(); ++i)
+        out[i] = ecrecover(in[i].hash, in[i].r, in[i].s, in[i].parity, mode);
 #endif
 }
 
