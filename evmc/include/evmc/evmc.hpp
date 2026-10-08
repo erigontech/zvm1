@@ -625,6 +625,12 @@ public:
         return host->get_balance(context, &address);
     }
 
+    /// get_balance() as the C struct, see get_transient_storage_raw().
+    evmc_uint256be get_balance_raw(const address& address) const noexcept
+    {
+        return host->get_balance(context, &address);
+    }
+
     uint64_t get_nonce(const address& address) const noexcept final
     {
         return host->get_nonce(context, &address);
