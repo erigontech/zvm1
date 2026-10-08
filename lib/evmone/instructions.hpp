@@ -12,6 +12,7 @@
 #include "word_layout.hpp"
 #include <evmone_precompiles/keccak.hpp>
 #include <bit>
+#include <new>
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
@@ -909,11 +910,19 @@ inline void clz(StackTop stack) noexcept
 }
 
 #ifdef EVMONE_WORD_LAYOUT
-/// The hash of the n bytes at the W pointer p, which the hash reads as bytes. Out of line, to keep
-/// the conversion out of the interpreter loop.
-[[gnu::noinline]] inline ethash::hash256 keccak256_w(const uint8_t* p, size_t n) noexcept
+/// Stores the hash of the n bytes at the W pointer p, which the hash reads as bytes, in x. Out of
+/// line, to keep both conversions out of the interpreter loop.
+[[gnu::noinline]] inline void keccak256_w(uint256& x, const uint8_t* p, size_t n) noexcept
 {
-    return ethash::keccak256(wl::scratch_copy(p, n), n);
+    const auto hash = ethash::keccak256(wl::scratch_copy(p, n), n);
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The hash is a local, so its words can be loaded: reversed straight into the stack slot
+    // instead of building the value and copying it there.
+    static_assert(alignof(ethash::hash256) >= 4);
+    intx::be::unsafe::load_aligned_into(x, hash.bytes);
+#else
+    x = intx::be::load<uint256>(hash);
+#endif
 }
 #endif
 
@@ -948,7 +957,7 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     }
 #endif
 #ifdef EVMONE_WORD_LAYOUT
-    size = intx::be::load<uint256>(keccak256_w(s != 0 ? &state.memory[i] : nullptr, s));
+    keccak256_w(size, s != 0 ? &state.memory[i] : nullptr, s);
 #else
     auto data = s != 0 ? &state.memory[i] : nullptr;
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
@@ -957,9 +966,44 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
 }
 
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Writes the 20 big-endian bytes at s (an address, at any alignment) to the stack slot at w as a
+/// 256-bit value: byte loads and stores reverse them into the low 5 words, and the 3 high words
+/// are zeroed. intx::be::load() of 20 bytes zeroes a temporary, copies the bytes into it with a
+/// memcpy call, swaps all 8 words and copies the result to the slot. One asm block keeps it to a
+/// single scratch register, see intx::internal::bswap256_bytes().
+[[gnu::always_inline]] inline void load_address_into(word32* w, const uint8_t* s) noexcept
+{
+    using Bytes = uint8_t[20];
+    uint32_t t;
+#define EVMONE_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
+    asm(EVMONE_RB(19, 0) EVMONE_RB(18, 1) EVMONE_RB(17, 2) EVMONE_RB(16, 3)
+        EVMONE_RB(15, 4) EVMONE_RB(14, 5) EVMONE_RB(13, 6) EVMONE_RB(12, 7)
+        EVMONE_RB(11, 8) EVMONE_RB(10, 9) EVMONE_RB(9, 10) EVMONE_RB(8, 11)
+        EVMONE_RB(7, 12) EVMONE_RB(6, 13) EVMONE_RB(5, 14) EVMONE_RB(4, 15)
+        EVMONE_RB(3, 16) EVMONE_RB(2, 17) EVMONE_RB(1, 18) EVMONE_RB(0, 19)
+        : [t] "=&r"(t), "=m"(*reinterpret_cast<Bytes*>(w))
+        : [d] "r"(w), [s] "r"(s), "m"(*reinterpret_cast<const Bytes*>(s)));
+#undef EVMONE_RB
+    w[5] = 0;
+    w[6] = 0;
+    w[7] = 0;
+}
+
+/// Pushes the address at a: see load_address_into().
+[[gnu::always_inline]] inline void push_address(StackTop stack, const evmc_address& a) noexcept
+{
+    load_address_into(reinterpret_cast<word32*>(stack.end()), a.bytes);
+}
+#endif
+
 inline void address(StackTop stack, ExecutionState& state) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    push_address(stack, state.msg->recipient);
+#else
     stack.push(intx::be::load<uint256>(state.msg->recipient));
+#endif
 }
 
 inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
@@ -979,17 +1023,32 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
 inline void origin(StackTop stack, ExecutionState& state) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    push_address(stack, state.get_tx_context().tx_origin);
+#else
     stack.push(intx::be::load<uint256>(state.get_tx_context().tx_origin));
+#endif
 }
 
 inline void caller(StackTop stack, ExecutionState& state) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    push_address(stack, state.msg->sender);
+#else
     stack.push(intx::be::load<uint256>(state.msg->sender));
+#endif
 }
 
 inline void callvalue(StackTop stack, ExecutionState& state) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Call values are mostly zero, and the conversion stores a leading zero word as one store.
+    // The value is word-aligned in the message, so no alignment test is needed.
+    static_assert(alignof(evmc_uint256be) >= 4);
+    intx::be::unsafe::load_aligned_into(*stack.end(), state.msg->value.bytes);
+#else
     stack.push(intx::be::load<uint256>(state.msg->value));
+#endif
 }
 
 inline void calldataload(StackTop stack, ExecutionState& state) noexcept
@@ -1293,7 +1352,11 @@ inline void blockhash(StackTop stack, ExecutionState& state) noexcept
 
 inline void coinbase(StackTop stack, ExecutionState& state) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    push_address(stack, state.get_tx_context().block_coinbase);
+#else
     stack.push(intx::be::load<uint256>(state.get_tx_context().block_coinbase));
+#endif
 }
 
 inline void timestamp(StackTop stack, ExecutionState& state) noexcept
@@ -1326,7 +1389,16 @@ inline void chainid(StackTop stack, ExecutionState& state) noexcept
 inline void selfbalance(StackTop stack, ExecutionState& state) noexcept
 {
     // TODO: introduce selfbalance in EVMC?
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The balance is received as the C struct (word-aligned), then reversed straight into the
+    // stack slot; the message's address is passed in place.
+    static_assert(alignof(evmc_uint256be) >= 4);
+    const evmc_uint256be balance =
+        state.host.get_balance_raw(evmc::internal::as_cpp(&state.msg->recipient));
+    intx::be::unsafe::load_aligned_into(*stack.end(), balance.bytes);
+#else
     stack.push(intx::be::load<uint256>(state.host.get_balance(state.msg->recipient)));
+#endif
 }
 
 inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
@@ -1561,20 +1633,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
     }
     else if constexpr (Len == 20)
     {
-        using Bytes = uint8_t[20];
-        uint32_t t;
-#define EVMONE_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
-        asm(EVMONE_RB(19, 0) EVMONE_RB(18, 1) EVMONE_RB(17, 2) EVMONE_RB(16, 3)
-            EVMONE_RB(15, 4) EVMONE_RB(14, 5) EVMONE_RB(13, 6) EVMONE_RB(12, 7)
-            EVMONE_RB(11, 8) EVMONE_RB(10, 9) EVMONE_RB(9, 10) EVMONE_RB(8, 11)
-            EVMONE_RB(7, 12) EVMONE_RB(6, 13) EVMONE_RB(5, 14) EVMONE_RB(4, 15)
-            EVMONE_RB(3, 16) EVMONE_RB(2, 17) EVMONE_RB(1, 18) EVMONE_RB(0, 19)
-            : [t] "=&r"(t), "=m"(*reinterpret_cast<Bytes*>(w))
-            : [d] "r"(w), [s] "r"(d), "m"(*reinterpret_cast<const Bytes*>(d)));
-#undef EVMONE_RB
-        w[5] = 0;
-        w[6] = 0;
-        w[7] = 0;
+        load_address_into(w, d);
     }
     else
     {
@@ -1784,16 +1843,30 @@ inline Result log(StackTop stack, int64_t gas_left, ExecutionState& state) noexc
     if ((gas_left -= cost) < 0)
         return {EVMC_OUT_OF_GAS, gas_left};
 
-    std::array<evmc::bytes32, NumTopics> topics;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The topics are converted straight into storage that implicitly holds the evmc::bytes32
+    // objects: std::array<evmc::bytes32, NumTopics> zeroes them first, and each conversion went
+    // through a zeroed temporary and a copy. Each conversion writes all 32 bytes of its topic.
+    alignas(evmc::bytes32) std::byte
+        topic_storage[sizeof(evmc::bytes32) * std::max(NumTopics, size_t{1})];
+    evmc::bytes32* const topics = std::launder(reinterpret_cast<evmc::bytes32*>(topic_storage));
     if constexpr (NumTopics > 0)
     {
-        for (auto& topic : topics)
-            topic = intx::be::store<evmc::bytes32>(stack.pop());
+        for (size_t i = 0; i < NumTopics; ++i)
+        {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+            static_assert(alignof(evmc::bytes32) >= 4);
+            intx::be::unsafe::store_aligned(topics[i].bytes, stack.pop());
+#else
+            intx::be::unsafe::store(topics[i].bytes, stack.pop());
+#endif
+        }
     }
 
-    // With the word layout the data is a W pointer; the state Host converts it.
+    // With the word layout the data is a W pointer; the state Host converts it. The message's
+    // address is passed in place: converting it to evmc::address copies it.
     const auto data = s != 0 ? &state.memory[o] : nullptr;
-    state.host.emit_log(state.msg->recipient, data, s, topics.data(), NumTopics);
+    state.host.emit_log(
+        evmc::internal::as_cpp(&state.msg->recipient), data, s, topics, NumTopics);
     return {EVMC_SUCCESS, gas_left};
 }
 
