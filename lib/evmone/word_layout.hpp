@@ -271,8 +271,8 @@ template <bool Overlap>
 inline void shift_words(uint8_t* d, const uint8_t* s, size_t words) noexcept
 {
     const auto phase = reinterpret_cast<uintptr_t>(s) & 3;
-    const auto* const src = reinterpret_cast<const word_t*>(s - phase);
-    auto* const dst = reinterpret_cast<word_t*>(d);
+    const word_t* const src = reinterpret_cast<const word_t*>(s - phase);
+    word_t* const dst = reinterpret_cast<word_t*>(d);
     const auto left = static_cast<unsigned>(8 * phase);
     const auto right = 32 - left;
     if (!Overlap || d < s)
