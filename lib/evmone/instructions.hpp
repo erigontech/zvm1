@@ -269,6 +269,43 @@ inline bool check_memory(
 #endif
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// check_memory() for the 32 bytes of MSTORE. A store starting at or below the end of the memory
+/// grows it by one word (85% of MSTORE's growths on mainnet blocks), which is made here rather
+/// than in grow_memory(). From n to n + 1 words the cost is 3 + (n + 1)^2 / 512 - n^2 / 512
+/// (floored divisions), that is 3 + (n^2 % 512 + 2n + 1) / 512, and n^2 % 512 is the low 9 bits
+/// of the wrapped 32-bit square: exact at any size.
+inline bool check_memory_for_mstore(int64_t& gas_left, Memory& memory, const uint256& offset) noexcept
+{
+    const word32* const w = reinterpret_cast<const word32*>(&offset);
+    if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
+        return false;
+
+    const auto new_size = static_cast<uint64_t>(w[0]) + 32;
+    const auto size = memory.size();
+    // Unlikely: GCC otherwise lays out the growth inline and the stores that do not grow the
+    // memory (most of them) pay for the jump around it.
+    if (new_size > size) [[unlikely]]
+    {
+        if (w[0] <= size && size + word_size <= memory.capacity())
+        {
+            const auto n = static_cast<uint32_t>(size >> 5);
+            const auto cost = 3 + ((((n * n) & 511) + 2 * n + 1) >> 9);
+            // A plain 64-bit subtraction: a deduct_gas()-style low-word update keeps gas_left in a
+            // register pair across every MSTORE.
+            if ((gas_left -= cost) < 0)
+                return false;
+            memory.grow_word_for_store(w[0]);
+            return true;
+        }
+        gas_left = grow_memory(gas_left, memory, new_size);
+        if (gas_left < 0) [[unlikely]]
+            return false;
+    }
+    return true;
+}
+#endif
+
 /// Check memory requirements for "copy" instructions.
 inline bool check_memory(
     int64_t& gas_left, Memory& memory, const uint256& offset, const uint256& size) noexcept
@@ -1424,7 +1461,13 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     const auto& index = stack.pop();
     const auto& value = stack.pop();
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+    // The fast path leaves a new word the store covers whole unzeroed: the store below writes
+    // all 32 bytes.
+    if (!check_memory_for_mstore(gas_left, state.memory, index))
+#else
     if (!check_memory(gas_left, state.memory, index, 32))
+#endif
         return {EVMC_OUT_OF_GAS, gas_left};
 
 #ifdef EVMONE_WORD_LAYOUT

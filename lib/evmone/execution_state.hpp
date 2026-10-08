@@ -83,6 +83,20 @@ class Memory
 
     [[noreturn, gnu::cold]] static void handle_out_of_memory() noexcept { std::terminate(); }
 
+    /// Zeros the @p count 32-byte words at @p index, a multiple of 32 within the capacity.
+    void zero_words(size_t index, size_t count) noexcept
+    {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+        // Word stores, as in grow(), rather than a memset call. One pointer for all of them: the
+        // stores may alias m_data itself.
+        wl::word_t* const w = reinterpret_cast<wl::word_t*>(&m_data[index]);
+        for (size_t i = 0; i < 8 * count; ++i)
+            w[i] = 0;
+#else
+        std::memset(&m_data[index], 0, 32 * count);
+#endif
+    }
+
     void allocate_capacity() noexcept
     {
         m_data.reset(static_cast<uint8_t*>(std::realloc(m_data.release(), m_capacity)));
@@ -145,6 +159,32 @@ public:
         std::memset(&m_data[m_size], 0, new_size - m_size);
 #endif
         m_size = new_size;
+    }
+
+    /// The size of the allocation: never below its initial page.
+    [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
+
+    /// Grows the memory by one word for a 32-byte store at @p offset in (size() - 32, size()],
+    /// within the capacity; the caller charges the gas. The store writes [offset, offset + 32)
+    /// right after, so the new word needs zeros only when the store starts below the old end.
+    void grow_word_for_store(size_t offset) noexcept
+    {
+        const auto old_size = m_size;  // Read once: the zeroing may alias it.
+        assert(offset <= old_size && old_size < offset + 32 && old_size + 32 <= m_capacity);
+        if (offset != old_size)
+            zero_words(old_size, 1);
+        m_size = old_size + 32;
+    }
+
+    /// Grows the empty memory to 3 words for a 32-byte store at 0x40, which writes the third one
+    /// right after: Solidity's free memory pointer initialization. The caller charges the gas.
+    /// The buffer of a frame is reused at its depth, so the first two words are zeroed.
+    void grow_empty_for_store_at_64() noexcept
+    {
+        static_assert(page_size >= 96, "the capacity is at least the initial page");
+        assert(m_size == 0);
+        zero_words(0, 2);
+        m_size = 96;
     }
 
     /// Virtually clears the memory by setting its size to 0. The capacity stays unchanged.
