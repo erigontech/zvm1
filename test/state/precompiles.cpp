@@ -929,12 +929,21 @@ constexpr auto LOOKUP_TABLE_SIZE = [] {
 PrecompileLookupIndex to_lookup_index(const evmc::address& addr) noexcept
 {
     static constexpr auto ADDRESS_SIZE = sizeof(addr.bytes);
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Two byte loads, kept apart: GCC would merge them into one halfword load and a byte swap,
+    // and an address is only byte aligned (the load must not be misaligned under -mstrict-align).
+    // The merge costs 6 instructions to the 4 of the two loads, a shift and an or.
+    uint8_t high = addr.bytes[ADDRESS_SIZE - 2];
+    asm("" : "+r"(high));
+    return static_cast<PrecompileLookupIndex>((high << 8) | addr.bytes[ADDRESS_SIZE - 1]);
+#else
     return static_cast<PrecompileLookupIndex>(
         (addr.bytes[ADDRESS_SIZE - 2] << 8) | addr.bytes[ADDRESS_SIZE - 1]);
+#endif
 }
 }  // namespace
 
-bool is_precompile(evmc_revision rev, const evmc::address& addr) noexcept
+bool is_precompile_from_byte1(evmc_revision rev, const evmc::address& addr) noexcept
 {
     static constexpr auto AVAILABILITY_LOOKUP_TABLE = [] {
         using Entry = std::underlying_type_t<evmc_revision>;
@@ -945,9 +954,19 @@ bool is_precompile(evmc_revision rev, const evmc::address& addr) noexcept
         return table;
     }();
 
-    if (addr >= evmc::address{AVAILABILITY_LOOKUP_TABLE.size()})
+    // addr < address{AVAILABILITY_LOOKUP_TABLE.size()}, most significant byte first: bytes 0 to
+    // 17 are zero, and the last two, the lookup index, are below the size.
+    static_assert(AVAILABILITY_LOOKUP_TABLE.size() <= 0x10000, "the index is the last 2 bytes");
+    assert(addr.bytes[0] == 0);
+    for (size_t i = 1; i < sizeof(addr.bytes) - 2; ++i)
+    {
+        if (addr.bytes[i] != 0)
+            return false;
+    }
+    const auto index = to_lookup_index(addr);
+    if (index >= AVAILABILITY_LOOKUP_TABLE.size())
         return false;
-    return AVAILABILITY_LOOKUP_TABLE[to_lookup_index(addr)] <= stdx::to_underlying(rev);
+    return AVAILABILITY_LOOKUP_TABLE[index] <= stdx::to_underlying(rev);
 }
 
 evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcept
