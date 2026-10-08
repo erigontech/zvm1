@@ -7,8 +7,10 @@
 #include "kzg_precomputed_lines.hpp"
 #include <blst.h>
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 
 namespace evmone::crypto
 {
@@ -56,15 +58,81 @@ blst_p1_affine add_or_double(const blst_p1_affine& p, const blst_p1& q) noexcept
     return ra;
 }
 
+/// Evaluates a precomputed Miller loop line at the G1 point P given as Px2 = (-2·P.x, 2·P.y),
+/// like blst's post_line_by_Px2(). The result is a sparse Fp12 element in blst's "xy00z0" form.
+void eval_line(blst_fp6& out, const blst_fp6& line, const blst_p1_affine& Px2) noexcept
+{
+    out.fp2[0] = line.fp2[0];
+    blst_fp_mul(&out.fp2[1].fp[0], &line.fp2[1].fp[0], &Px2.x);
+    blst_fp_mul(&out.fp2[1].fp[1], &line.fp2[1].fp[1], &Px2.x);
+    blst_fp_mul(&out.fp2[2].fp[0], &line.fp2[2].fp[0], &Px2.y);
+    blst_fp_mul(&out.fp2[2].fp[1], &line.fp2[2].fp[1], &Px2.y);
+}
+
+/// Checks e(a1, [1]₂) == e(b1, [s]₂) with a single Miller loop over both precomputed line tables.
+///
+/// blst_fp12_finalverify(GT1, GT2) exponentiates conj(GT1)·GT2 where each GT is the Miller loop
+/// product F(P) conjugated, i.e. it exponentiates F(a1)·conj(F(b1)). Negating P.y negates only
+/// the w-coefficient of every line, so F(-b1) = conj(F(b1)) and the product is F(a1)·F(-b1):
+/// one loop that multiplies both lines into the same accumulator shares all 62 squarings.
 bool pairings_verify(const blst_p1_affine& a1, const blst_p1_affine& b1) noexcept
 {
-    // Uses precomputed Miller loop lines for the G2 generator [1]₂.
-    blst_fp12 left;
-    blst_miller_loop_lines(&left, g2_gen_lines(), &a1);
-    // Uses precomputed Miller loop lines for KZG_SETUP_G2_1 ([s]₂).
-    blst_fp12 right;
-    blst_miller_loop_lines(&right, kzg_setup_g2_1_lines(), &b1);
-    return blst_fp12_finalverify(&left, &right);
+    const blst_fp6* const a_lines = g2_gen_lines();          // [1]₂
+    const blst_fp6* const b_lines = kzg_setup_g2_1_lines();  // [s]₂
+
+    blst_p1_affine a_Px2;
+    blst_fp_add(&a_Px2.x, &a1.x, &a1.x);
+    blst_fp_cneg(&a_Px2.x, &a_Px2.x, true);
+    blst_fp_add(&a_Px2.y, &a1.y, &a1.y);
+    blst_p1_affine b_Px2;  // -b1
+    blst_fp_add(&b_Px2.x, &b1.x, &b1.x);
+    blst_fp_cneg(&b_Px2.x, &b_Px2.x, true);
+    blst_fp_add(&b_Px2.y, &b1.y, &b1.y);
+    blst_fp_cneg(&b_Px2.y, &b_Px2.y, true);
+
+    // The first step is f = 1²·line = line.
+    blst_fp6 line;
+    eval_line(line, a_lines[0], a_Px2);
+    blst_fp12 f{};
+    f.fp6[0].fp2[0] = line.fp2[0];
+    f.fp6[0].fp2[1] = line.fp2[1];
+    f.fp6[1].fp2[1] = line.fp2[2];
+    eval_line(line, b_lines[0], b_Px2);
+    blst_fp12_mul_by_xy00z0(&f, &f, &line);
+
+    const auto mul_lines = [&](size_t i) noexcept {
+        eval_line(line, a_lines[i], a_Px2);
+        blst_fp12_mul_by_xy00z0(&f, &f, &line);
+        eval_line(line, b_lines[i], b_Px2);
+        blst_fp12_mul_by_xy00z0(&f, &f, &line);
+    };
+    // The remaining 67 lines in the blocks of blst's miller_loop_lines(): the line at the block
+    // start, then n times a squaring and the next line.
+    static constexpr std::pair<uint8_t, uint8_t> BLOCKS[]{{1, 2}, {4, 3}, {8, 9}, {18, 32}, {51, 16}};
+    // The blocks must take lines 1..67 in order (62 squarings), as both tables hold 68 lines.
+    static_assert([] {
+        size_t next = 1;
+        for (const auto& [start, n] : BLOCKS)
+        {
+            if (start != next)
+                return false;
+            next = size_t{start} + n + 1;
+        }
+        return next == 68;
+    }());
+    for (const auto& [start, n] : BLOCKS)
+    {
+        mul_lines(start);
+        for (size_t i = start + 1; i <= size_t{start} + n; ++i)
+        {
+            blst_fp12_sqr(&f, &f);
+            mul_lines(i);
+        }
+    }
+
+    // No final conjugation: the product already has the form finalverify exponentiates.
+    blst_final_exp(&f, &f);
+    return blst_fp12_is_one(&f);
 }
 }  // namespace
 
