@@ -141,7 +141,7 @@ bool VM::has_cached_execution() const noexcept
     return execute == static_cast<decltype(execute)>(baseline::execute);
 }
 
-evmc_result VM::execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
+evmc::Result VM::execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
     const evmc::bytes32& code_hash,
     const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept
 {

@@ -57,10 +57,10 @@ public:
     [[nodiscard]] bool has_cached_execution() const noexcept;
 
     /// Executes msg in the Baseline interpreter with the cached analysis of code_hash (made with
-    /// get_code when missing). Returns the raw result: the one copy into the caller's
-    /// evmc::Result is all it costs, where a std::optional<evmc::Result> return moved the
-    /// 80-byte result twice more per message.
-    evmc_result execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
+    /// get_code when missing). The result is built in the caller's return slot: a raw
+    /// evmc_result cost a release_raw() copy and a re-wrap per message, and a
+    /// std::optional<evmc::Result> two moves.
+    evmc::Result execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
         const evmc::bytes32& code_hash,
         const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept;
 

@@ -1728,7 +1728,7 @@ SWAP2_THEN_UNDEFINED:
 #endif
 }  // namespace
 
-evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* ctx,
+evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* ctx,
     evmc_revision rev, const evmc_message& msg, const CodeAnalysis& analysis) noexcept
 {
     const auto code = analysis.code();
@@ -1758,10 +1758,11 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
             gas = dispatch<false>(cost_table, state, gas, code_begin);
     }
 
-    const auto result = make_execution_result(state, gas);
+    // Not const: the result is returned by NRVO (evmc::Result cannot be copied).
+    auto result = make_execution_result(state, gas);
 
     if (INTX_UNLIKELY(tracer != nullptr))
-        tracer->notify_execution_end(result);
+        tracer->notify_execution_end(result.raw());
 
     return result;
 }
@@ -1773,7 +1774,7 @@ evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_co
     const bytes_view container{code, code_size};
 
     const auto code_analysis = analyze(container);
-    return execute(*vm, *host, ctx, rev, *msg, code_analysis);
+    return execute(*vm, *host, ctx, rev, *msg, code_analysis).release_raw();
     // return evmc_result{EVMC_SUCCESS, msg->gas};
 }
 }  // namespace evmone::baseline

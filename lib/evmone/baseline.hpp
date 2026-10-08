@@ -225,7 +225,7 @@ evmc_result execute(evmc_vm* vm, const evmc_host_interface* host, evmc_host_cont
     evmc_revision rev, const evmc_message* msg, const uint8_t* code, size_t code_size) noexcept;
 
 /// Executes in Baseline interpreter with the pre-processed code.
-EVMC_EXPORT evmc_result execute(VM&, const evmc_host_interface& host, evmc_host_context* ctx,
+EVMC_EXPORT evmc::Result execute(VM&, const evmc_host_interface& host, evmc_host_context* ctx,
     evmc_revision rev, const evmc_message& msg, const CodeAnalysis& analysis) noexcept;
 
 }  // namespace baseline
