@@ -18,9 +18,12 @@
 /// The JUMPDESTs go in a byte map (one byte per code position, nonzero at a JUMPDEST) instead of
 /// a bit set: the scan marks with one store and a jump tests with one byte load.
 #define EVMONE_JUMPDEST_BYTEMAP 1
+/// Code the host keeps padded in place is analyzed without a copy, see set_in_place_code_region().
+#define EVMONE_IN_PLACE_CODE 1
 #else
 #define EVMONE_LAZY_JUMPDESTS 0
 #define EVMONE_JUMPDEST_BYTEMAP 0
+#define EVMONE_IN_PLACE_CODE 0
 #endif
 
 namespace evmone
@@ -76,9 +79,9 @@ private:
 namespace baseline
 {
 #if EVMONE_JUMPDEST_BYTEMAP
-/// One byte per code position, nonzero at a JUMPDEST. The map must start zeroed and share its
-/// allocation with the code the scan reads: the scan finds a mark's address by an offset from
-/// the code's.
+/// One byte per code position, nonzero at a JUMPDEST. The map must start zeroed. The scan finds a
+/// mark's address by an integer offset from the code's address, not by pointer arithmetic: the
+/// map can lie in another allocation than the code (see set_in_place_code_region()).
 using JumpdestMap = uint8_t*;
 #else
 using JumpdestMap = BitsetSpan;
@@ -103,13 +106,23 @@ using CodeStorage = std::unique_ptr<uint8_t[]>;
 EVMC_EXPORT size_t scan_jumpdests(
     JumpdestMap map, const uint8_t* code, size_t from, size_t limit) noexcept;
 
+#if EVMONE_IN_PLACE_CODE
+/// Lets analyze() use legacy code lying in [begin, end) where it is, instead of copying it to
+/// append the 33 zero bytes of padding the interpreter needs (a STOP after the last opcode and the
+/// data of a PUSH32 cut off by the end): it does so for code followed by 33 zero bytes, which it
+/// checks each time. The caller guarantees that no byte in [begin, end + 36) changes while an
+/// analysis of such code lives, and resets the region (nullptr, nullptr) before that stops
+/// holding. One region per thread; a new one replaces the last.
+EVMC_EXPORT void set_in_place_code_region(const uint8_t* begin, const uint8_t* end) noexcept;
+#endif
+
 class CodeAnalysis
 {
 private:
     bytes_view m_code;  ///< The executable code.
 
-    /// Padded code for faster legacy code execution.
-    /// If not nullptr m_code must point to it.
+    /// Storage for the padded code for faster legacy code execution, and the JUMPDEST map.
+    /// m_code points into it, or to code analyzed in place (see set_in_place_code_region()).
     CodeStorage m_padded_code;
 
     JumpdestMap m_jumpdest_map{nullptr};
@@ -126,7 +139,8 @@ public:
         m_jumpdest_map{map}
     {}
 
-    /// Constructor for legacy code whose padded copy starts inside the owned storage.
+    /// Constructor for legacy code whose padded copy starts inside the owned storage, or which
+    /// is padded where it lies.
     CodeAnalysis(CodeStorage storage, const uint8_t* padded_code, size_t code_size,
         JumpdestMap map)
       : m_code{padded_code, code_size}, m_padded_code{std::move(storage)}, m_jumpdest_map{map}
