@@ -56,6 +56,16 @@ inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& co
     return *delegate_addr != addr ? Delegation::delegated : Delegation::none;
 }
 
+/// Sends the message of a CALL or CREATE to the host. Through the C callback the C++ Host's
+/// evmc::Result is released to a raw evmc_result and wrapped again in HostContext::call, two
+/// copies of the result per call; the same virtual call on the C++ Host returns it as is.
+inline evmc::Result host_call(ExecutionState& state, const evmc_message& msg) noexcept
+{
+    if (state.cpp_host != nullptr) [[likely]]
+        return state.cpp_host->call(msg);
+    return state.host.call(msg);
+}
+
 /// Absorbs a child's state-gas back to the parent (EIP-8037).
 inline void absorb_child_state_gas(
     int64_t& gas_left, ExecutionState& state, const evmc::Result& result) noexcept
@@ -304,7 +314,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
-    const auto result = state.host.call(msg);
+    const auto result = host_call(state, msg);
     state.return_data.assign(result.output_data, result.output_size);
     stack.top() = result.status_code == EVMC_SUCCESS;
 
@@ -436,7 +446,7 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     msg.flags = wl::FLAG_WORD_OUTPUT;  // The REVERT data is read as return data.
 #endif
 
-    const auto result = state.host.call(msg);
+    const auto result = host_call(state, msg);
     gas_left -= msg.gas - result.gas_left;
     state.gas_refund += result.gas_refund;
     absorb_child_state_gas(gas_left, state, result);
