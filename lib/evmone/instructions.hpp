@@ -705,6 +705,25 @@ inline void mulmod(StackTop stack) noexcept
 #endif
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// The bit width of @p x from its count of significant bytes @p n (that of the gas charge): 8 bits
+/// for each byte below the top one, whose own width is 8 less its leading zeros. intx::bit_width()
+/// counts leading zeros on a 64-bit word, a call to libgcc's __clzdi2 on rv32 around which the
+/// caller spills its live registers. A uint256 is little-endian, so its byte k is byte k of the
+/// object, and a char read is no alias of the words.
+[[gnu::always_inline]] inline unsigned bit_width_by_bytes(const uint256& x, unsigned n) noexcept
+{
+    if (n == 0)
+        return 0;
+    const auto top = reinterpret_cast<const uint8_t*>(&x)[n - 1];
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    return 8 * n - intx::internal::div32::clz_byte_table[top];
+#else
+    return 8 * n - static_cast<unsigned>(std::countl_zero(top));
+#endif
+}
+#endif
+
 /// Out of line, as before the word-store paths: inlined into the op wrapper and the interpreter
 /// loop it would change their size and layout for a rare instruction.
 [[gnu::noinline]] inline Result exp(
@@ -774,7 +793,12 @@ inline void mulmod(StackTop stack) noexcept
 
     // Copy exponent before overwriting with result.
     alignas(32) uint256 exp_copy = exponent;
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    const unsigned bw =
+        bit_width_by_bytes(exp_copy, static_cast<unsigned>(exponent_significant_bytes));
+#else
     const auto bw = intx::bit_width(exp_copy);
+#endif
 
     if (bw == 0)
     {
