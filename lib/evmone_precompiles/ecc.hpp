@@ -249,6 +249,24 @@ public:
         Fp.square_n_inplace(value_, n);
         return *this;
     }
+#else
+    /// In-place halving: this = this / 2. Halving commutes with the Montgomery form, so the new
+    /// value is v / 2 or (v + p) / 2, whichever is an integer.
+    FieldElement& halve() noexcept
+    {
+        const bool odd = (value_[0] & 1) != 0;
+        value_ >>= 1;
+        if (odd)
+            value_ += (ORDER >> 1) + 1;  // (v + p) / 2 for odd v and p, without v + p's carry
+        return *this;
+    }
+
+    /// In-place reverse subtraction: this = b - this.
+    FieldElement& rsub(const FieldElement& b) noexcept
+    {
+        value_ = Fp.sub(b.value_, value_);
+        return *this;
+    }
 #endif
 
     /// Named one element. Needed in the pairing templates.
