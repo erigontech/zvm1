@@ -7,7 +7,12 @@
 
 namespace evmone
 {
-std::optional<evmc::address> get_delegate_address(
+namespace
+{
+/// Reads the delegation designation of addr, whose code starts with DELEGATION_MAGIC[0].
+/// Kept out of line so that the one-byte probe in get_delegate_address(), which every CALL-like
+/// instruction runs, stays small where it is inlined.
+[[gnu::noinline, gnu::cold]] std::optional<evmc::address> read_designation(
     const evmc::HostInterface& host, const evmc::address& addr) noexcept
 {
     // Load the code prefix up to the delegation designation size.
@@ -26,5 +31,19 @@ std::optional<evmc::address> get_delegate_address(
     // assert(designation.size() == std::size(designation_buffer));
     std::ranges::copy(designation.substr(std::size(DELEGATION_MAGIC)), delegate_address.bytes);
     return delegate_address;
+}
+}  // namespace
+
+std::optional<evmc::address> get_delegate_address(
+    const evmc::HostInterface& host, const evmc::address& addr) noexcept
+{
+    // Probe the first byte alone. Since EIP-3541, only delegation designations (and a few older
+    // contracts) start with 0xEF, so almost every target is decided here. A one-byte copy is a
+    // byte move in the host, while the full 23-byte prefix costs it a memmove call.
+    uint8_t first_byte;
+    if (host.copy_code(addr, 0, &first_byte, 1) == 0 || first_byte != DELEGATION_MAGIC[0])
+        return {};
+
+    return read_designation(host, addr);
 }
 }  // namespace evmone
