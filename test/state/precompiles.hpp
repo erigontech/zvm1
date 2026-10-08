@@ -30,8 +30,20 @@ enum class PrecompileId : uint8_t
     p256verify,
 };
 
+/// is_precompile() of an address whose first byte is zero (the caller has tested it).
+[[gnu::noinline]] bool is_precompile_from_byte1(
+    evmc_revision rev, const evmc::address& addr) noexcept;
+
 /// Checks if the address @p addr is considered a precompiled contract in the revision @p rev.
-bool is_precompile(evmc_revision rev, const evmc::address& addr) noexcept;
+inline bool is_precompile(evmc_revision rev, const evmc::address& addr) noexcept
+{
+    // A precompile address is a small number, with 18 leading zero bytes. The first byte is tested
+    // here, where it rejects nearly every other address with one load and branch; the comparison
+    // of whole addresses it replaces assembled the first 8 bytes into words first.
+    if (addr.bytes[0] != 0)
+        return false;
+    return is_precompile_from_byte1(rev, addr);
+}
 
 /// Executes the message to a precompiled contract (msg.code_address must be a precompile).
 evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcept;
