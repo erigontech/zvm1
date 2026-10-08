@@ -773,8 +773,17 @@ static NO_INLINE NO_SANITIZE_ADDRESS void absorb_input_unaligned(
     absorb_input(state, block_words, data, size, misalign);
 }
 
+/// A 64-bit word of the hash keccak() stores into its caller's ethash_hash256: may alias any type
+/// the caller reads the hash's bytes through. A read through a plain word type of another width
+/// (uint32_t, say) would not be ordered against plain uint64_t stores under strict aliasing.
+#if __has_attribute(may_alias)
+typedef uint64_t __attribute__((may_alias)) keccak_word64;
+#else
+typedef uint64_t keccak_word64;
+#endif
+
 static inline ALWAYS_INLINE void keccak(
-    uint64_t* out, size_t bits, const uint8_t* data, size_t size)
+    keccak_word64* out, size_t bits, const uint8_t* data, size_t size)
 {
     const size_t hash_size = bits / 8;
     const size_t block_words = (1600 - bits * 2) / 8 / WORD_SIZE;
