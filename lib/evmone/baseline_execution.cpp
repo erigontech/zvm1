@@ -932,6 +932,110 @@ template <unsigned WS>
             x[i] = sign;
     }
 }
+
+/// Word I of x <<= 32 * WS + bs, in place. Destinations are written from the most significant
+/// word down, so every source word is read before it is overwritten. (v >> 1) >> rs is
+/// v >> (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void shl_word(word32* x, unsigned bs, unsigned rs) noexcept
+{
+    if constexpr (I < WS)
+        x[I] = 0;
+    else if constexpr (I == WS)
+        x[I] = x[0] << bs;
+    else
+        x[I] = (x[I - WS] << bs) | ((x[I - WS - 1] >> 1) >> rs);
+}
+
+template <unsigned WS>
+[[gnu::always_inline]] inline void shl_words(word32* x, unsigned bs) noexcept
+{
+    const unsigned rs = 31 - bs;
+    shl_word<WS, 7>(x, bs, rs);
+    shl_word<WS, 6>(x, bs, rs);
+    shl_word<WS, 5>(x, bs, rs);
+    shl_word<WS, 4>(x, bs, rs);
+    shl_word<WS, 3>(x, bs, rs);
+    shl_word<WS, 2>(x, bs, rs);
+    shl_word<WS, 1>(x, bs, rs);
+    shl_word<WS, 0>(x, bs, rs);
+}
+
+/// Word I of x >>= 32 * WS + bs, in place, written from the least significant word up.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void shr_word(word32* x, unsigned bs, unsigned rs) noexcept
+{
+    if constexpr (I + WS > 7)
+        x[I] = 0;
+    else if constexpr (I + WS == 7)
+        x[I] = x[7] >> bs;
+    else
+        x[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
+}
+
+template <unsigned WS>
+[[gnu::always_inline]] inline void shr_words(word32* x, unsigned bs) noexcept
+{
+    const unsigned rs = 31 - bs;
+    shr_word<WS, 0>(x, bs, rs);
+    shr_word<WS, 1>(x, bs, rs);
+    shr_word<WS, 2>(x, bs, rs);
+    shr_word<WS, 3>(x, bs, rs);
+    shr_word<WS, 4>(x, bs, rs);
+    shr_word<WS, 5>(x, bs, rs);
+    shr_word<WS, 6>(x, bs, rs);
+    shr_word<WS, 7>(x, bs, rs);
+}
+
+/// x <<= s or x >>= s in place, for a shift s below 256. The word shift s >> 5 selects an unrolled
+/// body, in which each destination word is one or two shifts and an or. Shared by the shifts of
+/// a stack operand and of a PUSH1 immediate.
+template <Opcode Op>
+[[gnu::always_inline]] inline void shift_words(word32* x, uint32_t s) noexcept
+{
+    const unsigned bs = s & 31;
+    switch (s >> 5)  // Below 256, so there is no "all out" case.
+    {
+#define SHIFT_CASE(WS)                             \
+    case WS:                                       \
+        if constexpr (Op == OP_SHL)                \
+            shl_words<WS>(x, bs);                  \
+        else                                       \
+            shr_words<WS>(x, bs);                  \
+        break;
+        SHIFT_CASE(0)
+        SHIFT_CASE(1)
+        SHIFT_CASE(2)
+        SHIFT_CASE(3)
+        SHIFT_CASE(4)
+        SHIFT_CASE(5)
+        SHIFT_CASE(6)
+        SHIFT_CASE(7)
+#undef SHIFT_CASE
+    default:
+        intx::unreachable();
+    }
+}
+
+/// SHL and SHR with both operands on the stack: the value under the shift, the result in the
+/// value's slot. The generic implementation, intx's operator<<=(uint), takes the shift by value
+/// (8 dead stores to the C stack) and builds the shift from uint128 halves with data-dependent
+/// branches: a shift below 128 costs about 45 more instructions than the word bodies. A shift
+/// of 256 or more, in any of the 8 words, gives 0, so the high 24 bits of word 0 and all of the
+/// other words are ORed rather than compared one by one.
+template <Opcode Op>
+[[gnu::always_inline]] inline void shift_by_stack(uint256* stack_end) noexcept
+{
+    const word32* const s = reinterpret_cast<const word32*>(stack_end - 1);
+    word32* const x = reinterpret_cast<word32*>(stack_end - 2);
+    if (INTX_UNLIKELY(((s[0] >> 8) | s[1] | s[2] | s[3] | s[4] | s[5] | s[6] | s[7]) != 0))
+    {
+        for (unsigned i = 0; i < 8; ++i)
+            x[i] = 0;
+    }
+    else
+        shift_words<Op>(x, s[0]);
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -1035,6 +1139,11 @@ template <Opcode Op, bool TracingEnabled>
         // it takes the result.
         sar_stack(reinterpret_cast<word32*>(pos.stack_end - 2),
             reinterpret_cast<const word32*>(pos.stack_end - 1));
+        return {pos.code_it + 1, pos.stack_end - 1};
+    }
+    if constexpr (Op == OP_SHL || Op == OP_SHR)
+    {
+        shift_by_stack<Op>(pos.stack_end);
         return {pos.code_it + 1, pos.stack_end - 1};
     }
 #endif
@@ -1151,60 +1260,6 @@ constexpr bool push1_fuses(Opcode op) noexcept
            op == OP_ADD || op == OP_NOT || op == OP_SWAP1 || op == OP_AND;
 }
 
-/// Word I of x <<= 32 * WS + bs, in place. Destinations are written from the most significant
-/// word down, so every source word is read before it is overwritten. (v >> 1) >> rs is
-/// v >> (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
-template <unsigned WS, unsigned I>
-[[gnu::always_inline]] inline void shl_word(word32* x, unsigned bs, unsigned rs) noexcept
-{
-    if constexpr (I < WS)
-        x[I] = 0;
-    else if constexpr (I == WS)
-        x[I] = x[0] << bs;
-    else
-        x[I] = (x[I - WS] << bs) | ((x[I - WS - 1] >> 1) >> rs);
-}
-
-template <unsigned WS>
-[[gnu::always_inline]] inline void shl_words(word32* x, unsigned bs) noexcept
-{
-    const unsigned rs = 31 - bs;
-    shl_word<WS, 7>(x, bs, rs);
-    shl_word<WS, 6>(x, bs, rs);
-    shl_word<WS, 5>(x, bs, rs);
-    shl_word<WS, 4>(x, bs, rs);
-    shl_word<WS, 3>(x, bs, rs);
-    shl_word<WS, 2>(x, bs, rs);
-    shl_word<WS, 1>(x, bs, rs);
-    shl_word<WS, 0>(x, bs, rs);
-}
-
-/// Word I of x >>= 32 * WS + bs, in place, written from the least significant word up.
-template <unsigned WS, unsigned I>
-[[gnu::always_inline]] inline void shr_word(word32* x, unsigned bs, unsigned rs) noexcept
-{
-    if constexpr (I + WS > 7)
-        x[I] = 0;
-    else if constexpr (I + WS == 7)
-        x[I] = x[7] >> bs;
-    else
-        x[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
-}
-
-template <unsigned WS>
-[[gnu::always_inline]] inline void shr_words(word32* x, unsigned bs) noexcept
-{
-    const unsigned rs = 31 - bs;
-    shr_word<WS, 0>(x, bs, rs);
-    shr_word<WS, 1>(x, bs, rs);
-    shr_word<WS, 2>(x, bs, rs);
-    shr_word<WS, 3>(x, bs, rs);
-    shr_word<WS, 4>(x, bs, rs);
-    shr_word<WS, 5>(x, bs, rs);
-    shr_word<WS, 6>(x, bs, rs);
-    shr_word<WS, 7>(x, bs, rs);
-}
-
 /// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
 [[gnu::always_inline]] inline void copy_slot(uint256* dst, const uint256* src) noexcept
 {
@@ -1248,28 +1303,7 @@ template <Opcode Op>
             pos.code_it += 1;
             return true;
         }
-        const unsigned bs = imm & 31;
-        switch (imm >> 5)  // The word shift: a byte is below 256, so there is no "all out" case.
-        {
-#define SHIFT_CASE(WS)                             \
-    case WS:                                       \
-        if constexpr (Op == OP_SHL)                \
-            shl_words<WS>(x, bs);                  \
-        else                                       \
-            shr_words<WS>(x, bs);                  \
-        break;
-            SHIFT_CASE(0)
-            SHIFT_CASE(1)
-            SHIFT_CASE(2)
-            SHIFT_CASE(3)
-            SHIFT_CASE(4)
-            SHIFT_CASE(5)
-            SHIFT_CASE(6)
-            SHIFT_CASE(7)
-#undef SHIFT_CASE
-        default:
-            intx::unreachable();
-        }
+        shift_words<Op>(x, imm);
         pos.code_it += 1;
         return true;
     }
