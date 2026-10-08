@@ -186,9 +186,9 @@ inline constexpr uint64_t fnv1a_by64(uint64_t h, uint64_t x) noexcept
 inline constexpr bool operator==(const address& a, const address& b) noexcept
 {
 #if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
-    using W = uint32_t;
-    const auto aw = reinterpret_cast<const W*>(&a);
-    const auto bw = reinterpret_cast<const W*>(&b);
+    typedef uint32_t __attribute__((may_alias)) W;
+    const W* const aw = reinterpret_cast<const W*>(&a);
+    const W* const bw = reinterpret_cast<const W*>(&b);
 
     for (size_t i = 0; i < (sizeof(a) / sizeof(W)); ++i)
         if (aw[i] != bw[i])
@@ -239,9 +239,9 @@ inline constexpr bool operator>=(const address& a, const address& b) noexcept
 inline constexpr bool operator==(const bytes32& a, const bytes32& b) noexcept
 {
 #if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
-    using W = size_t;
-    const auto aw = reinterpret_cast<const W*>(&a);
-    const auto bw = reinterpret_cast<const W*>(&b);
+    typedef size_t __attribute__((may_alias)) W;
+    const W* const aw = reinterpret_cast<const W*>(&a);
+    const W* const bw = reinterpret_cast<const W*>(&b);
 
     for (size_t i = 0; i < (sizeof(a) / sizeof(W)); ++i)
         if (aw[i] != bw[i])
@@ -1020,7 +1020,8 @@ struct hash<evmc::address>
         // Use the last uint32_t word directly: keccak-derived addresses have full entropy in any
         // 32-bit slice, and small ones (precompiles, system contracts) differ in their low bytes.
         // Saves 4 loads + 5 multiplies.
-        return *reinterpret_cast<const uint32_t*>(&s.bytes[16]);
+        typedef uint32_t __attribute__((may_alias)) W;
+        return *reinterpret_cast<const W*>(&s.bytes[16]);
 #elif defined(SP1TURBO) || defined(SP1)
         using W = uint32_t;
         const auto sw = reinterpret_cast<const W*>(&s);
@@ -1050,7 +1051,8 @@ struct hash<evmc::bytes32>
         // Use the last uint32_t word directly: keccak outputs have full entropy in any 32-bit
         // slice, and small storage keys (slots 0, 1, 2, ...) differ in their low bytes, which
         // the first word would map to a single bucket. Saves 7 loads + 8 multiplies per lookup.
-        return *reinterpret_cast<const uint32_t*>(&s.bytes[28]);
+        typedef uint32_t __attribute__((may_alias)) W;
+        return *reinterpret_cast<const W*>(&s.bytes[28]);
 #elif defined(SP1TURBO) || defined(SP1)
         using W = size_t;
         const auto sw = reinterpret_cast<const W*>(&s);
