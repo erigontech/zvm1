@@ -278,6 +278,45 @@ struct Position
     return (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
 }
 
+/// a < b on the 32-bit words of two 256-bit values, most significant word first.
+[[gnu::always_inline]] inline bool lt256(const word32* a, const word32* b) noexcept
+{
+#pragma GCC unroll 8
+    for (int i = 7; i > 0; --i)
+        if (a[i] != b[i])
+            return a[i] < b[i];
+    return a[0] < b[0];
+}
+
+/// a < b as two's complement 256-bit values. The most significant words compare signed: when the
+/// signs differ that decides, and with equal signs the signed order is the unsigned one.
+[[gnu::always_inline]] inline bool slt256(const word32* a, const word32* b) noexcept
+{
+    if (a[7] != b[7])
+        return static_cast<int32_t>(a[7]) < static_cast<int32_t>(b[7]);
+#pragma GCC unroll 7
+    for (int i = 6; i > 0; --i)
+        if (a[i] != b[i])
+            return a[i] < b[i];
+    return a[0] < b[0];
+}
+
+/// Whether the comparison Op holds for the top item a and the item b under it: LT is a < b, GT is
+/// b < a, SLT and SGT the same on signed values.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool cmp_holds(const word32* a, const word32* b) noexcept
+{
+    static_assert(Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT);
+    if constexpr (Op == OP_LT)
+        return lt256(a, b);
+    else if constexpr (Op == OP_GT)
+        return lt256(b, a);
+    else if constexpr (Op == OP_SLT)
+        return slt256(a, b);
+    else
+        return slt256(b, a);
+}
+
 /// PUSH2 followed by JUMP or JUMPI, which is how nearly every jump is written (99.6% of them on
 /// mainnet). The destination is the immediate, so it is never stored to the stack and read back
 /// and its high words need no zero check, and the landing JUMPDEST is folded in. The checks run
@@ -392,22 +431,27 @@ template <Opcode Op>
     return true;
 }
 
-/// The fast form of fused_cmp_push2_jumpi_seq(): the whole static gas in one test.
+/// The fast form of fused_cmp_push2_jumpi_seq(): the whole static gas in one test. It also takes
+/// LT, GT, SLT and SGT, which jump when the comparison holds (2.3M per 200 mainnet blocks) and
+/// whose checks are EQ's. When the test fails, the separate instructions run, the exact
+/// reference, except after EQ: unfused, EQ makes a BigInt delegation that its sequential form
+/// avoids.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
     const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
-    static_assert(Op == OP_ISZERO || Op == OP_EQ);
-    constexpr int required = Op == OP_EQ ? 2 : 1;
+    static_assert(Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT || Op == OP_SLT ||
+                  Op == OP_SGT);
+    constexpr int required = Op == OP_ISZERO ? 1 : 2;
     if (pos.code_it[1] != OP_PUSH2 || pos.code_it[4] != OP_JUMPI)
         return false;
     // The comparison 3, PUSH2 3, JUMPI 10, the landing JUMPDEST 1.
     if (!charge_all(gas, 3 + 3 + 10 + 1)) [[unlikely]]
     {
-        if constexpr (Op == OP_ISZERO)
-            return false;
-        else
+        if constexpr (Op == OP_EQ)
             return fused_cmp_push2_jumpi_seq<Op>(stack_bottom, stack_limit, pos, gas, state);
+        else
+            return false;
     }
     const auto fail = [&](evmc_status_code status) noexcept {
         state.status = status;
@@ -423,13 +467,32 @@ template <Opcode Op>
     }
     pos.stack_end -= required;  // The comparison leaves one, PUSH2 one more, JUMPI takes two.
     asm("" : "+r"(pos.stack_end));  // Address the popped words from the new stack_end only.
-    // The operands are the popped items: the top one a and, for EQ, b under it.
+    // The operands are the popped items: the top one a and, with two operands, b under it.
     const word32* const a = reinterpret_cast<const word32*>(pos.stack_end + (required - 1));
     bool taken;
     if constexpr (Op == OP_ISZERO)
         taken = zero256(a);
-    else
+    else if constexpr (Op == OP_EQ)
         taken = eq256(a, reinterpret_cast<const word32*>(pos.stack_end));
+#if defined(AIRBENDER) && defined(__riscv)
+    else if constexpr (Op == OP_LT || Op == OP_GT)
+    {
+        // The SUB delegation instr::core::lt() and gt() make, in 4 instructions where the word
+        // compare takes about 23: x12 = the borrow of *x10 - *x11, top minus second for LT and
+        // second minus top for GT. The difference overwrites a popped item. The ISZERO form
+        // compares words instead: fused, it has never made a delegation call.
+        uint256* const top = pos.stack_end + 1;
+        register uintptr_t r10 asm("x10") =
+            reinterpret_cast<uintptr_t>(Op == OP_LT ? top : pos.stack_end);
+        register uintptr_t r11 asm("x11") =
+            reinterpret_cast<uintptr_t>(Op == OP_LT ? pos.stack_end : top);
+        register uint32_t r12 asm("x12") = 0x02;
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+        taken = r12 != 0;
+    }
+#endif
+    else
+        taken = cmp_holds<Op>(a, reinterpret_cast<const word32*>(pos.stack_end));
     if (taken)
     {
         auto dst = static_cast<uint32_t>(pos.code_it[2]);
@@ -552,26 +615,15 @@ template <Opcode Op>
     return true;
 }
 
-/// a < b on the 32-bit words of two 256-bit values, most significant word first.
-[[gnu::always_inline]] inline bool lt256(const word32* a, const word32* b) noexcept
-{
-#pragma GCC unroll 8
-    for (int i = 7; i > 0; --i)
-        if (a[i] != b[i])
-            return a[i] < b[i];
-    return a[0] < b[0];
-}
-
-/// LT or GT, then ISZERO PUSH2 JUMPI: how Solidity branches on a comparison (2.4M per 200
-/// mainnet blocks, loop conditions and bounds checks). The comparison decides the jump without
-/// its result and the inverted result ever reaching the stack. Checks in the separate
+/// LT, GT, SLT or SGT, then ISZERO PUSH2 JUMPI: how Solidity branches on a comparison (3.0M per
+/// 200 mainnet blocks, loop conditions and bounds checks). The comparison decides the jump
+/// without its result and the inverted result ever reaching the stack. Checks in the separate
 /// instructions' order: the comparison's underflow and 3 gas, then ISZERO's 3, PUSH2's 3 (no
 /// overflow: the comparison popped one) and JUMPI's 10.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi_seq(const uint256* stack_bottom,
     Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
-    static_assert(Op == OP_LT || Op == OP_GT);
     const auto* const c = pos.code_it;
     if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
         return false;
@@ -588,8 +640,8 @@ template <Opcode Op>
         return fail(EVMC_OUT_OF_GAS);
     const word32* const top = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const word32* const second = reinterpret_cast<const word32*>(pos.stack_end - 2);
-    // LT leaves top < second, GT leaves second < top; ISZERO inverts; JUMPI jumps on non-zero.
-    const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
+    // ISZERO inverts the comparison; JUMPI jumps on non-zero.
+    const bool taken = !cmp_holds<Op>(top, second);
     pos.stack_end -= 2;  // The comparison leaves one of two, PUSH2 one more, JUMPI takes two.
     if (taken)
     {
@@ -605,18 +657,24 @@ template <Opcode Op>
         pos.code_it += 6;
     return true;
 }
-/// The fast form of fused_cmp_iszero_push2_jumpi_seq(): the whole static gas in one test.
+/// The fast form of fused_cmp_iszero_push2_jumpi_seq(): the whole static gas in one test. When
+/// the test fails, LT and GT take the sequential form: unfused, they make a BigInt delegation
+/// that it avoids. SLT and SGT make none, and their separate instructions are the exact reference.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* stack_bottom,
     Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
-    static_assert(Op == OP_LT || Op == OP_GT);
     const auto* const c = pos.code_it;
     if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
         return false;
     // The comparison 3, ISZERO 3, PUSH2 3, JUMPI 10, the landing JUMPDEST 1.
     if (!charge_all(gas, 3 + 3 + 3 + 10 + 1)) [[unlikely]]
-        return fused_cmp_iszero_push2_jumpi_seq<Op>(stack_bottom, pos, gas, state);
+    {
+        if constexpr (Op == OP_LT || Op == OP_GT)
+            return fused_cmp_iszero_push2_jumpi_seq<Op>(stack_bottom, pos, gas, state);
+        else
+            return false;
+    }
     const auto fail = [&](evmc_status_code status) noexcept {
         state.status = status;
         pos.code_it = nullptr;
@@ -626,7 +684,7 @@ template <Opcode Op>
         return fail(EVMC_STACK_UNDERFLOW);
     const word32* const top = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const word32* const second = reinterpret_cast<const word32*>(pos.stack_end - 2);
-    const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
+    const bool taken = !cmp_holds<Op>(top, second);
     pos.stack_end -= 2;
     if (taken)
     {
@@ -668,9 +726,13 @@ template <Opcode Op, bool TracingEnabled>
         if (fused_selector_test(stack_bottom, stack_limit, pos, gas, state))
             return pos;
     }
-    else if constexpr (Op == OP_LT || Op == OP_GT)
+    else if constexpr (Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT)
     {
+        // ISZERO first: it follows each of them more often than PUSH2 does, and on a partial
+        // match GCC skips the PUSH2 test, the successor being known to be ISZERO.
         if (fused_cmp_iszero_push2_jumpi<Op>(stack_bottom, pos, gas, state))
+            return pos;
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, stack_limit, pos, gas, state))
             return pos;
     }
     else if constexpr (Op == OP_JUMP)
