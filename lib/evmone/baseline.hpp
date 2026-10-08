@@ -6,6 +6,7 @@
 
 #include <evmc/evmc.hpp>
 #include <evmc/utils.h>
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 
@@ -113,7 +114,8 @@ private:
 
     JumpdestMap m_jumpdest_map{nullptr};
 #if EVMONE_LAZY_JUMPDESTS
-    mutable size_t m_scanned = 0;  ///< Positions below this are classified in the map.
+    /// Positions below this are classified in the map. Never above the code size.
+    mutable size_t m_scanned = 0;
 #endif
 
 public:
@@ -142,12 +144,18 @@ public:
     [[nodiscard]] bool check_jumpdest(uint64_t position) const noexcept
 #endif
     {
+#if EVMONE_LAZY_JUMPDESTS
+        // m_scanned never exceeds the code size, so a position below it is both inside the code
+        // and classified: one comparison covers the common case.
+        if (position >= m_scanned) [[unlikely]]
+        {
+            if (position >= m_code.size())
+                return false;
+            scan_to(static_cast<size_t>(position));
+        }
+#else
         if (position >= m_code.size())
             return false;
-#if EVMONE_LAZY_JUMPDESTS
-        if (position >= m_scanned) [[unlikely]]
-            m_scanned = scan_jumpdests(
-                m_jumpdest_map, m_code.data(), m_scanned, static_cast<size_t>(position) + 1);
 #endif
 #if EVMONE_JUMPDEST_BYTEMAP
         return m_jumpdest_map[position] != 0;
@@ -155,6 +163,40 @@ public:
         return m_jumpdest_map.test(static_cast<size_t>(position));
 #endif
     }
+
+#if EVMONE_JUMPDEST_BYTEMAP
+    /// The JUMPDEST map, for a caller that keeps it in a register: see check_jumpdest_in().
+    [[nodiscard]] JumpdestMap jumpdest_map() const noexcept { return m_jumpdest_map; }
+
+    /// check_jumpdest() with the map passed in, as jumpdest_map() returned it, which saves its
+    /// load.
+    [[nodiscard]] bool check_jumpdest_in(JumpdestMap map, uint32_t position) const noexcept
+    {
+        // The scan falls through to the one map test: returning check_jumpdest()'s result instead
+        // makes GCC merge the two answers into a register and test that on every jump.
+        if (position >= m_scanned) [[unlikely]]
+        {
+            if (position >= m_code.size())
+                return false;
+            scan_to(position);
+        }
+        return map[position] != 0;
+    }
+#endif
+
+private:
+#if EVMONE_LAZY_JUMPDESTS
+    /// Classifies the positions up to and including position, which is inside the code.
+    /// Out of line, so that the scan loop does not share registers with the interpreter's hot
+    /// state in dispatch_cgoto().
+    [[gnu::noinline]] void scan_to(size_t position) const noexcept
+    {
+        // The scan stops past the PUSH data it skips, which for a PUSH truncated by the code end
+        // is up to 32 positions past it. The map is not that long: clamp.
+        m_scanned = std::min(
+            scan_jumpdests(m_jumpdest_map, m_code.data(), m_scanned, position + 1), m_code.size());
+    }
+#endif
 };
 
 /// Analyze the EVM code in preparation for execution.
