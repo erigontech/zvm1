@@ -562,11 +562,80 @@ inline void smod(StackTop stack) noexcept
     v = v != 0 ? intx::sdivrem(stack[0], v).rem : 0;
 }
 
+#if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
+        defined(EVMONE_RV32_DISPATCH_TEST)) && \
+    !(defined(SP1TURBO) || defined(SP1))
+/// a < b on 8 words, most significant first: usually decided by the top word.
+[[gnu::always_inline]] inline bool lt8(const word32* a, const word32* b) noexcept
+{
+#pragma GCC unroll 8
+    for (int i = 7; i > 0; --i)
+        if (a[i] != b[i])
+            return a[i] < b[i];
+    return a[0] < b[0];
+}
+
+/// Sets m = (x + y) % m, in m's slot, when x < m and y < m (which also excludes m == 0);
+/// otherwise returns false with m untouched. The 64-bit carry emulation of intx::addmod costs
+/// about twice as much on rv32. Kept out of line so that its temporaries stay out of the
+/// registers of the interpreter loop.
+[[gnu::noinline]] inline bool addmod_reduced(
+    word32* m, const word32* x, const word32* y) noexcept
+{
+    if (!lt8(x, m) || !lt8(y, m))
+        return false;
+
+    // x + y < 2m, so one subtraction of m reduces it, when the sum reached 2^256 or m.
+    // The sum stays in registers: m is read in full before its slot is written.
+    uint32_t s[8];
+    s[0] = x[0] + y[0];
+    uint32_t carry = s[0] < x[0];
+#pragma GCC unroll 8
+    for (int i = 1; i < 8; ++i)
+    {
+        const uint32_t t = x[i] + y[i];
+        const uint32_t c1 = t < x[i];
+        s[i] = t + carry;
+        carry = c1 | (s[i] < t);
+    }
+
+    if (carry || !lt8(s, m))
+    {
+        uint32_t borrow = 0;
+#pragma GCC unroll 8
+        for (int i = 0; i < 8; ++i)
+        {
+            const uint32_t mi = m[i];
+            const uint32_t d = s[i] - mi;
+            const uint32_t b1 = s[i] < mi;
+            m[i] = d - borrow;
+            borrow = b1 | (d < borrow);
+        }
+    }
+    else
+    {
+#pragma GCC unroll 8
+        for (int i = 0; i < 8; ++i)
+            m[i] = s[i];
+    }
+    return true;
+}
+#endif
+
 inline void addmod(StackTop stack) noexcept
 {
     auto& x = stack.pop();
     auto& y = stack.pop();
     auto& m = stack.top();
+
+#if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
+        defined(EVMONE_RV32_DISPATCH_TEST)) && \
+    !(defined(SP1TURBO) || defined(SP1))
+    if (addmod_reduced(
+            reinterpret_cast<word32*>(&m), reinterpret_cast<const word32*>(&x),
+            reinterpret_cast<const word32*>(&y)))
+        return;
+#endif
 
     if (m == 0) [[unlikely]]
     {
