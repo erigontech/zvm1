@@ -1233,9 +1233,10 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// checks and dispatches the successor through push1_table, whose entries make the push and
 /// jump to the successor's handler (one extra instruction) or run the pair fused: SHL and SHR by
 /// an immediate (3.0M), SAR by an immediate, MLOAD and MSTORE at an immediate offset (2.8M), ADD,
-/// AND, NOT and SWAP1 with an immediate and the mask idiom PUSH1 PUSH1 SHL SUB (1.35M). The fused
-/// entries read the immediate from the code instead of writing it to the stack and reading it
-/// back, skip its 224-bit zero checks and one dispatch.
+/// AND, NOT and SWAP1 with an immediate, SIGNEXTEND from an immediate byte (0.26M) and the mask
+/// idiom PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the immediate from the code
+/// instead of writing it to the stack and reading it back, skip its 224-bit zero checks and one
+/// dispatch.
 /// Checks keep the separate instructions' order, so a failure stops with the same status.
 
 /// The push itself: the immediate is the byte before the successor.
@@ -1257,7 +1258,8 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 constexpr bool push1_fuses(Opcode op) noexcept
 {
     return op == OP_SHL || op == OP_SHR || op == OP_SAR || op == OP_MLOAD || op == OP_MSTORE ||
-           op == OP_ADD || op == OP_NOT || op == OP_SWAP1 || op == OP_AND;
+           op == OP_ADD || op == OP_NOT || op == OP_SWAP1 || op == OP_AND ||
+           op == OP_SIGNEXTEND;
 }
 
 /// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
@@ -1416,6 +1418,19 @@ template <Opcode Op>
         w[6] = ~uint32_t{0};
         w[7] = ~uint32_t{0};
         pos.stack_end += 1;
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_SIGNEXTEND)
+    {
+        // A Frontier instruction of cost 5 in every revision: no undefined-instruction check.
+        // The value under the pushed byte must exist.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 5)))
+            return fail(EVMC_OUT_OF_GAS);
+        if (imm < 31)  // For 31 and above x is unchanged.
+            instr::core::signextend_words(reinterpret_cast<word32*>(pos.stack_end - 1), imm);
         pos.code_it += 1;
         return true;
     }
