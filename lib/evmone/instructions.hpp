@@ -828,18 +828,59 @@ inline void mulmod(StackTop stack) noexcept
     return {EVMC_SUCCESS, gas_left};
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// SIGNEXTEND of x from byte e < 31 (counted from the least significant), in place on 32-bit
+/// words. The sign byte is in word e / 4: shifting it up to the top of the word and back down
+/// arithmetically extends it through the word, and the words above take its sign. The 64-bit word
+/// code needs 64-bit shifts, which take 8-9 instructions each on rv32.
+[[gnu::always_inline]] inline void signextend_words(word32* x, unsigned e) noexcept
+{
+    const unsigned wi = e / 4;
+    const unsigned sh = 24 - 8 * (e % 4);
+    const int32_t w = static_cast<int32_t>(x[wi] << sh) >> sh;
+    x[wi] = static_cast<uint32_t>(w);
+    const uint32_t sign = static_cast<uint32_t>(w >> 31);
+    switch (wi)  // Every word above wi, up to word 7.
+    {
+    case 0:
+        x[1] = sign;
+        [[fallthrough]];
+    case 1:
+        x[2] = sign;
+        [[fallthrough]];
+    case 2:
+        x[3] = sign;
+        [[fallthrough]];
+    case 3:
+        x[4] = sign;
+        [[fallthrough]];
+    case 4:
+        x[5] = sign;
+        [[fallthrough]];
+    case 5:
+        x[6] = sign;
+        [[fallthrough]];
+    case 6:
+        x[7] = sign;
+        break;
+    default:  // wi == 7: the sign word is the top one.
+        break;
+    }
+}
+#endif
+
 inline void signextend(StackTop stack) noexcept
 {
     const auto& ext = stack.pop();
     auto& x = stack.top();
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
     // On rv32im, check ext < 31 using 32-bit words to avoid constructing uint256{31}.
     const word32* const ew = reinterpret_cast<const word32*>(&ext);
     if ((ew[1] | ew[2] | ew[3] | ew[4] | ew[5] | ew[6] | ew[7]) == 0 && ew[0] < 31)
+        signextend_words(reinterpret_cast<word32*>(&x), ew[0]);
 #else
     if (ext < 31)  // For 31 we also don't need to do anything.
-#endif
     {
         const auto e = ext[0];  // uint256 -> uint64.
         const auto sign_word_index =
@@ -865,6 +906,7 @@ inline void signextend(StackTop stack) noexcept
         for (size_t i = 3; i > sign_word_index; --i)
             x[i] = sign_ex;  // Clear extended words.
     }
+#endif
 }
 
 inline void lt(StackTop stack) noexcept
