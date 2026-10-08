@@ -1158,17 +1158,22 @@ enum class MaddMode
 /// z2 = 1, written into p's own coordinates as each one dies, skipping the copies through the
 /// returned point. Its result (X3 : Y3 : Z3) is the same point as ecc::add()'s (4 X3 : 8 Y3 : 2 Z3),
 /// which is fine because callers use points only projectively (see dbl_inplace()). Taking the
-/// coordinates apart lets a negated table point pass only its new y. With Live the caller knows p
-/// is not infinity either, which saves the 8-word test of z. Returns true if the sum is the point
-/// at infinity (p == -(x2, y2)), and then leaves p with z == 0. The ratio and zinv modes need Live:
-/// p is never the point at infinity there. The formulas use no curve constant, so p may run on any
-/// curve y^2 = x^3 + b'.
-template <bool Live = false, MaddMode Mode = MaddMode::plain>
+/// coordinates apart lets a table point pass only its y. With Live the caller knows p is not
+/// infinity either, which saves the 8-word test of z. With NegY it adds (x2, -y2) instead,
+/// without materializing -y2: the formula's r = s2 - y1 becomes -r = s2 + y1 (r only enters
+/// squared and as the factor of v - x3, which then flips to x3 - v), so the result is
+/// bit-identical to passing -y2, and r == 0 still marks the doubling and infinity cases. Returns
+/// true if the sum is the point at infinity (p == -(x2, y2), or p == (x2, y2) with NegY), and then
+/// leaves p with z == 0. The ratio and zinv modes need Live: p is never the point at infinity
+/// there. The formulas use no curve constant, so p may run on any curve y^2 = x^3 + b'.
+template <bool Live = false, MaddMode Mode = MaddMode::plain, bool NegY = false>
 __attribute__((flatten)) bool madd_inplace(ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_,
     const Curve::Fp& y2_, [[maybe_unused]] const Curve::Fp* zg_ = nullptr,
     [[maybe_unused]] Curve::Fp* ratio_ = nullptr) noexcept
 {
     static_assert(Live || Mode == MaddMode::plain);
+    // The not-live set of p would store y2, not -y2, and the ratio table is built from +y points.
+    static_assert(!NegY || (Live && Mode != MaddMode::ratio));
     using FE = Curve::Fp;
     auto& p = *assume_aligned_32(&p_);
     const auto& x2 = *assume_aligned_32(&x2_);
@@ -1199,15 +1204,19 @@ __attribute__((flatten)) bool madd_inplace(ecc::ProjPoint<Curve>& p_, const Curv
     DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
     z1z1 *= *zs; z1z1 *= y2;                     // s2 = y2 z1^3
     h -= x1;                                     // h = u2 - x1
-    z1z1 -= y1;                                  // r = s2 - y1
+    // Before the h == 0 test: z1z1 == 0 must see +/-r there.
+    if constexpr (NegY)
+        z1z1 += y1;                              // -r = s2 + y1
+    else
+        z1z1 -= y1;                              // r = s2 - y1
     if (is_zero_low_first(h)) [[unlikely]]
     {
-        if (z1z1 == 0)  // p == (x2, y2)
+        if (z1z1 == 0)  // p == (x2, y2), or with NegY p == (x2, -y2)
         {
             dbl_inplace(p);
             return false;
         }
-        z1 = FE{};  // p == -(x2, y2): the sum is the point at infinity.
+        z1 = FE{};  // p == -(x2, y2), or with NegY p == (x2, y2): the sum is the point at infinity.
         return true;
     }
     if constexpr (Mode == MaddMode::ratio)
@@ -1218,9 +1227,12 @@ __attribute__((flatten)) bool madd_inplace(ecc::ProjPoint<Curve>& p_, const Curv
     hh *= x1;                                    // v = x1 h^2
     x1 = z1z1; x1 *= z1z1;                       // r^2
     x1 -= h; x1 -= hh; x1 -= hh;                 // x3 = r^2 - h^3 - 2v
-    hh -= x1;                                    // v - x3
+    if constexpr (NegY)
+        hh.rsub(x1);                             // x3 - v
+    else
+        hh -= x1;                                // v - x3
     y1 *= h;                                     // y1 h^3
-    z1z1 *= hh;                                  // r (v - x3)
+    z1z1 *= hh;                                  // r (v - x3), as (-r) (x3 - v) with NegY
     y1.rsub(z1z1);                               // y3 = r (v - x3) - y1 h^3
     return false;
 }
@@ -1252,6 +1264,18 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
             started = true;
         }
     };
+    // add(x, -y) for the G table's negated digits, without computing -y unless it must be stored.
+    const auto add_neg = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+        if (started)
+            started = !madd_inplace<true, MaddMode::plain, true>(result, x, y);
+        else
+        {
+            result.x = x;
+            result.y = -y;
+            result.z = FP_ONE;
+            started = true;
+        }
+    };
     for (auto i = top; i-- != 0;)
     {
         if (started)
@@ -1272,7 +1296,7 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
         {
             const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_ga)
-                add(pt.x, -pt.y);
+                add_neg(pt.x, pt.y);
             else
                 add(pt.x, pt.y);
         }
@@ -1280,7 +1304,7 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_gb)
-                add(pt.x, -pt.y);
+                add_neg(pt.x, pt.y);
             else
                 add(pt.x, pt.y);
         }
@@ -1385,9 +1409,11 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
     DECL_FE_COPY(FE, zg2, zg);
     DECL_FE_COPY(FE, zg3, zg);
     bool have_zg_powers = false;
-    const auto add_g = [&](const FE& x, const FE& y) noexcept {
+    // NegY adds the negated point (x, -y) without computing -y, as in madd_inplace().
+    const auto add_g = [&](const FE& x, const FE& y, auto neg_y) noexcept {
+        constexpr bool NegY = decltype(neg_y)::value;
         if (started)
-            started = !madd_inplace<true, MaddMode::zinv>(result, x, y, &zg);
+            started = !madd_inplace<true, MaddMode::zinv, NegY>(result, x, y, &zg);
         else
         {
             if (!have_zg_powers)
@@ -1401,6 +1427,8 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
             result.x *= zg2;
             result.y = y;
             result.y *= zg3;
+            if constexpr (NegY)
+                result.y = -result.y;
             result.z = FP_ONE;
             started = true;
         }
@@ -1424,17 +1452,17 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
         {
             const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != a1.sign)
-                add_g(pt.x, -pt.y);
+                add_g(pt.x, pt.y, std::true_type{});
             else
-                add_g(pt.x, pt.y);
+                add_g(pt.x, pt.y, std::false_type{});
         }
         if (const int d = naf_gb[i]; d != 0)
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != b1.sign)
-                add_g(pt.x, -pt.y);
+                add_g(pt.x, pt.y, std::true_type{});
             else
-                add_g(pt.x, pt.y);
+                add_g(pt.x, pt.y, std::false_type{});
         }
     }
     result.z *= zg;
