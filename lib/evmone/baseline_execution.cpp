@@ -1043,9 +1043,10 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// 5 instructions whichever table it goes through. The PUSH1 handler therefore makes its own
 /// checks and dispatches the successor through push1_table, whose entries make the push and
 /// jump to the successor's handler (one extra instruction) or run the pair fused: SHL and SHR by
-/// an immediate (3.0M), MLOAD and MSTORE at an immediate offset (2.8M) and the mask idiom
-/// PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the immediate from the code instead of
-/// writing it to the stack and reading it back, skip its 224-bit zero checks and one dispatch.
+/// an immediate (3.0M), MLOAD and MSTORE at an immediate offset (2.8M), ADD, AND, NOT and SWAP1
+/// with an immediate and the mask idiom PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the
+/// immediate from the code instead of writing it to the stack and reading it back, skip its
+/// 224-bit zero checks and one dispatch.
 /// Checks keep the separate instructions' order, so a failure stops with the same status.
 
 /// The push itself: the immediate is the byte before the successor.
@@ -1066,7 +1067,8 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// The successors that run fused with PUSH1 through push1_then().
 constexpr bool push1_fuses(Opcode op) noexcept
 {
-    return op == OP_SHL || op == OP_SHR || op == OP_MLOAD || op == OP_MSTORE;
+    return op == OP_SHL || op == OP_SHR || op == OP_MLOAD || op == OP_MSTORE || op == OP_ADD ||
+           op == OP_NOT || op == OP_SWAP1 || op == OP_AND;
 }
 
 /// Word I of x <<= 32 * WS + bs, in place. Destinations are written from the most significant
@@ -1121,6 +1123,19 @@ template <unsigned WS>
     shr_word<WS, 5>(x, bs, rs);
     shr_word<WS, 6>(x, bs, rs);
     shr_word<WS, 7>(x, bs, rs);
+}
+
+/// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
+[[gnu::always_inline]] inline void copy_slot(uint256* dst, const uint256* src) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(dst);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(src);
+    register uint32_t r12 asm("x12") = 0x80;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
+    *dst = *src;
+#endif
 }
 
 /// The fused PUSH1 + Op, entered after PUSH1's own checks with the push not yet made: the
@@ -1223,6 +1238,67 @@ template <Opcode Op>
         pos.code_it += 1;
         return true;
     }
+    else if constexpr (Op == OP_ADD || Op == OP_AND || Op == OP_SWAP1)
+    {
+        // Two operands: the pushed one and x under it, then 3 gas.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+        if constexpr (Op == OP_ADD)
+        {
+            // The carry runs up through the words that wrap to 0, rarely past the first.
+            const uint32_t lo = x[0] + imm;
+            x[0] = lo;
+            if (INTX_UNLIKELY(lo < imm))
+            {
+                for (unsigned i = 1; i < 8 && ++x[i] == 0; ++i)
+                {
+                }
+            }
+        }
+        else
+        {
+            // AND keeps only the immediate's bits of x[0]. SWAP1 moves x up into the push's slot
+            // and the immediate takes its place.
+            if constexpr (Op == OP_SWAP1)
+            {
+                copy_slot(pos.stack_end, pos.stack_end - 1);
+                pos.stack_end += 1;
+                x[0] = imm;
+            }
+            else
+                x[0] &= imm;
+            x[1] = 0;
+            x[2] = 0;
+            x[3] = 0;
+            x[4] = 0;
+            x[5] = 0;
+            x[6] = 0;
+            x[7] = 0;
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_NOT)
+    {
+        // The one operand is the pushed item: no underflow. 3 gas.
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        word32* const w = reinterpret_cast<word32*>(pos.stack_end);
+        w[0] = ~imm;
+        w[1] = ~uint32_t{0};
+        w[2] = ~uint32_t{0};
+        w[3] = ~uint32_t{0};
+        w[4] = ~uint32_t{0};
+        w[5] = ~uint32_t{0};
+        w[6] = ~uint32_t{0};
+        w[7] = ~uint32_t{0};
+        pos.stack_end += 1;
+        pos.code_it += 1;
+        return true;
+    }
     else
         return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
 }
@@ -1298,19 +1374,6 @@ template <Opcode Op>
 #endif
     pos.code_it += 4;
     return true;
-}
-
-/// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
-[[gnu::always_inline]] inline void copy_slot(uint256* dst, const uint256* src) noexcept
-{
-#if defined(AIRBENDER) && defined(__riscv)
-    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(dst);
-    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(src);
-    register uint32_t r12 asm("x12") = 0x80;
-    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-#else
-    *dst = *src;
-#endif
 }
 
 /// *dst += *src: the one BigInt delegation ADD makes.
