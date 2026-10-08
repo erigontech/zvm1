@@ -7,6 +7,7 @@
 #pragma once
 
 #include "hash_types.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifndef __cplusplus
@@ -19,6 +20,11 @@ extern "C" {
 
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size) noexcept;
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32]) noexcept;
+
+/// Whether ethash_keccak256() of the @p size bytes at @p data is the 32 bytes at @p expected, both
+/// at any alignment. On the Airbender guest the hash stays in the Keccak state and is compared
+/// there, which spares a caller that only checks a hash its stores and reloads.
+bool ethash_keccak256_eq(const uint8_t* expected, const uint8_t* data, size_t size) noexcept;
 
 /// ethash_keccak256() of the @p size bytes at @p data, which must be 8-byte aligned and hold at least
 /// @p blocks (1 or more) whole 136-byte blocks, that also leaves the Keccak state after those

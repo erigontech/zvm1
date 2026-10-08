@@ -6,6 +6,7 @@
 #include "keccak.h"
 
 #include <stdint.h>
+#include <string.h>
 
 #ifdef SP1TURBO
 void syscall_keccak_permute(uint64_t (*state)[25]);
@@ -833,9 +834,83 @@ static inline ALWAYS_INLINE void keccak(
 
     keccakf1600_best(state);
 
-    for (size_t i = 0; i < (hash_size / WORD_SIZE); ++i)
-        out[i] = to_le64(state[i]);
+    // No out: the caller reads the hash where it is (AIRBENDER, state in buf[]).
+    if (out)
+    {
+        for (size_t i = 0; i < (hash_size / WORD_SIZE); ++i)
+            out[i] = to_le64(state[i]);
+    }
 }
+
+#if defined(AIRBENDER)
+/// Keccak-256 of a short input (size < 136: a single block), left in buf[0..3]. The state is buf[]
+/// as in keccak(), so ethash_keccak256() stores the hash from it and ethash_keccak256_eq() compares
+/// it where it is.
+static inline ALWAYS_INLINE void keccak256_short_into_buf(const uint8_t* data, size_t size)
+{
+    // Direct copy to CSR-aligned buf: skip buf_zero_all() + XOR loop since
+    // XOR-with-zero is identity. Copy data via uint32_t when aligned (~2x faster
+    // than load_le + XOR), then zero only the remaining buf words.
+    int i;
+    keccak_word32* bufW = (keccak_word32*)buf;
+    const uint8_t* d = data;
+    size_t remaining = size;
+
+    // Fast path: copy full 4-byte words when data is 4-byte aligned.
+    if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
+    {
+        const size_t words = copy_short_aligned((keccak_word32*)buf, data, size);
+        buf_zero_state_from(4 * words);
+        buf[16] |= 0x8000000000000000ULL;
+        keccak_permute_buf();
+        return;
+    }
+    if (0)
+    {
+        const keccak_word32* dW = (const keccak_word32*)d;
+        size_t full_words = remaining / 4;
+        for (size_t j = 0; j < full_words; ++j)
+            bufW[j] = dW[j];
+        d += full_words * 4;
+        bufW += full_words;
+        remaining -= full_words * 4;
+    }
+    else
+    {
+        // Unaligned: use load_le for full uint64_t chunks.
+        uint64_t* buf_iter = buf;
+        while (remaining >= 8)
+        {
+            *buf_iter++ = load_le_any(d);
+            d += 8;
+            remaining -= 8;
+        }
+        bufW = (keccak_word32*)buf_iter;
+    }
+
+    // Handle remaining bytes + padding byte 0x01.
+    uint64_t last_word = 0;
+    uint8_t* lw = (uint8_t*)&last_word;
+    for (i = 0; i < (int)remaining; ++i)
+        lw[i] = d[i];
+    lw[remaining] = 0x01;
+    {
+        // Write last_word at current position (may be uint32_t-misaligned).
+        const keccak_word32* lwd = (const keccak_word32*)&last_word;
+        bufW[0] = lwd[0];
+        bufW[1] = lwd[1];
+        bufW += 2;
+    }
+
+    // Zero the rest of the state (the scratch lanes need no clearing).
+    buf_zero_state_from((size_t)((uintptr_t)bufW - (uintptr_t)buf));
+
+    buf[16] |= 0x8000000000000000ULL;
+
+    keccak_permute_buf();
+}
+
+#endif
 
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 {
@@ -845,81 +920,44 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
     // Most EVM inputs are < 136 bytes (single block). Specialize.
     if (size < 136)
     {
-        // Direct copy to CSR-aligned buf: skip buf_zero_all() + XOR loop since
-        // XOR-with-zero is identity. Copy data via uint32_t when aligned (~2x faster
-        // than load_le + XOR), then zero only the remaining buf words.
-        {
-            int i;
-            keccak_word32* bufW = (keccak_word32*)buf;
-            const uint8_t* d = data;
-            size_t remaining = size;
-
-            // Fast path: copy full 4-byte words when data is 4-byte aligned.
-            if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
-            {
-                const size_t words = copy_short_aligned((keccak_word32*)buf, data, size);
-                buf_zero_state_from(4 * words);
-                buf[16] |= 0x8000000000000000ULL;
-                keccak_permute_buf();
-                hash.word64s[0] = to_le64(buf[0]);
-                hash.word64s[1] = to_le64(buf[1]);
-                hash.word64s[2] = to_le64(buf[2]);
-                hash.word64s[3] = to_le64(buf[3]);
-                return hash;
-            }
-            if (0)
-            {
-                const keccak_word32* dW = (const keccak_word32*)d;
-                size_t full_words = remaining / 4;
-                for (size_t j = 0; j < full_words; ++j)
-                    bufW[j] = dW[j];
-                d += full_words * 4;
-                bufW += full_words;
-                remaining -= full_words * 4;
-            }
-            else
-            {
-                // Unaligned: use load_le for full uint64_t chunks.
-                uint64_t* buf_iter = buf;
-                while (remaining >= 8)
-                {
-                    *buf_iter++ = load_le_any(d);
-                    d += 8;
-                    remaining -= 8;
-                }
-                bufW = (keccak_word32*)buf_iter;
-            }
-
-            // Handle remaining bytes + padding byte 0x01.
-            uint64_t last_word = 0;
-            uint8_t* lw = (uint8_t*)&last_word;
-            for (i = 0; i < (int)remaining; ++i)
-                lw[i] = d[i];
-            lw[remaining] = 0x01;
-            {
-                // Write last_word at current position (may be uint32_t-misaligned).
-                const keccak_word32* lwd = (const keccak_word32*)&last_word;
-                bufW[0] = lwd[0];
-                bufW[1] = lwd[1];
-                bufW += 2;
-            }
-
-            // Zero the rest of the state (the scratch lanes need no clearing).
-            buf_zero_state_from((size_t)((uintptr_t)bufW - (uintptr_t)buf));
-
-            buf[16] |= 0x8000000000000000ULL;
-
-            keccak_permute_buf();
-            hash.word64s[0] = to_le64(buf[0]);
-            hash.word64s[1] = to_le64(buf[1]);
-            hash.word64s[2] = to_le64(buf[2]);
-            hash.word64s[3] = to_le64(buf[3]);
-            return hash;
-        }
+        keccak256_short_into_buf(data, size);
+        hash.word64s[0] = to_le64(buf[0]);
+        hash.word64s[1] = to_le64(buf[1]);
+        hash.word64s[2] = to_le64(buf[2]);
+        hash.word64s[3] = to_le64(buf[3]);
+        return hash;
     }
 #endif
     keccak(hash.word64s, 256, data, size);
     return hash;
+}
+
+bool ethash_keccak256_eq(const uint8_t* expected, const uint8_t* data, size_t size)
+{
+#if defined(AIRBENDER)
+    if (size < 136)
+        keccak256_short_into_buf(data, size);
+    else
+        keccak(NULL, 256, data, size);
+    // The digest is buf[0..3] (to_le64() is the identity here), so the words are its bytes. The
+    // compare stops at the first differing word: a node that fails it is the rare case.
+    if (__builtin_expect(((uintptr_t)expected & 3) == 0, 1))
+    {
+        const keccak_word32* const h = (const keccak_word32*)buf;
+        const keccak_word32* const e = (const keccak_word32*)expected;
+#pragma GCC unroll 8
+        for (size_t i = 0; i < 8; ++i)
+        {
+            if (h[i] != e[i])
+                return false;
+        }
+        return true;
+    }
+    return memcmp(buf, expected, 32) == 0;
+#else
+    const union ethash_hash256 hash = ethash_keccak256(data, size);
+    return memcmp(hash.bytes, expected, 32) == 0;
+#endif
 }
 
 /// Copies the 25 lanes of the state in buf[] to the pool slot. Word by word and unrolled: a loop
