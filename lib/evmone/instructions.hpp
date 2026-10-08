@@ -506,7 +506,18 @@ inline void callvalue(StackTop stack, ExecutionState& state) noexcept
 
 #if defined(__riscv) && !defined(__riscv_zbb)
 // Without a byte-swap instruction an access of unproven alignment is split into byte accesses,
-// and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap.
+// and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap,
+// PUSH data is assembled in big-endian order directly.
+
+/// Big-endian value of the Len bytes at p.
+template <size_t Len>
+[[gnu::always_inline]] inline uint64_t load_be_bytes(const uint8_t* p) noexcept
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < Len; ++i)
+        v = (v << 8) | p[i];
+    return v;
+}
 
 [[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
 {
@@ -950,6 +961,31 @@ inline uint64_t load_partial_push_data<4>(code_iterator pos) noexcept
 /// @tparam Len The number of push data bytes, e.g. PUSH3 is push<3>.
 ///
 /// It assumes that at least 32 bytes of data are available, so code padding is required.
+#if defined(__riscv) && !defined(__riscv_zbb)
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    using word_type = uint256::word_type;
+    static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
+    static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
+
+    // Built in registers and pushed once: pushing zero first leaves four dead stores.
+    uint256 r;
+    pos += 1;  // Skip the opcode.
+    if constexpr (NUM_PARTIAL_BYTES != 0)
+    {
+        r[NUM_FULL_WORDS] = load_be_bytes<NUM_PARTIAL_BYTES>(pos);
+        pos += NUM_PARTIAL_BYTES;
+    }
+    for (size_t i = 0; i < NUM_FULL_WORDS; ++i)
+    {
+        r[NUM_FULL_WORDS - 1 - i] = load_be_bytes<sizeof(word_type)>(pos);
+        pos += sizeof(word_type);
+    }
+    stack.push(r);
+    return pos;
+}
+#else
 template <size_t Len>
 inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
 {
@@ -980,6 +1016,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
 
     return pos;
 }
+#endif
 
 /// DUP instruction implementation.
 /// @tparam N  The number as in the instruction definition, e.g. DUP3 is dup<3>.
