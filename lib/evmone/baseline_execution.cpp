@@ -10,6 +10,7 @@
 #include "zilk_core/print.hpp"
 #include "vm.hpp"
 
+#include <bit>
 #include <memory>
 
 #ifdef NDEBUG
@@ -769,6 +770,98 @@ template <Opcode Op>
     }
     return true;
 }
+
+/// Whether the 20 immediate bytes of the PUSH20 at c are all 0xff. The 6 aligned words that
+/// cover them are read, and the bytes outside the immediate are forced to 0xff: on a
+/// little-endian target the low k bytes of the first word precede it and the rest of the last
+/// word follows it. The reads stay within the allocation of the analysis copy (see
+/// analyze_legacy()): it is at least 4-aligned, so rounding c + 1 down to 4 stays inside it (on
+/// the guest the copy may start up to 31 bytes in, after bytes of fresh heap RAM, which read as
+/// zero: the guest's calloc does not clear), and the last word
+/// ends at most at c + 24, inside the 33 zero bytes after the code (a truncated PUSH20 sees 0x00
+/// bytes and fails the test).
+[[gnu::always_inline]] inline bool push20_all_ones(const uint8_t* c) noexcept
+{
+    static_assert(std::endian::native == std::endian::little);
+    const uint8_t* const d = c + 1;
+    const auto k = static_cast<unsigned>(reinterpret_cast<uintptr_t>(d) & 3);
+    const word32* const w = reinterpret_cast<const word32*>(d - k);
+    const uint32_t before = (uint32_t{1} << (8 * k)) - 1;
+    return ((w[0] | before) & w[1] & w[2] & w[3] & w[4] & (w[5] | ~before)) == ~uint32_t{0};
+}
+
+/// PUSH20 0xff..ff AND: Solidity's address mask (1.09M per 200 mainnet blocks). x & (2^160 - 1)
+/// clears the 3 high words of x in place; the mask is never written to the stack, nor read back
+/// by a separate AND. Checks in the separate instructions' order: PUSH20's overflow, then AND's
+/// underflow (the item under the mask), after both charges in one test. When that test fails the
+/// two instructions run separately, the exact reference.
+[[gnu::always_inline]] inline bool fused_push20_mask_and(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto* const c = pos.code_it;
+    if (c[21] != OP_AND || !push20_all_ones(c))
+        return false;
+    // PUSH20 3, AND 3.
+    if (!charge_all(gas, 3 + 3)) [[unlikely]]
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+    x[5] = 0;
+    x[6] = 0;
+    x[7] = 0;
+    pos.code_it += 22;
+    return true;
+}
+
+/// PUSH4 imm AND (332K per 200 mainnet blocks, nearly all with imm 0xffffffff): x & imm has one
+/// word. Checks as in fused_push20_mask_and().
+[[gnu::always_inline]] inline bool fused_push4_and(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto* const c = pos.code_it;
+    // Three in four PUSH4s are followed by something else: keep their path the straight one.
+    if (c[5] != OP_AND) [[likely]]
+        return false;
+    // PUSH4 3, AND 3.
+    if (!charge_all(gas, 3 + 3)) [[unlikely]]
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    // The 4 immediate bytes, big-endian, built with the barrier of push_data_word().
+    uint32_t imm = c[1];
+    asm("" : "+r"(imm));
+    imm = imm << 8 | c[2];
+    asm("" : "+r"(imm));
+    imm = imm << 8 | c[3];
+    asm("" : "+r"(imm));
+    imm = imm << 8 | c[4];
+    word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+    x[0] &= imm;
+    x[1] = 0;
+    x[2] = 0;
+    x[3] = 0;
+    x[4] = 0;
+    x[5] = 0;
+    x[6] = 0;
+    x[7] = 0;
+    pos.code_it += 6;
+    return true;
+}
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
@@ -800,6 +893,16 @@ template <Opcode Op, bool TracingEnabled>
         if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state, jb))
             return pos;
         if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state, jb))
+            return pos;
+    }
+    else if constexpr (Op == OP_PUSH20)
+    {
+        if (fused_push20_mask_and(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_PUSH4)
+    {
+        if (fused_push4_and(stack_bottom, stack_limit, pos, gas, state))
             return pos;
     }
     else if constexpr (Op == OP_JUMP)
@@ -1127,7 +1230,8 @@ template <Opcode Op>
 /// PUSH1 a PUSH1 b SHL SUB, the mask idiom (for 2^160 - 1 Solidity emits PUSH1 1 PUSH1 1 PUSH1
 /// 0xa0 SHL SUB): the top item x becomes (a << b) - x. Entered after the first PUSH1's checks
 /// with pos at the second PUSH1. The shifted constant is built in the first push's free slot and
-/// the subtraction is the one BigInt delegation SUB makes anyway.
+/// the subtraction is the one BigInt delegation SUB makes anyway. The address mask followed by
+/// AND also takes the AND, without either.
 [[gnu::always_inline]] inline bool push1_shl_sub(const uint256* stack_bottom,
     const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
@@ -1138,13 +1242,34 @@ template <Opcode Op>
     // Second PUSH1: overflow with one item already pushed, 3 gas. SHL has its two operands: 3
     // gas. SUB needs x under the shifted constant: underflow, 3 gas.
     // The caller has charged the 9 gas with charge_all().
-    (void)gas;
     if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
         return fail(EVMC_STACK_OVERFLOW);
     if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
         return fail(EVMC_STACK_UNDERFLOW);
     const uint32_t a = pos.code_it[-1];
     const uint32_t b = pos.code_it[1];
+    if (pos.code_it[4] == OP_AND && a == 1 && b == 160)
+    {
+        // With x == 1 the result is 2^160 - 1, and an AND follows: Solidity's address mask
+        // (404K per 200 mainnet blocks). The AND clears the 3 high words of the item y under x,
+        // after its own underflow test and 3 gas; neither the mask nor the SUB is made. Other
+        // operands that give the same mask take the general path.
+        const word32* const x = reinterpret_cast<const word32*>(pos.stack_end - 1);
+        if (((x[0] ^ 1) | x[1] | x[2] | x[3] | x[4] | x[5] | x[6] | x[7]) == 0)
+        {
+            if (INTX_UNLIKELY(pos.stack_end - 1 == stack_bottom))
+                return fail(EVMC_STACK_UNDERFLOW);
+            if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+                return fail(EVMC_OUT_OF_GAS);
+            word32* const y = reinterpret_cast<word32*>(pos.stack_end - 2);
+            y[5] = 0;
+            y[6] = 0;
+            y[7] = 0;
+            pos.stack_end -= 1;
+            pos.code_it += 5;
+            return true;
+        }
+    }
     // c = a << b: a byte shifted by b < 256 lands in words b / 32 and b / 32 + 1.
     word32* const c = reinterpret_cast<word32*>(pos.stack_end);
     c[0] = 0;
@@ -1157,9 +1282,11 @@ template <Opcode Op>
     c[7] = 0;
     const unsigned ws = b >> 5;
     const unsigned bs = b & 31;
-    c[ws] = a << bs;
+    // Through one pointer: indexing c twice, GCC computes the address of c[ws + 1] apart.
+    word32* const cw = c + ws;
+    cw[0] = a << bs;
     if (ws < 7)
-        c[ws + 1] = (a >> 1) >> (31 - bs);
+        cw[1] = (a >> 1) >> (31 - bs);
     // x = c - x: CSR SUB_AND_NEGATE (0x04) is *x10 = *x11 - *x10, as instr::core::sub() uses it.
 #if defined(AIRBENDER) && defined(__riscv)
     register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(pos.stack_end - 1);
