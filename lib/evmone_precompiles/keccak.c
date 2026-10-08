@@ -1024,6 +1024,230 @@ union ethash_hash256 ethash_keccak256_resume(
     return hash;
 }
 
+/// The size of a full trie branch: a 3-byte list header, 16 slots of 0xa0 and a 32-byte hash, and
+/// the empty value 0x80. Four blocks: three of 136 bytes and a last one of 124.
+#define FULL_BRANCH_SIZE 532
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size_t blocks,
+    const uint8_t* node, uint32_t dirty, const uint8_t* hashes, const uint8_t* const* ptrs)
+{
+    // The word deltas below assume little-endian lanes: hash the patched copy instead.
+    uint64_t copy[(FULL_BRANCH_SIZE + 7) / 8];
+    uint8_t* const p = (uint8_t*)copy;
+    __builtin_memcpy(p, node, FULL_BRANCH_SIZE);
+    for (unsigned j = 0; j < 16; ++j)
+    {
+        if (dirty & (1u << j))
+            __builtin_memcpy(p + 4 + 33 * j, ptrs[j] ? ptrs[j] : hashes + 32 * j, 32);
+    }
+    return blocks != 0 ? ethash_keccak256_resume(slot, blocks, p, FULL_BRANCH_SIZE) :
+                         ethash_keccak256(p, FULL_BRANCH_SIZE);
+}
+#else
+/// A 32-bit word of the node, of a hash or of the state (64-bit lanes): may alias them all.
+#if __has_attribute(may_alias)
+typedef uint32_t __attribute__((may_alias)) branch_word32;
+#else
+typedef uint32_t branch_word32;
+#endif
+
+/// The new hash of dirty slot @p j as 8 aligned words: the encoder's child_ptr[j] ? child_ptr[j] :
+/// child[j]. A witness reference (child_ptr) is at any alignment and is copied to @p tmp; no slot
+/// the corpus updates has one, as an update stores its hash in child[j].
+static inline ALWAYS_INLINE const branch_word32* full_branch_new_hash(
+    const uint8_t* hashes, const uint8_t* const* ptrs, unsigned j, uint32_t tmp[8])
+{
+    if (ptrs[j] != NULL)
+    {
+        __builtin_memcpy(tmp, ptrs[j], 32);
+        return (const branch_word32*)tmp;
+    }
+    return (const branch_word32*)(hashes + 32 * j);
+}
+
+/// Writes slot j's new hash @p h over its old bytes in block 0, which the state @p s holds as a
+/// copy of the node. Slot j's hash bytes start at byte 4 + 33 j, which is j modulo 4: at that byte
+/// of word (4 + 33 j) / 4. A slot at a nonzero phase shares its first word with the bytes before
+/// it (its 0xa0 and the end of the slot before) and its ninth word with those after it.
+static inline ALWAYS_INLINE void full_branch_put0(branch_word32* s, const branch_word32* h, unsigned j)
+{
+    const unsigned w = (4 + 33 * j) / 4;
+    const unsigned sh = 8 * (j & 3);
+    if (sh == 0)
+    {
+#pragma GCC unroll 8
+        for (unsigned t = 0; t < 8; ++t)
+            s[w + t] = h[t];
+        return;
+    }
+    const uint32_t low = ((uint32_t)1 << sh) - 1;
+    s[w] = (s[w] & low) | (h[0] << sh);
+#pragma GCC unroll 7
+    for (unsigned t = 1; t < 8; ++t)
+        s[w + t] = (h[t - 1] >> (32 - sh)) | (h[t] << sh);
+    s[w + 8] = (s[w + 8] & ~low) | (h[7] >> (32 - sh));
+}
+
+/// XORs into the state @p s the change of slot j's hash from the node's bytes @p n to @p h, over
+/// the words of the slot in block k: those of hash words [t_lo, t_hi) of a slot at phase 0 (slots
+/// 8 and 12 straddle a block boundary), all nine of any other slot. The absorbed block held the
+/// node's words, so each XOR of old ^ new leaves the new hash's bytes absorbed in their place.
+static inline ALWAYS_INLINE void full_branch_delta(branch_word32* s, const branch_word32* n,
+    const branch_word32* h, unsigned j, unsigned k, unsigned t_lo, unsigned t_hi)
+{
+    const unsigned w = (4 + 33 * j) / 4;
+    const unsigned sh = 8 * (j & 3);
+    const unsigned d = w - 34 * k;  // The state word of node word w.
+    if (sh == 0)
+    {
+#pragma GCC unroll 8
+        for (unsigned t = t_lo; t < t_hi; ++t)
+            s[d + t] ^= n[w + t] ^ h[t];
+        return;
+    }
+    s[d] ^= ((n[w] >> sh) ^ h[0]) << sh;
+#pragma GCC unroll 7
+    for (unsigned t = 1; t < 8; ++t)
+        s[d + t] ^= n[w + t] ^ ((h[t - 1] >> (32 - sh)) | (h[t] << sh));
+    s[d + 8] ^= ((n[w + 8] << (32 - sh)) ^ h[7]) >> (32 - sh);
+}
+
+/// full_branch_delta() of slot j if it is dirty; j, k, t_lo and t_hi are constants once inlined.
+static inline ALWAYS_INLINE void full_branch_slot_delta(branch_word32* s, const branch_word32* n,
+    uint32_t dirty, const uint8_t* hashes, const uint8_t* const* ptrs, unsigned j, unsigned k,
+    unsigned t_lo, unsigned t_hi)
+{
+    if (dirty & (1u << j))
+    {
+        uint32_t tmp[8];
+        full_branch_delta(s, n, full_branch_new_hash(hashes, ptrs, j, tmp), j, k, t_lo, t_hi);
+    }
+}
+
+/// XORs block @p k (1 to 3) of the node into the state; the last block with its padding.
+static inline ALWAYS_INLINE void full_branch_absorb(branch_word32* s, const branch_word32* n, unsigned k)
+{
+    const branch_word32* const d = n + 34 * k;
+    if (k < 3)
+    {
+#pragma GCC unroll 34
+        for (unsigned i = 0; i < 34; ++i)
+            s[i] ^= d[i];
+        return;
+    }
+    // 124 bytes: 31 words, the padding byte 0x01 at byte 124 and the bit flip at the top of lane 16.
+#pragma GCC unroll 31
+    for (unsigned i = 0; i < 31; ++i)
+        s[i] ^= d[i];
+    s[31] ^= 0x01;
+    s[33] ^= 0x80000000;
+}
+
+#if defined(AIRBENDER)
+#define FULL_BRANCH_PERMUTE(state) keccak_permute_at(state)
+#else
+#define FULL_BRANCH_PERMUTE(state) keccakf1600_best(state)
+#endif
+
+#if defined(__GNUC__)
+#define FULL_BRANCH_BARRIER() __asm__ volatile("" ::: "memory")
+#else
+#define FULL_BRANCH_BARRIER() ((void)0)
+#endif
+
+/// Out of line: inlined into its caller, its ~18 KB (four permutations and the deltas of every
+/// slot) would also take that caller's registers.
+NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size_t blocks,
+    const uint8_t* node, uint32_t dirty, const uint8_t* hashes, const uint8_t* const* ptrs)
+{
+    union ethash_hash256 hash;
+    const branch_word32* const n = (const branch_word32*)node;
+#if defined(AIRBENDER)
+    // From the start, the state is buf[], as in keccak(); resumed, the slot is permuted in place.
+    uint64_t* const state = blocks != 0 ? slot : buf;
+#else
+    uint64_t local[25];
+    uint64_t* const state = blocks != 0 ? slot : local;
+#endif
+    branch_word32* const s = (branch_word32*)state;
+    uint32_t tmp[8];
+
+    // Each block's deltas are tested for as a group first: most updates change one or two slots.
+    // Each group opens with an empty asm statement: without them GCC schedules the copy and the
+    // absorbs differently around the tests, and on rv32 a hash cost about 100 more instructions.
+    switch (blocks)
+    {
+    case 0:
+    {
+        // The state starts at zero, so block 0 is a copy, and its dirty slots are written over it.
+        unsigned i;
+#pragma GCC unroll 34
+        for (i = 0; i < 34; ++i)
+            s[i] = n[i];
+#pragma GCC unroll 16
+        for (; i < 2 * 25; ++i)
+            s[i] = 0;
+        if (dirty & 0x000fu)
+        {
+            FULL_BRANCH_BARRIER();
+            if (dirty & 0x0001u)
+                full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 0, tmp), 0);
+            if (dirty & 0x0002u)
+                full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 1, tmp), 1);
+            if (dirty & 0x0004u)
+                full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 2, tmp), 2);
+            if (dirty & 0x0008u)
+                full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 3, tmp), 3);
+        }
+        FULL_BRANCH_PERMUTE(state);
+    }
+        /* fallthrough */
+    case 1:
+        full_branch_absorb(s, n, 1);
+        if (dirty & 0x01f0u)
+        {
+            FULL_BRANCH_BARRIER();
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 4, 1, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 5, 1, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 6, 1, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 7, 1, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 8, 1, 0, 1);
+        }
+        FULL_BRANCH_PERMUTE(state);
+        /* fallthrough */
+    case 2:
+        full_branch_absorb(s, n, 2);
+        if (dirty & 0x1f00u)
+        {
+            FULL_BRANCH_BARRIER();
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 8, 2, 1, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 9, 2, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 10, 2, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 11, 2, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 12, 2, 0, 2);
+        }
+        FULL_BRANCH_PERMUTE(state);
+        /* fallthrough */
+    default:
+        full_branch_absorb(s, n, 3);
+        if (dirty & 0xf000u)
+        {
+            FULL_BRANCH_BARRIER();
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 12, 3, 2, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 13, 3, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 14, 3, 0, 8);
+            full_branch_slot_delta(s, n, dirty, hashes, ptrs, 15, 3, 0, 8);
+        }
+        FULL_BRANCH_PERMUTE(state);
+    }
+#pragma GCC unroll 8
+    for (unsigned i = 0; i < 8; ++i)
+        hash.word32s[i] = s[i];
+    return hash;
+}
+#endif
+
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
 {
     union ethash_hash256 hash;

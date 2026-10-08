@@ -103,6 +103,7 @@ target_compile_definitions(
     KECCAK_STRICT_ALIGNMENT=1
     ethash_keccak256=ethash_keccak256_strict
     ethash_keccak256_32=ethash_keccak256_32_strict
+    ethash_keccak256_full_branch=ethash_keccak256_full_branch_strict
 )
 target_include_directories(evmone-keccak-strict PRIVATE ${PROJECT_SOURCE_DIR}/lib/evmone_precompiles)
 

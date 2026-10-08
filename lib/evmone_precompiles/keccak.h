@@ -32,6 +32,18 @@ union ethash_hash256 ethash_keccak256_snap(
 union ethash_hash256 ethash_keccak256_resume(
     uint64_t* slot, size_t blocks, const uint8_t* data, size_t size) noexcept;
 
+/// ethash_keccak256() of a full trie branch with some of its hash references replaced, read from
+/// the branch itself rather than from a patched copy of it. @p node is the 532-byte branch, 8-byte
+/// aligned: a list header f9 02 11, 16 slots of 0xa0 and a 32-byte hash (slot j's hash at byte
+/// 4 + 33 j) and the empty value 0x80. The hashed bytes are those with the hash of each slot j in
+/// @p dirty (bit j) replaced by the 32 bytes at @p ptrs[j] (any alignment) if that is not null,
+/// else by the 32 bytes at @p hashes + 32 j (8-byte aligned).
+/// With @p blocks nonzero, @p slot holds the state ethash_keccak256_snap() left for the node and
+/// that many blocks, which must not hold any byte of a dirty slot, and is consumed as by
+/// ethash_keccak256_resume(); with @p blocks 0, @p slot is not used.
+union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size_t blocks,
+    const uint8_t* node, uint32_t dirty, const uint8_t* hashes, const uint8_t* const* ptrs) noexcept;
+
 #if defined(AIRBENDER)
 /// A 32-bit word of a byte buffer or of a uint256 (stored as 64-bit words): may alias them.
 typedef uint32_t __attribute__((may_alias)) ethash_w32;
