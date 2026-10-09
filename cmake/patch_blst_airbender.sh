@@ -4,27 +4,38 @@
 # BLS12-381 Fp multiplication on rv32im with 32-bit limbs uses CIOS with n=12,
 # costing ~2900 instructions per mul_mont_384 call. By decomposing 384-bit
 # operands into (hi:128, lo:256) chunks and using the 256-bit BigInt CSR for
-# MUL_LOW/MUL_HIGH/ADD, we reduce this to ~33 CSR calls + ~200 insns glue.
+# MUL_LOW/MUL_HIGH/ADD, we reduce this to ~35 CSR calls and ~245 instructions in all.
 #
 # Only CSR ADD carry-in (bit 6) is used; SUB borrow-in is NOT assumed.
+#
+# src/fp12_tower.c is patched too: the cyclotomic squaring forms each output
+# (3*t -/+ 2*a) with one fused sum and one reduction instead of three modular ops.
 set -e
 
 NO_ASM_H="src/no_asm.h"
 [ -f "$NO_ASM_H" ] || { echo "ERR: $NO_ASM_H not found (pwd=$(pwd))"; exit 1; }
 
-grep -q "AIRBENDER_BIGINT_CSR" "$NO_ASM_H" && { echo "Already patched"; exit 0; }
+FP12_TOWER_C="$(dirname "$NO_ASM_H")/fp12_tower.c"
+[ -f "$FP12_TOWER_C" ] || { echo "ERR: $FP12_TOWER_C not found (pwd=$(pwd))"; exit 1; }
 
-python3 - "$NO_ASM_H" << 'PYEOF'
+# Each file carries its own marker: a run that failed between the two writes must not
+# leave one of them unpatched behind an "Already patched" exit.
+if grep -q "AIRBENDER_BIGINT_CSR" "$NO_ASM_H" && grep -q "_cyc_3t_sub_2a" "$FP12_TOWER_C"; then
+    echo "Already patched"; exit 0
+fi
+
+python3 - "$NO_ASM_H" "$FP12_TOWER_C" << 'PYEOF'
 import sys
 
 path = sys.argv[1]
+fp12_path = sys.argv[2]
 with open(path) as f:
     src = f.read()
 
-def replace_once(src, old, new):
+def replace_once(src, old, new, name="no_asm.h"):
     # A target that a blst upgrade moved would otherwise leave the generic code in silently.
     if old not in src:
-        sys.exit("ERR: patch target not found in no_asm.h: " + old.strip().splitlines()[0])
+        sys.exit("ERR: patch target not found in " + name + ": " + old.strip().splitlines()[0])
     return src.replace(old, new, 1)
 
 airbender_384 = r"""/* Airbender BigInt CSR (0x7CA) accelerated 384-bit Montgomery arithmetic.
@@ -115,163 +126,126 @@ static const limb_t _bls_np_hi[8] _BLS_ALIGN32 = {
     0, 0, 0, 0
 };
 
+static const limb_t _bls_one[8] _BLS_ALIGN32 = { 1, 0, 0, 0, 0, 0, 0, 0 };
+
+/* Split a 384-bit value into lo = words 0..7 and hi = words 8..11, zero-padded. */
+static inline __attribute__((always_inline))
+void _bls_split384(limb_t lo[8], limb_t hi[8], const limb_t a[12])
+{
+    lo[0]=a[0]; lo[1]=a[1]; lo[2]=a[2]; lo[3]=a[3];
+    lo[4]=a[4]; lo[5]=a[5]; lo[6]=a[6]; lo[7]=a[7];
+    _bls_pad128(hi, a+8);
+}
+
 /*
- * mul_mont_384: ret = a * b * R^{-1} mod P, R = 2^384
- *
- * 1. T = a * b  (768 bits, schoolbook with 256-bit chunks)
- * 2. m = T_lo_384 * N' mod 2^384
- * 3. (T + m*P) >> 384, conditional subtract P
- *
- * ~33 CSR calls total.
+ * t0 + t1*2^256 + t2*2^512 = x*y for x = xl + xh*2^256 and y = yl + yh*2^256, xh and yh
+ * below 2^128, consuming xl, xh and yl: the last product of each is formed in place, which
+ * saves a copy, and t2 is formed in xl. The carries out of t1 go into t2 as ADD carry-ins;
+ * t2 itself cannot carry out since x*y < 2^768. s is scratch.
+ */
+static inline __attribute__((always_inline))
+void _bls_mul384(limb_t t0[8], limb_t t1[8], limb_t s[8],
+                 limb_t xl[8], limb_t xh[8], limb_t yl[8], const limb_t yh[8])
+{
+    limb_t k1, k2;
+
+    _bls_copy256(t0, xl);
+    _bls_copy256(t1, xl);
+    _bls_copy256(s, xl);
+    _bls_csr(s, yh, 0x08);                             /* lo(xl*yh) */
+    _bls_csr(xl, yh, 0x10);                            /* t2 = hi(xl*yh) */
+    _bls_csr(t0, yl, 0x08);                            /* lo(xl*yl) */
+    _bls_csr(t1, yl, 0x10);                            /* hi(xl*yl) */
+    k1 = _bls_csr(t1, s, 0x01);
+    _bls_copy256(s, xh);
+    _bls_csr(s, yl, 0x08);                             /* lo(xh*yl) */
+    k2 = _bls_csr(t1, s, 0x01);
+    _bls_csr(yl, xh, 0x10);                            /* hi(xh*yl) */
+    _bls_csr(xh, yh, 0x08);                            /* xh*yh */
+    _bls_csr(xl, yl, 0x01 | k1 << 6);
+    _bls_csr(xl, xh, 0x01 | k2 << 6);
+}
+
+/* ret -= p, out of line: the reductions below rarely need it. */
+static __attribute__((noinline))
+void _bls_sub_p(limb_t ret[12])
+{
+    (void)_bls_sub384(ret, ret, _bls_P);
+}
+
+/*
+ * ret = t * 2^-384 mod p for t = t0 + t1*2^256 + t2*2^512 below p*2^384, by two Montgomery
+ * rounds of 256 and 128 bits (n0 = -1/p mod 2^256). The quotient (t + m*p) / 2^384 is then
+ * below 2p, so no chunk carries out and one subtraction of p makes it canonical. t0, t1,
+ * t2, s0 and s1 are clobbered.
+ */
+static inline __attribute__((always_inline))
+void _bls_redc768(vec384 ret, limb_t t0[8], limb_t t1[8], limb_t t2[8],
+                  limb_t s0[8], limb_t s1[8])
+{
+    limb_t c, d;
+
+    /* Round 1: m1 = t0*n0 mod 2^256. t0 + lo(m1*p_lo) is 2^256 unless t0 is zero, so the
+     * carry into t1 is (t0 != 0), and the rest of (t + m1*p) / 2^256 is
+     * t1 + hi(m1*p_lo) + m1*p_hi + t2*2^256. */
+    c = t0[0] | t0[1];
+    if (c == 0)
+        c = t0[2] | t0[3] | t0[4] | t0[5] | t0[6] | t0[7];
+    c = c != 0;
+    _bls_csr(t0, _bls_np_lo, 0x08);                    /* m1 */
+    _bls_copy256(s0, t0);
+    _bls_copy256(s1, t0);
+    _bls_csr(s1, _bls_p_hi, 0x08);                     /* lo(m1*p_hi) */
+    _bls_csr(t0, _bls_p_hi, 0x10);                     /* hi(m1*p_hi) < 2^128 */
+    _bls_csr(s0, _bls_p_lo, 0x10);                     /* hi(m1*p_lo) */
+    c = _bls_csr(t1, s0, 0x01 | c << 6);
+    d = _bls_csr(t1, s1, 0x01);
+    _bls_csr(t2, t0, 0x01 | c << 6);
+    if (d)
+        _bls_csr(t2, _bls_one, 0x01);
+
+    /* Round 2: m2 = t1*n0 mod 2^128 clears the low 128 bits of t1. */
+    _bls_copy256(s0, t1);
+    _bls_csr(s0, _bls_np_lo, 0x08);
+    s0[4] = 0; s0[5] = 0; s0[6] = 0; s0[7] = 0;        /* m2 */
+    _bls_copy256(s1, s0);
+    _bls_copy256(t0, s0);
+    _bls_csr(t0, _bls_p_lo, 0x10);                     /* hi(m2*p_lo) < 2^128 */
+    _bls_csr(s1, _bls_p_lo, 0x08);                     /* lo(m2*p_lo) */
+    _bls_csr(s0, _bls_p_hi, 0x08);                     /* m2*p_hi < 2^256 */
+    c = _bls_csr(t1, s1, 0x01);
+    _bls_csr(t2, t0, 0x01 | c << 6);
+    _bls_csr(t2, s0, 0x01);
+
+    ret[0]  = t1[4];  ret[1]  = t1[5];  ret[2]  = t1[6];  ret[3]  = t1[7];
+    ret[4]  = t2[0];  ret[5]  = t2[1];  ret[6]  = t2[2];  ret[7]  = t2[3];
+    ret[8]  = t2[4];  ret[9]  = t2[5];  ret[10] = t2[6];  ret[11] = t2[7];
+    if (_bls_ge384(ret, _bls_P))
+        _bls_sub_p(ret);
+}
+
+/*
+ * mul_mont_384: ret = a * b * R^{-1} mod P, R = 2^384, as one 768-bit product and a
+ * two-round reduction. At least one operand must be below p, so that a*b is below
+ * p*2^384 as _bls_redc768 requires: blst keeps every Fp value fully reduced, and raw
+ * 384-bit encodings are only multiplied by RR or by 1. Unlike a reduction that keeps the
+ * 769th bit, this one is not exact for two operands that are both near 2^384.
  */
 __attribute__((noinline))
 void mul_mont_384(vec384 ret, const vec384 a, const vec384 b,
                   const vec384 p, limb_t n0)
 {
+    limb_t al[8] _BLS_ALIGN32, ah[8] _BLS_ALIGN32;
+    limb_t bl[8] _BLS_ALIGN32, bh[8] _BLS_ALIGN32;
+    limb_t t0[8] _BLS_ALIGN32, t1[8] _BLS_ALIGN32, s[8] _BLS_ALIGN32;
+
     (void)p; (void)n0;
 
-    limb_t a_lo[8] _BLS_ALIGN32, a_hi[8] _BLS_ALIGN32;
-    limb_t b_lo[8] _BLS_ALIGN32, b_hi[8] _BLS_ALIGN32;
-    limb_t buf_A[8] _BLS_ALIGN32;
-    limb_t T0[8] _BLS_ALIGN32, T1[8] _BLS_ALIGN32, T2[8] _BLS_ALIGN32;
-    limb_t m0[8] _BLS_ALIGN32, m1[8] _BLS_ALIGN32;
-    limb_t MP0[8] _BLS_ALIGN32, MP1[8] _BLS_ALIGN32, MP2[8] _BLS_ALIGN32;
-    limb_t c1, c2, c3, carry_mid, carry_mp;
-
-    /* Split a, b into (lo:256, hi:128) */
-    a_lo[0]=a[0]; a_lo[1]=a[1]; a_lo[2]=a[2]; a_lo[3]=a[3];
-    a_lo[4]=a[4]; a_lo[5]=a[5]; a_lo[6]=a[6]; a_lo[7]=a[7];
-    _bls_pad128(a_hi, a+8);
-    b_lo[0]=b[0]; b_lo[1]=b[1]; b_lo[2]=b[2]; b_lo[3]=b[3];
-    b_lo[4]=b[4]; b_lo[5]=b[5]; b_lo[6]=b[6]; b_lo[7]=b[7];
-    _bls_pad128(b_hi, b+8);
-
-    /* === Phase 1: T = a * b (768 bits) === */
-
-    /* a_lo * b_lo -> (T0, buf_A=ll_hi) */
-    _bls_copy256(T0, a_lo);
-    _bls_csr(T0, b_lo, 0x08);          /* T0 = MUL_LOW(a_lo, b_lo) */
-    _bls_copy256(buf_A, a_lo);
-    _bls_csr(buf_A, b_lo, 0x10);       /* buf_A = ll_hi = MUL_HIGH(a_lo, b_lo) */
-
-    /* T1 = ll_hi + lh_lo + hl_lo */
-    _bls_copy256(T1, buf_A);           /* T1 = ll_hi */
-
-    _bls_copy256(buf_A, a_lo);
-    _bls_csr(buf_A, b_hi, 0x08);       /* buf_A = lh_lo = MUL_LOW(a_lo, b_hi) */
-    c1 = _bls_csr(T1, buf_A, 0x01);    /* T1 += lh_lo */
-
-    _bls_copy256(buf_A, a_hi);
-    _bls_csr(buf_A, b_lo, 0x08);       /* buf_A = hl_lo = MUL_LOW(a_hi, b_lo) */
-    c2 = _bls_csr(T1, buf_A, 0x01);    /* T1 += hl_lo */
-
-    carry_mid = c1 + c2;
-
-    /* T2 = lh_hi + hl_hi + hh + carry_mid */
-    _bls_copy256(T2, a_lo);
-    _bls_csr(T2, b_hi, 0x10);          /* T2 = lh_hi = MUL_HIGH(a_lo, b_hi) */
-
-    _bls_copy256(buf_A, a_hi);
-    _bls_csr(buf_A, b_lo, 0x10);       /* buf_A = hl_hi = MUL_HIGH(a_hi, b_lo) */
-    c1 = _bls_csr(T2, buf_A, 0x01);    /* T2 += hl_hi */
-
-    _bls_copy256(buf_A, a_hi);
-    _bls_csr(buf_A, b_hi, 0x08);       /* buf_A = hh = MUL_LOW(a_hi, b_hi) */
-    c2 = _bls_csr(T2, buf_A, 0x01);    /* T2 += hh */
-
-    /* Add carry_mid + c1 + c2. At most 4, fits in a word. */
-    {
-        limb_t cm = carry_mid + c1 + c2;
-        if (cm) {
-            buf_A[0]=cm; buf_A[1]=0; buf_A[2]=0; buf_A[3]=0;
-            buf_A[4]=0; buf_A[5]=0; buf_A[6]=0; buf_A[7]=0;
-            _bls_csr(T2, buf_A, 0x01);
-        }
-    }
-
-    /* === Phase 2: m = T_lo_384 * N' mod 2^384 === */
-
-    /* m0 = MUL_LOW(T0, np_lo) */
-    _bls_copy256(m0, T0);
-    _bls_csr(m0, _bls_np_lo, 0x08);
-
-    /* m1 = lower 128 bits of: MUL_HIGH(T0,np_lo) + MUL_LOW(T0,np_hi) + MUL_LOW(t1h,np_lo) */
-    _bls_copy256(m1, T0);
-    _bls_csr(m1, _bls_np_lo, 0x10);    /* m1 = MUL_HIGH(T0, np_lo) */
-
-    _bls_copy256(buf_A, T0);
-    _bls_csr(buf_A, _bls_np_hi, 0x08); /* buf_A = MUL_LOW(T0, np_hi) */
-    _bls_csr(m1, buf_A, 0x01);         /* m1 += buf_A (carry ignored, only need low 128) */
-
-    _bls_pad128(buf_A, T1);            /* t1h = T1[0:3] (lower 128 of T1) */
-    _bls_csr(buf_A, _bls_np_lo, 0x08); /* buf_A = MUL_LOW(t1h, np_lo) */
-    _bls_csr(m1, buf_A, 0x01);         /* m1 += buf_A */
-
-    /* m = m0 + (m1[0:3]) * 2^256  (only lower 128 bits of m1 matter) */
-
-    /* === Phase 3: mP = m * P (768 bits) === */
-
-    /* m0 * p_lo -> (MP0, buf_A=mp_ll_hi) */
-    _bls_copy256(MP0, m0);
-    _bls_csr(MP0, _bls_p_lo, 0x08);
-
-    _bls_copy256(buf_A, m0);
-    _bls_csr(buf_A, _bls_p_lo, 0x10);
-    _bls_copy256(MP1, buf_A);          /* MP1 = mp_ll_hi */
-
-    /* MP1 += MUL_LOW(m0, p_hi) */
-    _bls_copy256(buf_A, m0);
-    _bls_csr(buf_A, _bls_p_hi, 0x08);
-    c1 = _bls_csr(MP1, buf_A, 0x01);
-
-    /* MP1 += MUL_LOW(m1_trunc, p_lo) */
-    _bls_pad128(buf_A, m1);
-    _bls_csr(buf_A, _bls_p_lo, 0x08);
-    c2 = _bls_csr(MP1, buf_A, 0x01);
-
-    carry_mp = c1 + c2;
-
-    /* MP2 = MUL_HIGH(m0, p_hi) + MUL_HIGH(m1_trunc, p_lo) + MUL_LOW(m1_trunc, p_hi) + carry */
-    _bls_copy256(MP2, m0);
-    _bls_csr(MP2, _bls_p_hi, 0x10);    /* MP2 = MUL_HIGH(m0, p_hi) */
-
-    _bls_pad128(buf_A, m1);
-    _bls_csr(buf_A, _bls_p_lo, 0x10);  /* buf_A = MUL_HIGH(m1_trunc, p_lo) */
-    c1 = _bls_csr(MP2, buf_A, 0x01);
-
-    _bls_pad128(buf_A, m1);
-    _bls_csr(buf_A, _bls_p_hi, 0x08);  /* buf_A = MUL_LOW(m1_trunc, p_hi) */
-    c2 = _bls_csr(MP2, buf_A, 0x01);
-
-    {
-        limb_t cm = carry_mp + c1 + c2;
-        if (cm) {
-            buf_A[0]=cm; buf_A[1]=0; buf_A[2]=0; buf_A[3]=0;
-            buf_A[4]=0; buf_A[5]=0; buf_A[6]=0; buf_A[7]=0;
-            _bls_csr(MP2, buf_A, 0x01);
-        }
-    }
-
-    /* === Phase 4: S = (T + mP) >> 384 === */
-
-    /* Add T + mP in 256-bit chunks with carry chain */
-    c1 = _bls_csr(T0, MP0, 0x01);
-    c2 = _bls_csr(T1, MP1, 0x01 | (c1 << 6));
-    c3 = _bls_csr(T2, MP2, 0x01 | (c2 << 6));
-
-    /* Result = bits [384..767] of (T+mP).
-     * Lower 384 bits are 0 by construction.
-     * Result lo 256 = upper 128 of T1 | lower 128 of T2
-     * Result hi 128 = upper 128 of T2 (+ c3 which is part of the result flags)
-     */
-    ret[0]  = T1[4];  ret[1]  = T1[5];  ret[2]  = T1[6];  ret[3]  = T1[7];
-    ret[4]  = T2[0];  ret[5]  = T2[1];  ret[6]  = T2[2];  ret[7]  = T2[3];
-    ret[8]  = T2[4];  ret[9]  = T2[5];  ret[10] = T2[6];  ret[11] = T2[7];
-
-    /* Conditional subtract P (software 384-bit). If c3 or result >= P, subtract. */
-    if (c3 || _bls_ge384(ret, _bls_P)) {
-        _bls_sub384(ret, ret, _bls_P);
-    }
+    /* ret may alias a or b: both are read before ret is written */
+    _bls_split384(al, ah, a);
+    _bls_split384(bl, bh, b);
+    _bls_mul384(t0, t1, s, al, ah, bl, bh);             /* top chunk in al */
+    _bls_redc768(ret, t0, t1, al, s, bh);
 }
 
 void sqr_mont_384(vec384 ret, const vec384 a,
@@ -487,7 +461,6 @@ new_mul384x = r"""#ifdef AIRBENDER_BIGINT_CSR
  * where it can, which saves the address moves.
  */
 
-static const limb_t _bls_one[8] _BLS_ALIGN32 = { 1, 0, 0, 0, 0, 0, 0, 0 };
 /* The lift for a negative a0*b0 - a1*b1: p*m*2^256 with m = ceil(p/2^256), the multiple of p
  * just above p^2 whose low 256 bits are zero, as its chunks 1 and 2 */
 static const limb_t _bls_lift1[8] _BLS_ALIGN32 = {
@@ -498,44 +471,6 @@ static const limb_t _bls_lift2[8] _BLS_ALIGN32 = {
     0x7ff0c107, 0xf4a0f220, 0xa41018b0, 0xf2a919a4,
     0xa22f25e9, 0x4bd278ea, 0xb8c35fc7, 0x02a437a4
 };
-
-/* Split a 384-bit value into lo = words 0..7 and hi = words 8..11, zero-padded. */
-static inline __attribute__((always_inline))
-void _bls_split384(limb_t lo[8], limb_t hi[8], const limb_t a[12])
-{
-    lo[0]=a[0]; lo[1]=a[1]; lo[2]=a[2]; lo[3]=a[3];
-    lo[4]=a[4]; lo[5]=a[5]; lo[6]=a[6]; lo[7]=a[7];
-    _bls_pad128(hi, a+8);
-}
-
-/*
- * t0 + t1*2^256 + t2*2^512 = x*y for x = xl + xh*2^256 and y = yl + yh*2^256, xh and yh
- * below 2^128, consuming xl, xh and yl: the last product of each is formed in place, which
- * saves a copy, and t2 is formed in xl. The carries out of t1 go into t2 as ADD carry-ins;
- * t2 itself cannot carry out since x*y < 2^768. s is scratch.
- */
-static inline __attribute__((always_inline))
-void _bls_mul384(limb_t t0[8], limb_t t1[8], limb_t s[8],
-                 limb_t xl[8], limb_t xh[8], limb_t yl[8], const limb_t yh[8])
-{
-    limb_t k1, k2;
-
-    _bls_copy256(t0, xl);
-    _bls_copy256(t1, xl);
-    _bls_copy256(s, xl);
-    _bls_csr(s, yh, 0x08);                             /* lo(xl*yh) */
-    _bls_csr(xl, yh, 0x10);                            /* t2 = hi(xl*yh) */
-    _bls_csr(t0, yl, 0x08);                            /* lo(xl*yl) */
-    _bls_csr(t1, yl, 0x10);                            /* hi(xl*yl) */
-    k1 = _bls_csr(t1, s, 0x01);
-    _bls_copy256(s, xh);
-    _bls_csr(s, yl, 0x08);                             /* lo(xh*yl) */
-    k2 = _bls_csr(t1, s, 0x01);
-    _bls_csr(yl, xh, 0x10);                            /* hi(xh*yl) */
-    _bls_csr(xh, yh, 0x08);                            /* xh*yh */
-    _bls_csr(xl, yl, 0x01 | k1 << 6);
-    _bls_csr(xl, xh, 0x01 | k2 << 6);
-}
 
 /*
  * t -= u for 768-bit values whose difference is known to be non-negative. SUB takes no
@@ -555,64 +490,6 @@ void _bls_sub768(limb_t t0[8], limb_t t1[8], limb_t t2[8],
     _bls_csr(t2, u2, 0x02);
     if (b1)
         _bls_csr(t2, _bls_one, 0x02);
-}
-
-/* ret -= p, out of line: the reductions below rarely need it. */
-static __attribute__((noinline))
-void _bls_sub_p(limb_t ret[12])
-{
-    (void)_bls_sub384(ret, ret, _bls_P);
-}
-
-/*
- * ret = t * 2^-384 mod p for t = t0 + t1*2^256 + t2*2^512 at most 4p^2, by two Montgomery
- * rounds of 256 and 128 bits (n0 = -1/p mod 2^256). The quotient stays below 2p, so no
- * chunk carries out and one subtraction of p makes it canonical. t0, t1, t2, s0 and s1
- * are clobbered.
- */
-static inline __attribute__((always_inline))
-void _bls_redc768(vec384 ret, limb_t t0[8], limb_t t1[8], limb_t t2[8],
-                  limb_t s0[8], limb_t s1[8])
-{
-    limb_t c, d;
-
-    /* Round 1: m1 = t0*n0 mod 2^256. t0 + lo(m1*p_lo) is 2^256 unless t0 is zero, so the
-     * carry into t1 is (t0 != 0), and the rest of (t + m1*p) / 2^256 is
-     * t1 + hi(m1*p_lo) + m1*p_hi + t2*2^256. */
-    c = t0[0] | t0[1];
-    if (c == 0)
-        c = t0[2] | t0[3] | t0[4] | t0[5] | t0[6] | t0[7];
-    c = c != 0;
-    _bls_csr(t0, _bls_np_lo, 0x08);                    /* m1 */
-    _bls_copy256(s0, t0);
-    _bls_copy256(s1, t0);
-    _bls_csr(s1, _bls_p_hi, 0x08);                     /* lo(m1*p_hi) */
-    _bls_csr(t0, _bls_p_hi, 0x10);                     /* hi(m1*p_hi) < 2^128 */
-    _bls_csr(s0, _bls_p_lo, 0x10);                     /* hi(m1*p_lo) */
-    c = _bls_csr(t1, s0, 0x01 | c << 6);
-    d = _bls_csr(t1, s1, 0x01);
-    _bls_csr(t2, t0, 0x01 | c << 6);
-    if (d)
-        _bls_csr(t2, _bls_one, 0x01);
-
-    /* Round 2: m2 = t1*n0 mod 2^128 clears the low 128 bits of t1. */
-    _bls_copy256(s0, t1);
-    _bls_csr(s0, _bls_np_lo, 0x08);
-    s0[4] = 0; s0[5] = 0; s0[6] = 0; s0[7] = 0;        /* m2 */
-    _bls_copy256(s1, s0);
-    _bls_copy256(t0, s0);
-    _bls_csr(t0, _bls_p_lo, 0x10);                     /* hi(m2*p_lo) < 2^128 */
-    _bls_csr(s1, _bls_p_lo, 0x08);                     /* lo(m2*p_lo) */
-    _bls_csr(s0, _bls_p_hi, 0x08);                     /* m2*p_hi < 2^256 */
-    c = _bls_csr(t1, s1, 0x01);
-    _bls_csr(t2, t0, 0x01 | c << 6);
-    _bls_csr(t2, s0, 0x01);
-
-    ret[0]  = t1[4];  ret[1]  = t1[5];  ret[2]  = t1[6];  ret[3]  = t1[7];
-    ret[4]  = t2[0];  ret[5]  = t2[1];  ret[6]  = t2[2];  ret[7]  = t2[3];
-    ret[8]  = t2[4];  ret[9]  = t2[5];  ret[10] = t2[6];  ret[11] = t2[7];
-    if (_bls_ge384(ret, _bls_P))
-        _bls_sub_p(ret);
 }
 
 __attribute__((noinline))
@@ -844,6 +721,229 @@ new_sqr384x_ref = """#ifndef AIRBENDER_BIGINT_CSR
 """
 src = replace_once(src, old_sqr384x_ref, new_sqr384x_ref)
 print("Patched sqr_mont_384x -> lazy-reduction version")
+
+# Cyclotomic squaring of fp12_tower.c: the outputs are 3*t - 2*a or 3*t + 2*a, each formed
+# and reduced once instead of by three modular operations (see the comment in the code).
+old_cyclotomic = """static void cyclotomic_sqr_fp12(vec384fp12 ret, const vec384fp12 a)
+{
+    vec384fp4 t0, t1, t2;
+
+    sqr_fp4(t0, a[0][0], a[1][1]);
+    sqr_fp4(t1, a[1][0], a[0][2]);
+    sqr_fp4(t2, a[0][1], a[1][2]);
+
+    sub_fp2(ret[0][0], t0[0],     a[0][0]);
+    add_fp2(ret[0][0], ret[0][0], ret[0][0]);
+    add_fp2(ret[0][0], ret[0][0], t0[0]);
+
+    sub_fp2(ret[0][1], t1[0],     a[0][1]);
+    add_fp2(ret[0][1], ret[0][1], ret[0][1]);
+    add_fp2(ret[0][1], ret[0][1], t1[0]);
+
+    sub_fp2(ret[0][2], t2[0],     a[0][2]);
+    add_fp2(ret[0][2], ret[0][2], ret[0][2]);
+    add_fp2(ret[0][2], ret[0][2], t2[0]);
+
+    mul_by_u_plus_1_fp2(t2[1], t2[1]);
+    add_fp2(ret[1][0], t2[1],     a[1][0]);
+    add_fp2(ret[1][0], ret[1][0], ret[1][0]);
+    add_fp2(ret[1][0], ret[1][0], t2[1]);
+
+    add_fp2(ret[1][1], t0[1],     a[1][1]);
+    add_fp2(ret[1][1], ret[1][1], ret[1][1]);
+    add_fp2(ret[1][1], ret[1][1], t0[1]);
+
+    add_fp2(ret[1][2], t1[1],     a[1][2]);
+    add_fp2(ret[1][2], ret[1][2], ret[1][2]);
+    add_fp2(ret[1][2], ret[1][2], t1[1]);
+}
+"""
+new_cyclotomic = r"""#ifdef AIRBENDER_BIGINT_CSR
+/*
+ * The cyclotomic squaring's outputs are 3*t - 2*a or 3*t + 2*a, which blst forms
+ * with three modular operations each. For canonical t and a (below p, as every
+ * Fp value produced here is), v = 3*t - 2*a + 2*p and v = 3*t + 2*a are below
+ * 5*p < 2^384, so each is summed once (low 256 bits on the CSR, top 128 in
+ * software) and reduced once: q*p with q estimated from the top word, which is
+ * low by at most one, then a subtraction of p that is rare except for zero
+ * coefficients (t = a = 0 gives v = 2*p). The result is the same residue the
+ * three modular operations give. The CSR carries are propagated explicitly; SUB
+ * borrow-in is not used.
+ * no_asm.h, which holds the shared CSR helpers, is included after this file.
+ */
+#define _CYC_ALIGN32 __attribute__((aligned(32)))
+
+static inline __attribute__((always_inline))
+limb_t _cyc_csr(limb_t *mut, const limb_t *immut, limb_t mask)
+{
+    register unsigned long x10 __asm__("x10") = (unsigned long)mut;
+    register unsigned long x11 __asm__("x11") = (unsigned long)immut;
+    register limb_t x12 __asm__("x12") = mask;
+    __asm__ __volatile__("csrrw x0, 0x7CA, x0"
+                         : "+r"(x12) : "r"(x10), "r"(x11) : "memory");
+    return x12;
+}
+
+/* k*p for k = 0..4: low 256 bits (CSR operands) and top 128 bits */
+static const limb_t _cyc_kp_lo[5][8] _CYC_ALIGN32 = {
+    { 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0xffffaaab, 0xb9feffff, 0xb153ffff, 0x1eabfffe,
+      0xf6b0f624, 0x6730d2a0, 0xf38512bf, 0x64774b84 },
+    { 0xffff5556, 0x73fdffff, 0x62a7ffff, 0x3d57fffd,
+      0xed61ec48, 0xce61a541, 0xe70a257e, 0xc8ee9709 },
+    { 0xffff0001, 0x2dfcffff, 0x13fbffff, 0x5c03fffc,
+      0xe412e26c, 0x359277e2, 0xda8f383e, 0x2d65e28e },
+    { 0xfffeaaac, 0xe7fbffff, 0xc54ffffe, 0x7aaffffa,
+      0xdac3d890, 0x9cc34a83, 0xce144afd, 0x91dd2e13 }
+};
+static const limb_t _cyc_kp_hi[5][4] = {
+    { 0, 0, 0, 0 },
+    { 0x434bacd7, 0x4b1ba7b6, 0x397fe69a, 0x1a0111ea },
+    { 0x869759ae, 0x96374f6c, 0x72ffcd34, 0x340223d4 },
+    { 0xc9e30686, 0xe152f722, 0xac7fb3ce, 0x4e0335be },
+    { 0x0d2eb35d, 0x2c6e9ed9, 0xe5ff9a69, 0x680447a8 }
+};
+
+/* v's top word at least ceil(k*p / 2^352) implies v >= k*p, and below
+ * ceil((k+1)*p / 2^352) it implies v < (k+2)*p */
+#define _CYC_THR1 0x1a0111eb
+#define _CYC_THR2 0x340223d5
+#define _CYC_THR3 0x4e0335bf
+#define _CYC_THR4 0x680447a9
+
+/* ret -= p when ret >= p, for ret below 2p: out of line, as it is rare */
+static __attribute__((noinline)) void _cyc_reduce_once(limb_t ret[12])
+{
+    limb_t tmp[12], borrow = 0;
+    unsigned long long limbx;
+    size_t i;
+
+    for (i = 0; i < 12; i++) {
+        limb_t pi = i < 8 ? _cyc_kp_lo[1][i] : _cyc_kp_hi[1][i - 8];
+        limbx = (unsigned long long)ret[i] - pi - borrow;
+        tmp[i] = (limb_t)limbx;
+        borrow = (limb_t)(limbx >> LIMB_T_BITS) & 1;
+    }
+    if (!borrow)
+        for (i = 0; i < 12; i++)
+            ret[i] = tmp[i];
+}
+
+static inline __attribute__((always_inline))
+void _cyc_lin(vec384 ret, const vec384 t, const vec384 a, const int sub)
+{
+    limb_t T[8] _CYC_ALIGN32, A[8] _CYC_ALIGN32;
+    limb_t t8 = t[8], t9 = t[9], t10 = t[10], t11 = t[11];
+    limb_t a8 = a[8], a9 = a[9], a10 = a[10], a11 = a[11];
+    limb_t h0, h1, h2, h3, q, b, *r;
+    const limb_t *kh;
+    long long d;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        T[i] = t[i];
+        A[i] = a[i];
+    }
+
+    if (sub) {
+        /* T = t - a, A = t, A = 2t - a, T = 3t - 2a, T += 2p, mod 2^256; the second
+         * step carries out exactly when the first borrowed, which cancels it */
+        limb_t b1 = _cyc_csr(T, A, 0x02);
+        limb_t k;
+        _cyc_csr(A, T, 0x01);
+        k = _cyc_csr(A, T, 0x01);
+        k += _cyc_csr(T, A, 0x01);
+        k += _cyc_csr(T, _cyc_kp_lo[2], 0x01);
+        d = (long long)t8 * 3 - ((long long)a8 << 1) + 2 * (long long)_cyc_kp_hi[1][0]
+            + (long long)k - 2 * (long long)b1;
+        h0 = (limb_t)d;
+        d = (d >> 32) + (long long)t9 * 3 - ((long long)a9 << 1)
+            + 2 * (long long)_cyc_kp_hi[1][1];
+        h1 = (limb_t)d;
+        d = (d >> 32) + (long long)t10 * 3 - ((long long)a10 << 1)
+            + 2 * (long long)_cyc_kp_hi[1][2];
+        h2 = (limb_t)d;
+        h3 = (limb_t)(d >> 32) + t11 * 3 - (a11 << 1) + 2 * _cyc_kp_hi[1][3];
+        r = T;
+    } else {
+        /* A = a + t, T = 2t + a, A = 3t + 2a, mod 2^256: 2^256 carries 2*c1 + c2 + c3 */
+        unsigned long long x;
+        limb_t k = _cyc_csr(A, T, 0x01);
+        k = 2 * k + _cyc_csr(T, A, 0x01);
+        k += _cyc_csr(A, T, 0x01);
+        x = (unsigned long long)t8 * 3 + ((unsigned long long)a8 << 1) + k;
+        h0 = (limb_t)x;
+        x = (x >> 32) + (unsigned long long)t9 * 3 + ((unsigned long long)a9 << 1);
+        h1 = (limb_t)x;
+        x = (x >> 32) + (unsigned long long)t10 * 3 + ((unsigned long long)a10 << 1);
+        h2 = (limb_t)x;
+        h3 = (limb_t)(x >> 32) + t11 * 3 + (a11 << 1);
+        r = A;
+    }
+
+    /* v = h*2^256 + r < 5p */
+    q = (h3 >= _CYC_THR1) + (h3 >= _CYC_THR2) + (h3 >= _CYC_THR3) + (h3 >= _CYC_THR4);
+    b = _cyc_csr(r, _cyc_kp_lo[q], 0x02);
+    kh = _cyc_kp_hi[q];
+    d = (long long)h0 - kh[0] - b;
+    h0 = (limb_t)d;
+    d = (d >> 32) + (long long)h1 - kh[1];
+    h1 = (limb_t)d;
+    d = (d >> 32) + (long long)h2 - kh[2];
+    h2 = (limb_t)d;
+    h3 = h3 - kh[3] + (limb_t)(d >> 32);
+
+    for (i = 0; i < 8; i++)
+        ret[i] = r[i];
+    ret[8] = h0; ret[9] = h1; ret[10] = h2; ret[11] = h3;
+    if (h3 >= _cyc_kp_hi[1][3])                     /* v - q*p may be p or more */
+        _cyc_reduce_once(ret);
+}
+
+static __attribute__((noinline))
+void _cyc_3t_sub_2a(vec384 ret, const vec384 t, const vec384 a)
+{   _cyc_lin(ret, t, a, 1);   }
+
+static __attribute__((noinline))
+void _cyc_3t_add_2a(vec384 ret, const vec384 t, const vec384 a)
+{   _cyc_lin(ret, t, a, 0);   }
+
+static void cyclotomic_sqr_fp12(vec384fp12 ret, const vec384fp12 a)
+{
+    vec384fp4 t0, t1, t2;
+
+    sqr_fp4(t0, a[0][0], a[1][1]);
+    sqr_fp4(t1, a[1][0], a[0][2]);
+    sqr_fp4(t2, a[0][1], a[1][2]);
+
+    /* each coefficient reads a's before writing ret's, so ret may alias a */
+    _cyc_3t_sub_2a(ret[0][0][0], t0[0][0], a[0][0][0]);
+    _cyc_3t_sub_2a(ret[0][0][1], t0[0][1], a[0][0][1]);
+    _cyc_3t_sub_2a(ret[0][1][0], t1[0][0], a[0][1][0]);
+    _cyc_3t_sub_2a(ret[0][1][1], t1[0][1], a[0][1][1]);
+    _cyc_3t_sub_2a(ret[0][2][0], t2[0][0], a[0][2][0]);
+    _cyc_3t_sub_2a(ret[0][2][1], t2[0][1], a[0][2][1]);
+
+    mul_by_u_plus_1_fp2(t2[1], t2[1]);
+    _cyc_3t_add_2a(ret[1][0][0], t2[1][0], a[1][0][0]);
+    _cyc_3t_add_2a(ret[1][0][1], t2[1][1], a[1][0][1]);
+    _cyc_3t_add_2a(ret[1][1][0], t0[1][0], a[1][1][0]);
+    _cyc_3t_add_2a(ret[1][1][1], t0[1][1], a[1][1][1]);
+    _cyc_3t_add_2a(ret[1][2][0], t1[1][0], a[1][2][0]);
+    _cyc_3t_add_2a(ret[1][2][1], t1[1][1], a[1][2][1]);
+}
+#else
+""" + old_cyclotomic + """#endif
+"""
+with open(fp12_path) as f:
+    fp12_src = f.read()
+if "_cyc_3t_sub_2a" not in fp12_src:
+    fp12_src = replace_once(fp12_src, old_cyclotomic, new_cyclotomic, "fp12_tower.c")
+    print("Patched cyclotomic_sqr_fp12 -> fused outputs")
+
+# Write fp12_tower.c first: the shell's "Already patched" check needs both files marked.
+with open(fp12_path, 'w') as f:
+    f.write(fp12_src)
 
 with open(path, 'w') as f:
     f.write(src)

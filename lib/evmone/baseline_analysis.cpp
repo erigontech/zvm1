@@ -5,6 +5,7 @@
 
 #include "baseline.hpp"
 #include "instructions.hpp"
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -36,11 +37,11 @@ size_t scan_jumpdests(JumpdestMap map, const uint8_t* code, size_t from, size_t 
 #if EVMONE_JUMPDEST_BYTEMAP
     // Test 8 opcodes per bound check: a plain opcode then costs its load and one branch, where
     // the loop below spends 4 instructions on each. The reads run up to 7 bytes past the end,
-    // into the zero padding of the analysis copy (see analyze_legacy()), and a 0 (STOP) is
+    // into the zero padding of the code (see analyze_legacy()), and a 0 (STOP) is
     // neither PUSH nor JUMPDEST, so it only steps the walk past the end.
     // The mark for p + K lands at map + (p + K - base): with map - code fixed for the call, one
-    // add forms the address and K folds into the store's offset. Map and code share one
-    // allocation, which keeps the difference defined.
+    // add forms the address and K folds into the store's offset. The difference is taken between
+    // integers: code analyzed in place lies in another allocation than its map.
     const auto map_delta = reinterpret_cast<uintptr_t>(map) - reinterpret_cast<uintptr_t>(code);
     // Handle the PUSH or JUMPDEST..PUSH0 opcode op at p + K and step past it (and PUSH data).
     const auto special = [&]<std::ptrdiff_t K>(int8_t op) noexcept {
@@ -101,6 +102,41 @@ size_t scan_jumpdests(JumpdestMap map, const uint8_t* code, size_t from, size_t 
 
 namespace
 {
+#if EVMONE_IN_PLACE_CODE
+/// The region of set_in_place_code_region(), empty while begin lies above every address.
+struct InPlaceRegion
+{
+    uintptr_t begin = UINTPTR_MAX;
+    uintptr_t end = 0;
+};
+// The guest runs one thread; a host test build may run VMs on several.
+#if defined(AIRBENDER)
+constinit InPlaceRegion in_place_region;
+#else
+constinit thread_local InPlaceRegion in_place_region;
+#endif
+
+/// Whether the code can be executed where it lies: inside the region and followed by 33 zero
+/// bytes. The test of the bytes on every analysis keeps the copy as the fallback for anything the
+/// host has not padded. The 9 aligned words read cover them with up to 3 bytes more on either
+/// side, which the two shifts drop (the region's contract keeps those readable).
+bool is_padded_in_place(bytes_view code) noexcept
+{
+    static_assert(std::endian::native == std::endian::little);
+    typedef uint32_t __attribute__((may_alias)) word;
+    const auto begin = reinterpret_cast<uintptr_t>(code.data());
+    const auto end = begin + code.size();
+    if (begin < in_place_region.begin || end > in_place_region.end)
+        return false;
+    const word* const w = reinterpret_cast<const word*>(end & ~uintptr_t{3});
+    const auto sh = static_cast<unsigned>(end & 3) * 8;
+    uint32_t acc = (w[0] >> sh) | (w[8] << (24 - sh));
+    for (size_t i = 1; i < 8; ++i)
+        acc |= w[i];
+    return acc == 0;
+}
+#endif
+
 CodeAnalysis analyze_legacy(bytes_view code)
 {
     // We need at most 33 bytes of code padding: 32 for possible missing all data bytes of
@@ -112,6 +148,10 @@ CodeAnalysis analyze_legacy(bytes_view code)
 
     const auto padded_code_size = code.size() + PADDING;
     [[maybe_unused]] const auto bitset_words = (code.size() + (BitsetSpan::WORD_BITS)) / BitsetSpan::WORD_BITS;
+#if EVMONE_IN_PLACE_CODE
+    // Code in place is scanned on demand, never up front, into a byte map of its own.
+    static_assert(EVMONE_LAZY_JUMPDESTS && EVMONE_JUMPDEST_BYTEMAP);
+#endif
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // The copy starts at the code's own offset modulo 32: the guest's memcpy then copies the
     // bulk in 32-byte CSR chunks (0.125 instructions a byte) instead of word by word (0.5), and
@@ -124,8 +164,17 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto head_size =
         32 + padded_code_size + BITSET_ALIGNMENT + bitset_words * sizeof(BitsetSpan::word_type);
     const auto map_size = code.size() + 8;
-    CodeStorage storage{
-        static_cast<uint8_t*>(std::calloc(1, head_size + ((map_size + 6 + 31) & ~size_t{31})))};
+    const auto map_alloc_size = (map_size + 6 + 31) & ~size_t{31};
+    if (is_padded_in_place(code))
+    {
+        // Only the map is stored (2.8 MB of code a block is not copied). The size is the copy's
+        // less a multiple of 32, which leaves later allocations at their addresses modulo 32 too.
+        CodeStorage storage{
+            static_cast<uint8_t*>(std::calloc(1, (head_size & 31) + map_alloc_size))};
+        uint8_t* const map = storage.get();
+        return {std::move(storage), code.data(), code.size(), map};
+    }
+    CodeStorage storage{static_cast<uint8_t*>(std::calloc(1, head_size + map_alloc_size))};
     const auto base = reinterpret_cast<uintptr_t>(storage.get());
     const auto code_off = (reinterpret_cast<uintptr_t>(code.data()) - base) & 31;
     uint8_t* const padded = storage.get() + code_off;
@@ -139,6 +188,17 @@ CodeAnalysis analyze_legacy(bytes_view code)
 #endif
     return {std::move(storage), padded, code.size(), map};
 #else
+#if EVMONE_IN_PLACE_CODE
+    if (is_padded_in_place(code))
+    {
+        // Only the map is stored, zeroed here: host memory is not fresh.
+        const auto map_size = code.size() + 8;
+        auto storage = std::make_unique_for_overwrite<uint8_t[]>(map_size);
+        std::fill_n(storage.get(), map_size, 0);
+        uint8_t* const map = storage.get();
+        return {std::move(storage), code.data(), code.size(), map};
+    }
+#endif
     const auto aligned_code_size =
         (padded_code_size + (BITSET_ALIGNMENT - 1)) / BITSET_ALIGNMENT * BITSET_ALIGNMENT;
 #if EVMONE_JUMPDEST_BYTEMAP
@@ -182,4 +242,14 @@ CodeAnalysis analyze(bytes_view code)
 {
     return analyze_legacy(code);
 }
+
+#if EVMONE_IN_PLACE_CODE
+void set_in_place_code_region(const uint8_t* begin, const uint8_t* end) noexcept
+{
+    in_place_region = begin != nullptr ?
+                          InPlaceRegion{reinterpret_cast<uintptr_t>(begin),
+                              reinterpret_cast<uintptr_t>(end)} :
+                          InPlaceRegion{};
+}
+#endif
 }  // namespace evmone::baseline

@@ -10,6 +10,7 @@
 #include "zilk_core/print.hpp"
 #include "vm.hpp"
 
+#include <bit>
 #include <memory>
 
 #ifdef NDEBUG
@@ -57,40 +58,32 @@ namespace
     return limit;
 }
 
-#if EVMONE_RV32_DISPATCH
-/// gas_left -= cost; false once that is negative. cost is a non-negative 16-bit value.
-///
-/// On rv32 the int64 subtract-and-test is 6 instructions. Subtract from the low word and test
-/// its sign: 2 instructions. A borrow always leaves the low word negative (at least
-/// 2^32 - 2^15). A non-negative low word therefore borrowed nothing and is the exact 64-bit
-/// result, still non-negative. A negative one (a borrow, or a low word of 2^31 or more) takes
-/// the full 64-bit path, which recovers the borrow from the new low word alone.
-[[gnu::always_inline]] inline bool deduct_gas(int64_t& gas_left, uint32_t cost) noexcept
+/// stack_bottom + 1, the bound of the 2-operand underflow check (the stack top must lie above
+/// it). That check runs in most handlers, and GCC computes the bound again in each (an addi from
+/// stack_bottom); hidden like the limit, it is computed once and kept in a register. The 3-operand
+/// bound stack_bottom + 2 stays in a register without this while one is free, and under register
+/// pressure GCC can then recompute it at each check rather than spill it.
+[[gnu::always_inline]] inline const uint256* stack_floor_of(const uint256* stack_bottom) noexcept
 {
-    const auto g = static_cast<uint64_t>(gas_left);
-    auto lo = static_cast<uint32_t>(g) - cost;
-    asm("" : "+r"(lo));  // Keep GCC from folding lo + cost below back into the old low word.
-    if (static_cast<int32_t>(lo) >= 0) [[likely]]
-    {
-        gas_left = static_cast<int64_t>((g & 0xffffffff00000000) | lo);
-        return true;
-    }
-    const auto borrow = static_cast<uint32_t>(lo + cost < cost);
-    const auto hi = static_cast<uint32_t>(g >> 32) - borrow;
-    gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
-    return gas_left >= 0;
-}
+    const uint256* floor = stack_bottom + 1;
+#if EVMONE_RV32_DISPATCH
+    asm("" : "+r"(floor));
 #endif
+    return floor;
+}
 
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
 ///                               The stack height is stack_top - stack_bottom.
+/// @param          bottom1       stack_bottom + 1, see stack_floor_of().
+/// @param          bottom2       stack_bottom + 2.
 /// @return  Status code with information which check has failed
 ///          or EVMC_SUCCESS if everything is fine.
 template <Opcode Op>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
-    const uint256* stack_top, const uint256* stack_bottom, const uint256* stack_limit) noexcept
+    const uint256* stack_top, const uint256* stack_bottom, const uint256* bottom1,
+    const uint256* bottom2, const uint256* stack_limit) noexcept
 {
     static_assert(
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
@@ -128,7 +121,14 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
     {
         // Check stack underflow using pointer comparison <= (better optimization).
         static constexpr auto min_offset = instr::traits[Op].stack_height_required - 1;
-        if (INTX_UNLIKELY(stack_top <= stack_bottom + min_offset))
+        const uint256* floor;
+        if constexpr (min_offset == 1)
+            floor = bottom1;
+        else if constexpr (min_offset == 2)
+            floor = bottom2;
+        else
+            floor = stack_bottom + min_offset;
+        if (INTX_UNLIKELY(stack_top <= floor))
             return EVMC_STACK_UNDERFLOW;
     }
 
@@ -153,6 +153,43 @@ struct Position
     code_iterator code_it;  ///< The position in the code.
     uint256* stack_end;     ///< The pointer to the stack end.
 };
+
+#if EVMONE_RV32_DISPATCH
+/// What a taken jump reads of the analysis besides the scan bound, kept in registers by
+/// dispatch_cgoto(): the code start plus one, where a jump to 0 resumes after its landing
+/// JUMPDEST, and the JUMPDEST map. Each saves a load per jump (and code1 an addi), with the
+/// analysis pointer loaded for the bound alone.
+struct JumpBase
+{
+    code_iterator code1;
+    JumpdestMap map;
+};
+
+[[gnu::always_inline]] inline JumpBase jump_base(
+    const uint8_t* code, const ExecutionState& state) noexcept
+{
+    return {code + 1, state.analysis.baseline->jumpdest_map()};
+}
+
+/// The position after the landing JUMPDEST at dst, a JUMPDEST checked with jb.map.
+[[gnu::always_inline]] inline code_iterator landing(const JumpBase& jb, uint32_t dst) noexcept
+{
+    const auto target = jb.code1 + dst;
+    // A code position is never null. GCC cannot see that through the hidden code1 and would
+    // test every jump's result against the failure return.
+    if (target == nullptr)
+        __builtin_unreachable();
+    return target;
+}
+#else
+struct JumpBase
+{};
+
+[[gnu::always_inline]] inline JumpBase jump_base(const uint8_t*, const ExecutionState&) noexcept
+{
+    return {};
+}
+#endif
 
 /// Helpers for invoking instruction implementations of different signatures.
 /// @{
@@ -322,7 +359,8 @@ template <Opcode Op>
 /// and its high words need no zero check, and the landing JUMPDEST is folded in. The checks run
 /// in the order the separate instructions would run them, so a failure gets the same status.
 [[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state,
+    JumpBase jb) noexcept
 {
     const auto fail = [&](evmc_status_code status) noexcept {
         state.status = status;
@@ -341,9 +379,9 @@ template <Opcode Op>
         asm("" : "+r"(dst));
         dst = dst << 8 | pos.code_it[2];
         const auto& analysis = *state.analysis.baseline;
-        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+        if (INTX_UNLIKELY(!analysis.check_jumpdest_in(jb.map, dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = &analysis.code()[dst] + 1;
+        pos.code_it = landing(jb, dst);
         return true;
     }
     if (op != OP_JUMPI)
@@ -365,9 +403,9 @@ template <Opcode Op>
         asm("" : "+r"(dst));
         dst = dst << 8 | pos.code_it[2];
         const auto& analysis = *state.analysis.baseline;
-        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+        if (INTX_UNLIKELY(!analysis.check_jumpdest_in(jb.map, dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = &analysis.code()[dst] + 1;
+        pos.code_it = landing(jb, dst);
     }
     else
     {
@@ -383,7 +421,8 @@ template <Opcode Op>
 /// item, so it cannot overflow) and 3 gas, JUMPI's 10 gas (its two operands are there).
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_push2_jumpi_seq(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* bottom1, const uint256* stack_limit, Position& pos, int64_t& gas,
+    ExecutionState& state) noexcept
 {
     static_assert(Op == OP_ISZERO || Op == OP_EQ);
     constexpr int required = Op == OP_EQ ? 2 : 1;
@@ -394,7 +433,7 @@ template <Opcode Op>
         pos.code_it = nullptr;
         return true;
     };
-    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + (required - 1)))
+    if (INTX_UNLIKELY(pos.stack_end <= (required == 2 ? bottom1 : stack_bottom)))
         return fail(EVMC_STACK_UNDERFLOW);
     if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
         return fail(EVMC_OUT_OF_GAS);
@@ -438,7 +477,8 @@ template <Opcode Op>
 /// avoids.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* bottom1, const uint256* stack_limit, Position& pos, int64_t& gas,
+    ExecutionState& state, JumpBase jb) noexcept
 {
     static_assert(Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT || Op == OP_SLT ||
                   Op == OP_SGT);
@@ -449,7 +489,8 @@ template <Opcode Op>
     if (!charge_all(gas, 3 + 3 + 10 + 1)) [[unlikely]]
     {
         if constexpr (Op == OP_EQ)
-            return fused_cmp_push2_jumpi_seq<Op>(stack_bottom, stack_limit, pos, gas, state);
+            return fused_cmp_push2_jumpi_seq<Op>(
+                stack_bottom, bottom1, stack_limit, pos, gas, state);
         else
             return false;
     }
@@ -458,7 +499,7 @@ template <Opcode Op>
         pos.code_it = nullptr;
         return true;
     };
-    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + (required - 1)))
+    if (INTX_UNLIKELY(pos.stack_end <= (required == 2 ? bottom1 : stack_bottom)))
         return fail(EVMC_STACK_UNDERFLOW);
     if constexpr (Op == OP_ISZERO)
     {
@@ -499,9 +540,9 @@ template <Opcode Op>
         asm("" : "+r"(dst));
         dst = dst << 8 | pos.code_it[3];
         const auto& analysis = *state.analysis.baseline;
-        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+        if (INTX_UNLIKELY(!analysis.check_jumpdest_in(jb.map, dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = &analysis.code()[dst] + 1;
+        pos.code_it = landing(jb, dst);
     }
     else
     {
@@ -567,7 +608,8 @@ template <Opcode Op>
 
 /// The fast form of fused_selector_test_seq(): the whole static gas in one test.
 [[gnu::always_inline]] inline bool fused_selector_test(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state,
+    JumpBase jb) noexcept
 {
     const auto* const c = pos.code_it;
     if (c[1] != OP_PUSH4)
@@ -603,9 +645,9 @@ template <Opcode Op>
         asm("" : "+r"(dst));
         dst = dst << 8 | c[9];
         const auto& analysis = *state.analysis.baseline;
-        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+        if (INTX_UNLIKELY(!analysis.check_jumpdest_in(jb.map, dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = &analysis.code()[dst] + 1;
+        pos.code_it = landing(jb, dst);
     }
     else
     {
@@ -621,7 +663,7 @@ template <Opcode Op>
 /// instructions' order: the comparison's underflow and 3 gas, then ISZERO's 3, PUSH2's 3 (no
 /// overflow: the comparison popped one) and JUMPI's 10.
 template <Opcode Op>
-[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi_seq(const uint256* stack_bottom,
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi_seq(const uint256* bottom1,
     Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
     const auto* const c = pos.code_it;
@@ -632,7 +674,7 @@ template <Opcode Op>
         pos.code_it = nullptr;
         return true;
     };
-    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + 1))
+    if (INTX_UNLIKELY(pos.stack_end <= bottom1))
         return fail(EVMC_STACK_UNDERFLOW);
     if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
         return fail(EVMC_OUT_OF_GAS);
@@ -661,8 +703,8 @@ template <Opcode Op>
 /// the test fails, LT and GT take the sequential form: unfused, they make a BigInt delegation
 /// that it avoids. SLT and SGT make none, and their separate instructions are the exact reference.
 template <Opcode Op>
-[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* stack_bottom,
-    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* bottom1,
+    Position& pos, int64_t& gas, ExecutionState& state, JumpBase jb) noexcept
 {
     const auto* const c = pos.code_it;
     if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
@@ -671,7 +713,7 @@ template <Opcode Op>
     if (!charge_all(gas, 3 + 3 + 3 + 10 + 1)) [[unlikely]]
     {
         if constexpr (Op == OP_LT || Op == OP_GT)
-            return fused_cmp_iszero_push2_jumpi_seq<Op>(stack_bottom, pos, gas, state);
+            return fused_cmp_iszero_push2_jumpi_seq<Op>(bottom1, pos, gas, state);
         else
             return false;
     }
@@ -680,7 +722,7 @@ template <Opcode Op>
         pos.code_it = nullptr;
         return true;
     };
-    if (INTX_UNLIKELY(pos.stack_end <= stack_bottom + 1))
+    if (INTX_UNLIKELY(pos.stack_end <= bottom1))
         return fail(EVMC_STACK_UNDERFLOW);
     const word32* const top = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const word32* const second = reinterpret_cast<const word32*>(pos.stack_end - 2);
@@ -692,9 +734,9 @@ template <Opcode Op>
         asm("" : "+r"(dst));
         dst = dst << 8 | c[4];
         const auto& analysis = *state.analysis.baseline;
-        if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+        if (INTX_UNLIKELY(!analysis.check_jumpdest_in(jb.map, dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
-        pos.code_it = &analysis.code()[dst] + 1;
+        pos.code_it = landing(jb, dst);
     }
     else
     {
@@ -703,197 +745,167 @@ template <Opcode Op>
     }
     return true;
 }
-#endif
 
-/// A helper to invoke the instruction implementation of the given opcode Op.
-template <Opcode Op, bool TracingEnabled>
-[[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
-    const uint256* stack_limit, Position pos, int64_t& gas, ExecutionState& state) noexcept
+/// Whether the 20 immediate bytes of the PUSH20 at c are all 0xff. The 6 aligned words that
+/// cover them are read, and the bytes outside the immediate are forced to 0xff: on a
+/// little-endian target the low k bytes of the first word precede it and the rest of the last
+/// word follows it. The reads stay within the allocation of the analysis copy (see
+/// analyze_legacy()): it is at least 4-aligned, so rounding c + 1 down to 4 stays inside it (on
+/// the guest the copy may start up to 31 bytes in, after bytes of fresh heap RAM, which read as
+/// zero: the guest's calloc does not clear), and the last word
+/// ends at most at c + 24, inside the 33 zero bytes after the code (a truncated PUSH20 sees 0x00
+/// bytes and fails the test).
+[[gnu::always_inline]] inline bool push20_all_ones(const uint8_t* c) noexcept
 {
-#if EVMONE_RV32_DISPATCH
-    if constexpr (Op == OP_PUSH2)
-    {
-        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
-            return pos;
-    }
-    else if constexpr (Op == OP_ISZERO || Op == OP_EQ)
-    {
-        if (fused_cmp_push2_jumpi<Op>(stack_bottom, stack_limit, pos, gas, state))
-            return pos;
-    }
-    else if constexpr (Op == OP_DUP1)
-    {
-        if (fused_selector_test(stack_bottom, stack_limit, pos, gas, state))
-            return pos;
-    }
-    else if constexpr (Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT)
-    {
-        // ISZERO first: it follows each of them more often than PUSH2 does, and on a partial
-        // match GCC skips the PUSH2 test, the successor being known to be ISZERO.
-        if (fused_cmp_iszero_push2_jumpi<Op>(stack_bottom, pos, gas, state))
-            return pos;
-        if (fused_cmp_push2_jumpi<Op>(stack_bottom, stack_limit, pos, gas, state))
-            return pos;
-    }
-    else if constexpr (Op == OP_JUMP)
-    {
-        if (INTX_UNLIKELY(pos.stack_end <= stack_bottom))
-        {
-            state.status = EVMC_STACK_UNDERFLOW;
-            return {nullptr, pos.stack_end};
-        }
-        // JUMP 8 and the landing JUMPDEST 1.
-        if (charge_all(gas, 8 + 1)) [[likely]]
-        {
-            const word32* const w = reinterpret_cast<const word32*>(pos.stack_end - 1);
-            const uint32_t dst = w[0];
-            const auto& analysis = *state.analysis.baseline;
-            if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||
-                              !analysis.check_jumpdest(dst)))
-            {
-                state.status = EVMC_BAD_JUMP_DESTINATION;
-                return {nullptr, pos.stack_end};
-            }
-            return {&analysis.code()[dst] + 1, pos.stack_end - 1};
-        }
-    }
-#endif
-    // auto starting_gas = gas;
-    const auto status =
-        check_requirements<Op>(cost_table, gas, pos.stack_end, stack_bottom, stack_limit);
-    if (status != EVMC_SUCCESS)
-    {
-        // if constexpr (TracingEnabled)
-        // {
-        //     if (status == EVMC_OUT_OF_GAS)
-        //     {
-        //         switch (Op)
-        //         {
-        //         case OP_CALL:
-        //         case OP_CALLCODE:
-        //         case OP_STATICCALL:
-        //         case OP_DELEGATECALL:
-        //         case OP_CREATE:
-        //         case OP_CREATE2:
-        //         case OP_KECCAK256:
-        //         case OP_MSTORE:
-        //             break;
+    static_assert(std::endian::native == std::endian::little);
+    const uint8_t* const d = c + 1;
+    const auto k = static_cast<unsigned>(reinterpret_cast<uintptr_t>(d) & 3);
+    const word32* const w = reinterpret_cast<const word32*>(d - k);
+    const uint32_t before = (uint32_t{1} << (8 * k)) - 1;
+    return ((w[0] | before) & w[1] & w[2] & w[3] & w[4] & (w[5] | ~before)) == ~uint32_t{0};
+}
 
-        //         default:
-        //             invoke(instr::core::impl<Op>, pos, starting_gas, state);
-        //             break;
-        //         }
-        //     }
-        // }
+/// PUSH20 0xff..ff AND: Solidity's address mask (1.09M per 200 mainnet blocks). x & (2^160 - 1)
+/// clears the 3 high words of x in place; the mask is never written to the stack, nor read back
+/// by a separate AND. Checks in the separate instructions' order: PUSH20's overflow, then AND's
+/// underflow (the item under the mask), after both charges in one test. When that test fails the
+/// two instructions run separately, the exact reference.
+[[gnu::always_inline]] inline bool fused_push20_mask_and(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto* const c = pos.code_it;
+    if (c[21] != OP_AND || !push20_all_ones(c))
+        return false;
+    // PUSH20 3, AND 3.
+    if (!charge_all(gas, 3 + 3)) [[unlikely]]
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
         state.status = status;
-        return {nullptr, pos.stack_end};
-    }
-    auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
-#if EVMONE_RV32_DISPATCH
-    if constexpr (Op == OP_JUMP)
-    {
-        if (new_pos != nullptr)  // A taken jump lands on a JUMPDEST.
-            new_pos = skip_landing_jumpdest(new_pos, gas, state);
-    }
-    else if constexpr (Op == OP_JUMPI)
-    {
-        // Taken or not: a JUMPDEST at the next position is executed the same way either way.
-        if (new_pos != nullptr && *new_pos == OP_JUMPDEST)
-            new_pos = skip_landing_jumpdest(new_pos, gas, state);
-    }
-#endif
-    const auto new_stack_top = pos.stack_end + instr::traits[Op].stack_height_change;
-    return {new_pos, new_stack_top};
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+    x[5] = 0;
+    x[6] = 0;
+    x[7] = 0;
+    pos.code_it += 22;
+    return true;
 }
 
-
-template <bool TracingEnabled>
-int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas,
-    const uint8_t* code, Tracer* tracer = nullptr) noexcept
+/// PUSH4 imm AND (332K per 200 mainnet blocks, nearly all with imm 0xffffffff): x & imm has one
+/// word. Checks as in fused_push20_mask_and().
+[[gnu::always_inline]] inline bool fused_push4_and(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
-    const auto stack_bottom = state.stack_space.bottom();
-    const auto stack_limit = stack_limit_of(stack_bottom);
+    const auto* const c = pos.code_it;
+    // Three in four PUSH4s are followed by something else: keep their path the straight one.
+    if (c[5] != OP_AND) [[likely]]
+        return false;
+    // PUSH4 3, AND 3.
+    if (!charge_all(gas, 3 + 3)) [[unlikely]]
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    // The 4 immediate bytes, big-endian, built with the barrier of push_data_word().
+    uint32_t imm = c[1];
+    asm("" : "+r"(imm));
+    imm = imm << 8 | c[2];
+    asm("" : "+r"(imm));
+    imm = imm << 8 | c[3];
+    asm("" : "+r"(imm));
+    imm = imm << 8 | c[4];
+    word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+    x[0] &= imm;
+    x[1] = 0;
+    x[2] = 0;
+    x[3] = 0;
+    x[4] = 0;
+    x[5] = 0;
+    x[6] = 0;
+    x[7] = 0;
+    pos.code_it += 6;
+    return true;
+}
 
-    // Code iterator and stack top pointer for interpreter loop.
-    Position position{code, stack_bottom};
+/// Word I of x >>= 32 * WS + bs arithmetically, in place, written from the least significant word
+/// up, so every source word (I + WS and I + WS + 1) is read before it is overwritten. The words
+/// above the shifted top word take the sign, which the caller reads before any store.
+/// (v << 1) << rs is v << (32 - bs), and 0 for bs == 0 where a single shift would be by 32.
+template <unsigned WS, unsigned I>
+[[gnu::always_inline]] inline void sar_word(
+    word32* x, unsigned bs, unsigned rs, uint32_t sign) noexcept
+{
+    if constexpr (I + WS > 7)
+        x[I] = sign;
+    else if constexpr (I + WS == 7)
+        x[I] = static_cast<uint32_t>(static_cast<int32_t>(x[7]) >> bs);
+    else
+        x[I] = (x[I + WS] >> bs) | ((x[I + WS + 1] << 1) << rs);
+}
 
-    while (true)  // Guaranteed to terminate because padded code ends with STOP.
+template <unsigned WS>
+[[gnu::always_inline]] inline void sar_words(word32* x, unsigned bs, uint32_t sign) noexcept
+{
+    const unsigned rs = 31 - bs;
+    sar_word<WS, 0>(x, bs, rs, sign);
+    sar_word<WS, 1>(x, bs, rs, sign);
+    sar_word<WS, 2>(x, bs, rs, sign);
+    sar_word<WS, 3>(x, bs, rs, sign);
+    sar_word<WS, 4>(x, bs, rs, sign);
+    sar_word<WS, 5>(x, bs, rs, sign);
+    sar_word<WS, 6>(x, bs, rs, sign);
+    sar_word<WS, 7>(x, bs, rs, sign);
+}
+
+/// x >>= s arithmetically, for s below 256. instr::core::sar() builds two full 256-bit shifts
+/// (about 220 instructions on rv32); moving words takes about 25 to 60
+/// instructions from the shift decode through the last store.
+[[gnu::always_inline]] inline void sar_below_256(word32* x, unsigned s) noexcept
+{
+    const auto sign = static_cast<uint32_t>(static_cast<int32_t>(x[7]) >> 31);
+    const unsigned bs = s & 31;
+    switch ((s >> 5) & 7)  // The word shift; the mask spares the switch its range check.
     {
-        if constexpr (TracingEnabled)
-        {
-            const auto offset = static_cast<uint32_t>(position.code_it - code);
-            const auto stack_height = static_cast<int>(position.stack_end - stack_bottom);
-            if (offset < state.original_code.size())  // Skip STOP from code padding.
-            {
-                tracer->notify_instruction_start(
-                    offset, position.stack_end - 1, stack_height, gas, state);
-            }
-        }
-
-        const auto op = *position.code_it;
-        switch (op)
-        {
-#define ON_OPCODE(OPCODE)                                                                       \
-    case OPCODE:                                                                                \
-        ASM_COMMENT(OPCODE);                                                                    \
-        if (const auto next =                                                                   \
-                invoke<OPCODE, TracingEnabled>(                                                 \
-                    cost_table, stack_bottom, stack_limit, position, gas, state);               \
-            next.code_it == nullptr)                                                            \
-        {                                                                                       \
-            return gas;                                                                         \
-        }                                                                                       \
-        else                                                                                    \
-        {                                                                                       \
-            /* Update current position only when no error,                                      \
-               this improves compiler optimization. */                                          \
-            position = next;                                                                    \
-        }                                                                                       \
+#define SAR_CASE(WS)                \
+    case WS:                        \
+        sar_words<WS>(x, bs, sign); \
         break;
-
-            MAP_OPCODES
-#undef ON_OPCODE
-
-        default:
-            state.status = EVMC_UNDEFINED_INSTRUCTION;
-            return gas;
-        }
+        SAR_CASE(0)
+        SAR_CASE(1)
+        SAR_CASE(2)
+        SAR_CASE(3)
+        SAR_CASE(4)
+        SAR_CASE(5)
+        SAR_CASE(6)
+        SAR_CASE(7)
+#undef SAR_CASE
+    default:
+        intx::unreachable();
     }
-    intx::unreachable();
 }
 
-#if EVMONE_RV32_DISPATCH
-/// PUSH1 and its successor.
-///
-/// PUSH1 is the most executed instruction (29.3M per 200 mainnet blocks) and its successor is
-/// known at the point where the handler would push: the dispatch of that successor is the same
-/// 5 instructions whichever table it goes through. The PUSH1 handler therefore makes its own
-/// checks and dispatches the successor through push1_table, whose entries make the push and
-/// jump to the successor's handler (one extra instruction) or run the pair fused: SHL and SHR by
-/// an immediate (3.0M), MLOAD and MSTORE at an immediate offset (2.8M) and the mask idiom
-/// PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the immediate from the code instead of
-/// writing it to the stack and reading it back, skip its 224-bit zero checks and one dispatch.
-/// Checks keep the separate instructions' order, so a failure stops with the same status.
-
-/// The push itself: the immediate is the byte before the successor.
-[[gnu::always_inline]] inline void push1_commit(Position& pos) noexcept
+/// SAR with its shift y from the stack: x >>= y arithmetically, all sign bits from 256 on.
+[[gnu::always_inline]] inline void sar_stack(word32* x, const word32* y) noexcept
 {
-    word32* const w = reinterpret_cast<word32*>(pos.stack_end);
-    w[0] = pos.code_it[-1];
-    w[1] = 0;
-    w[2] = 0;
-    w[3] = 0;
-    w[4] = 0;
-    w[5] = 0;
-    w[6] = 0;
-    w[7] = 0;
-    pos.stack_end += 1;
-}
-
-/// The successors that run fused with PUSH1 through push1_then().
-constexpr bool push1_fuses(Opcode op) noexcept
-{
-    return op == OP_SHL || op == OP_SHR || op == OP_MLOAD || op == OP_MSTORE;
+    if ((y[1] | y[2] | y[3] | y[4] | y[5] | y[6] | y[7]) == 0 && y[0] < 256) [[likely]]
+        sar_below_256(x, y[0]);
+    else
+    {
+        const auto sign = static_cast<uint32_t>(static_cast<int32_t>(x[7]) >> 31);
+        for (int i = 0; i < 8; ++i)
+            x[i] = sign;
+    }
 }
 
 /// Word I of x <<= 32 * WS + bs, in place. Destinations are written from the most significant
@@ -950,6 +962,294 @@ template <unsigned WS>
     shr_word<WS, 7>(x, bs, rs);
 }
 
+/// x <<= s or x >>= s in place, for a shift s below 256. The word shift s >> 5 selects an unrolled
+/// body, in which each destination word is one or two shifts and an or. Shared by the shifts of
+/// a stack operand and of a PUSH1 immediate.
+template <Opcode Op>
+[[gnu::always_inline]] inline void shift_words(word32* x, uint32_t s) noexcept
+{
+    const unsigned bs = s & 31;
+    switch (s >> 5)  // Below 256, so there is no "all out" case.
+    {
+#define SHIFT_CASE(WS)                             \
+    case WS:                                       \
+        if constexpr (Op == OP_SHL)                \
+            shl_words<WS>(x, bs);                  \
+        else                                       \
+            shr_words<WS>(x, bs);                  \
+        break;
+        SHIFT_CASE(0)
+        SHIFT_CASE(1)
+        SHIFT_CASE(2)
+        SHIFT_CASE(3)
+        SHIFT_CASE(4)
+        SHIFT_CASE(5)
+        SHIFT_CASE(6)
+        SHIFT_CASE(7)
+#undef SHIFT_CASE
+    default:
+        intx::unreachable();
+    }
+}
+
+/// SHL and SHR with both operands on the stack: the value under the shift, the result in the
+/// value's slot. The generic implementation, intx's operator<<=(uint), takes the shift by value
+/// (8 dead stores to the C stack) and builds the shift from uint128 halves with data-dependent
+/// branches: a shift below 128 costs about 45 more instructions than the word bodies. A shift
+/// of 256 or more, in any of the 8 words, gives 0, so the high 24 bits of word 0 and all of the
+/// other words are ORed rather than compared one by one.
+template <Opcode Op>
+[[gnu::always_inline]] inline void shift_by_stack(uint256* stack_end) noexcept
+{
+    const word32* const s = reinterpret_cast<const word32*>(stack_end - 1);
+    word32* const x = reinterpret_cast<word32*>(stack_end - 2);
+    if (INTX_UNLIKELY(((s[0] >> 8) | s[1] | s[2] | s[3] | s[4] | s[5] | s[6] | s[7]) != 0))
+    {
+        for (unsigned i = 0; i < 8; ++i)
+            x[i] = 0;
+    }
+    else
+        shift_words<Op>(x, s[0]);
+}
+#endif
+
+/// A helper to invoke the instruction implementation of the given opcode Op.
+template <Opcode Op, bool TracingEnabled>
+[[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
+    const uint256* bottom1, const uint256* bottom2, const uint256* stack_limit, Position pos,
+    int64_t& gas, ExecutionState& state, [[maybe_unused]] JumpBase jb) noexcept
+{
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_PUSH2)
+    {
+        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state, jb))
+            return pos;
+    }
+    else if constexpr (Op == OP_ISZERO || Op == OP_EQ)
+    {
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state, jb))
+            return pos;
+    }
+    else if constexpr (Op == OP_DUP1)
+    {
+        if (fused_selector_test(stack_bottom, stack_limit, pos, gas, state, jb))
+            return pos;
+    }
+    else if constexpr (Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT)
+    {
+        // ISZERO first: it follows each of them more often than PUSH2 does, and on a partial
+        // match GCC skips the PUSH2 test, the successor being known to be ISZERO.
+        if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state, jb))
+            return pos;
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state, jb))
+            return pos;
+    }
+    else if constexpr (Op == OP_PUSH20)
+    {
+        if (fused_push20_mask_and(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_PUSH4)
+    {
+        if (fused_push4_and(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr (Op == OP_JUMP)
+    {
+        if (INTX_UNLIKELY(pos.stack_end <= stack_bottom))
+        {
+            state.status = EVMC_STACK_UNDERFLOW;
+            return {nullptr, pos.stack_end};
+        }
+        // JUMP 8 and the landing JUMPDEST 1.
+        if (charge_all(gas, 8 + 1)) [[likely]]
+        {
+            const word32* const w = reinterpret_cast<const word32*>(pos.stack_end - 1);
+            const uint32_t dst = w[0];
+            const auto& analysis = *state.analysis.baseline;
+            if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||
+                              !analysis.check_jumpdest_in(jb.map, dst)))
+            {
+                state.status = EVMC_BAD_JUMP_DESTINATION;
+                return {nullptr, pos.stack_end};
+            }
+            return {landing(jb, dst), pos.stack_end - 1};
+        }
+    }
+#endif
+    // auto starting_gas = gas;
+    const auto status = check_requirements<Op>(
+        cost_table, gas, pos.stack_end, stack_bottom, bottom1, bottom2, stack_limit);
+    if (status != EVMC_SUCCESS)
+    {
+        // if constexpr (TracingEnabled)
+        // {
+        //     if (status == EVMC_OUT_OF_GAS)
+        //     {
+        //         switch (Op)
+        //         {
+        //         case OP_CALL:
+        //         case OP_CALLCODE:
+        //         case OP_STATICCALL:
+        //         case OP_DELEGATECALL:
+        //         case OP_CREATE:
+        //         case OP_CREATE2:
+        //         case OP_KECCAK256:
+        //         case OP_MSTORE:
+        //             break;
+
+        //         default:
+        //             invoke(instr::core::impl<Op>, pos, starting_gas, state);
+        //             break;
+        //         }
+        //     }
+        // }
+        state.status = status;
+        return {nullptr, pos.stack_end};
+    }
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_SAR)
+    {
+        // By words, after check_requirements(): the shift is the top item and the value under
+        // it takes the result.
+        sar_stack(reinterpret_cast<word32*>(pos.stack_end - 2),
+            reinterpret_cast<const word32*>(pos.stack_end - 1));
+        return {pos.code_it + 1, pos.stack_end - 1};
+    }
+    if constexpr (Op == OP_SHL || Op == OP_SHR)
+    {
+        shift_by_stack<Op>(pos.stack_end);
+        return {pos.code_it + 1, pos.stack_end - 1};
+    }
+#endif
+    auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
+#if EVMONE_RV32_DISPATCH
+    if constexpr (Op == OP_JUMP)
+    {
+        if (new_pos != nullptr)  // A taken jump lands on a JUMPDEST.
+            new_pos = skip_landing_jumpdest(new_pos, gas, state);
+    }
+    else if constexpr (Op == OP_JUMPI)
+    {
+        // Taken or not: a JUMPDEST at the next position is executed the same way either way.
+        if (new_pos != nullptr && *new_pos == OP_JUMPDEST)
+            new_pos = skip_landing_jumpdest(new_pos, gas, state);
+    }
+#endif
+    const auto new_stack_top = pos.stack_end + instr::traits[Op].stack_height_change;
+    return {new_pos, new_stack_top};
+}
+
+
+template <bool TracingEnabled>
+int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas,
+    const uint8_t* code, Tracer* tracer = nullptr) noexcept
+{
+    const auto stack_bottom = state.stack_space.bottom();
+    const auto stack_limit = stack_limit_of(stack_bottom);
+    const auto jb = jump_base(code, state);
+    const auto bottom1 = stack_floor_of(stack_bottom);
+    const auto bottom2 = stack_bottom + 2;
+
+    // Code iterator and stack top pointer for interpreter loop.
+    Position position{code, stack_bottom};
+
+    while (true)  // Guaranteed to terminate because padded code ends with STOP.
+    {
+        if constexpr (TracingEnabled)
+        {
+            const auto offset = static_cast<uint32_t>(position.code_it - code);
+            const auto stack_height = static_cast<int>(position.stack_end - stack_bottom);
+            if (offset < state.original_code.size())  // Skip STOP from code padding.
+            {
+                tracer->notify_instruction_start(
+                    offset, position.stack_end - 1, stack_height, gas, state);
+            }
+        }
+
+        const auto op = *position.code_it;
+        switch (op)
+        {
+#define ON_OPCODE(OPCODE)                                                                       \
+    case OPCODE:                                                                                \
+        ASM_COMMENT(OPCODE);                                                                    \
+        if (const auto next =                                                                   \
+                invoke<OPCODE, TracingEnabled>(cost_table, stack_bottom, bottom1, bottom2,      \
+                    stack_limit, position, gas, state, jb);                                     \
+            next.code_it == nullptr)                                                            \
+        {                                                                                       \
+            return gas;                                                                         \
+        }                                                                                       \
+        else                                                                                    \
+        {                                                                                       \
+            /* Update current position only when no error,                                      \
+               this improves compiler optimization. */                                          \
+            position = next;                                                                    \
+        }                                                                                       \
+        break;
+
+            MAP_OPCODES
+#undef ON_OPCODE
+
+        default:
+            state.status = EVMC_UNDEFINED_INSTRUCTION;
+            return gas;
+        }
+    }
+    intx::unreachable();
+}
+
+#if EVMONE_RV32_DISPATCH
+/// PUSH1 and its successor.
+///
+/// PUSH1 is the most executed instruction (29.3M per 200 mainnet blocks) and its successor is
+/// known at the point where the handler would push: the dispatch of that successor is the same
+/// 5 instructions whichever table it goes through. The PUSH1 handler therefore makes its own
+/// checks and dispatches the successor through push1_table, whose entries make the push and
+/// jump to the successor's handler (one extra instruction) or run the pair fused: SHL and SHR by
+/// an immediate (3.0M), SAR by an immediate, MLOAD and MSTORE at an immediate offset (2.8M), ADD,
+/// AND, NOT and SWAP1 with an immediate, SIGNEXTEND from an immediate byte (0.26M) and the mask
+/// idiom PUSH1 PUSH1 SHL SUB (1.35M). The fused entries read the immediate from the code
+/// instead of writing it to the stack and reading it back, skip its 224-bit zero checks and one
+/// dispatch.
+/// Checks keep the separate instructions' order, so a failure stops with the same status.
+
+/// The push itself: the immediate is the byte before the successor.
+[[gnu::always_inline]] inline void push1_commit(Position& pos) noexcept
+{
+    word32* const w = reinterpret_cast<word32*>(pos.stack_end);
+    w[0] = pos.code_it[-1];
+    w[1] = 0;
+    w[2] = 0;
+    w[3] = 0;
+    w[4] = 0;
+    w[5] = 0;
+    w[6] = 0;
+    w[7] = 0;
+    pos.stack_end += 1;
+}
+
+/// The successors that run fused with PUSH1 through push1_then().
+constexpr bool push1_fuses(Opcode op) noexcept
+{
+    return op == OP_SHL || op == OP_SHR || op == OP_SAR || op == OP_MLOAD || op == OP_MSTORE ||
+           op == OP_ADD || op == OP_NOT || op == OP_SWAP1 || op == OP_AND ||
+           op == OP_SIGNEXTEND;
+}
+
+/// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
+[[gnu::always_inline]] inline void copy_slot(uint256* dst, const uint256* src) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(dst);
+    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(src);
+    register uint32_t r12 asm("x12") = 0x80;
+    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#else
+    *dst = *src;
+#endif
+}
+
 /// The fused PUSH1 + Op, entered after PUSH1's own checks with the push not yet made: the
 /// immediate is pos.code_it[-1] and pos.stack_end is still the slot it would take. On false the
 /// status is set. On true pos is at the next instruction.
@@ -962,7 +1262,7 @@ template <Opcode Op>
         return false;
     };
     const uint32_t imm = pos.code_it[-1];
-    if constexpr (Op == OP_SHL || Op == OP_SHR)
+    if constexpr (Op == OP_SHL || Op == OP_SHR || Op == OP_SAR)
     {
         // Constantinople instructions: undefined before it, which check_requirements() tests
         // first, through the revision's cost table.
@@ -974,28 +1274,13 @@ template <Opcode Op>
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
         word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
-        const unsigned bs = imm & 31;
-        switch (imm >> 5)  // The word shift: a byte is below 256, so there is no "all out" case.
+        if constexpr (Op == OP_SAR)
         {
-#define SHIFT_CASE(WS)                             \
-    case WS:                                       \
-        if constexpr (Op == OP_SHL)                \
-            shl_words<WS>(x, bs);                  \
-        else                                       \
-            shr_words<WS>(x, bs);                  \
-        break;
-            SHIFT_CASE(0)
-            SHIFT_CASE(1)
-            SHIFT_CASE(2)
-            SHIFT_CASE(3)
-            SHIFT_CASE(4)
-            SHIFT_CASE(5)
-            SHIFT_CASE(6)
-            SHIFT_CASE(7)
-#undef SHIFT_CASE
-        default:
-            intx::unreachable();
+            sar_below_256(x, imm);  // A byte: below 256.
+            pos.code_it += 1;
+            return true;
         }
+        shift_words<Op>(x, imm);
         pos.code_it += 1;
         return true;
     }
@@ -1008,13 +1293,25 @@ template <Opcode Op>
         }
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
-        // check_memory() for an offset of one byte: no high words to test.
+        // check_memory() for an offset of one byte: no high words to test, and it is below the
+        // limit when the 32 bytes at it are inside the memory.
         auto& memory = state.memory;
-        if (imm + 32 > memory.size())
+        if (imm >= memory.limit32())
         {
-            gas = grow_memory(gas, memory, imm + 32);
-            if (gas < 0) [[unlikely]]
-                return fail(EVMC_OUT_OF_GAS);
+            if (Op == OP_MSTORE && imm == 0x40 && memory.size() == 0)
+            {
+                // Solidity's prologue PUSH1 0x80 PUSH1 0x40 MSTORE as the frame's first memory
+                // access (94% of these growths): 0 to 3 words cost 3 * 3 + 3^2 / 512 = 9 gas.
+                if (INTX_UNLIKELY(!deduct_gas(gas, 9)))
+                    return fail(EVMC_OUT_OF_GAS);
+                memory.grow_empty_for_store_at_64();
+            }
+            else
+            {
+                gas = grow_memory(gas, memory, imm + 32);
+                if (gas < 0) [[unlikely]]
+                    return fail(EVMC_OUT_OF_GAS);
+            }
         }
         if constexpr (Op == OP_MLOAD)
         {
@@ -1039,14 +1336,93 @@ template <Opcode Op>
         pos.code_it += 1;
         return true;
     }
+    else if constexpr (Op == OP_ADD || Op == OP_AND || Op == OP_SWAP1)
+    {
+        // Two operands: the pushed one and x under it, then 3 gas.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
+        if constexpr (Op == OP_ADD)
+        {
+            // The carry runs up through the words that wrap to 0, rarely past the first.
+            const uint32_t lo = x[0] + imm;
+            x[0] = lo;
+            if (INTX_UNLIKELY(lo < imm))
+            {
+                for (unsigned i = 1; i < 8 && ++x[i] == 0; ++i)
+                {
+                }
+            }
+        }
+        else
+        {
+            // AND keeps only the immediate's bits of x[0]. SWAP1 moves x up into the push's slot
+            // and the immediate takes its place.
+            if constexpr (Op == OP_SWAP1)
+            {
+                copy_slot(pos.stack_end, pos.stack_end - 1);
+                pos.stack_end += 1;
+                x[0] = imm;
+            }
+            else
+                x[0] &= imm;
+            x[1] = 0;
+            x[2] = 0;
+            x[3] = 0;
+            x[4] = 0;
+            x[5] = 0;
+            x[6] = 0;
+            x[7] = 0;
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_NOT)
+    {
+        // The one operand is the pushed item: no underflow. 3 gas.
+        if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+            return fail(EVMC_OUT_OF_GAS);
+        word32* const w = reinterpret_cast<word32*>(pos.stack_end);
+        w[0] = ~imm;
+        w[1] = ~uint32_t{0};
+        w[2] = ~uint32_t{0};
+        w[3] = ~uint32_t{0};
+        w[4] = ~uint32_t{0};
+        w[5] = ~uint32_t{0};
+        w[6] = ~uint32_t{0};
+        w[7] = ~uint32_t{0};
+        pos.stack_end += 1;
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_SIGNEXTEND)
+    {
+        // A Frontier instruction of cost 5 in every revision: no undefined-instruction check.
+        // The value under the pushed byte must exist.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY(!deduct_gas(gas, 5)))
+            return fail(EVMC_OUT_OF_GAS);
+        if (imm < 31)  // For 31 and above x is unchanged.
+            instr::core::signextend_words(reinterpret_cast<word32*>(pos.stack_end - 1), imm);
+        pos.code_it += 1;
+        return true;
+    }
     else
+    {
+        // An opcode in push1_fuses() without a branch here would neither push nor advance.
+        static_assert(!push1_fuses(Op));
         return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
+    }
 }
 
 /// PUSH1 a PUSH1 b SHL SUB, the mask idiom (for 2^160 - 1 Solidity emits PUSH1 1 PUSH1 1 PUSH1
 /// 0xa0 SHL SUB): the top item x becomes (a << b) - x. Entered after the first PUSH1's checks
 /// with pos at the second PUSH1. The shifted constant is built in the first push's free slot and
-/// the subtraction is the one BigInt delegation SUB makes anyway.
+/// the subtraction is the one BigInt delegation SUB makes anyway. The address mask followed by
+/// AND also takes the AND, without either.
 [[gnu::always_inline]] inline bool push1_shl_sub(const uint256* stack_bottom,
     const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
 {
@@ -1057,13 +1433,34 @@ template <Opcode Op>
     // Second PUSH1: overflow with one item already pushed, 3 gas. SHL has its two operands: 3
     // gas. SUB needs x under the shifted constant: underflow, 3 gas.
     // The caller has charged the 9 gas with charge_all().
-    (void)gas;
     if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
         return fail(EVMC_STACK_OVERFLOW);
     if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
         return fail(EVMC_STACK_UNDERFLOW);
     const uint32_t a = pos.code_it[-1];
     const uint32_t b = pos.code_it[1];
+    if (pos.code_it[4] == OP_AND && a == 1 && b == 160)
+    {
+        // With x == 1 the result is 2^160 - 1, and an AND follows: Solidity's address mask
+        // (404K per 200 mainnet blocks). The AND clears the 3 high words of the item y under x,
+        // after its own underflow test and 3 gas; neither the mask nor the SUB is made. Other
+        // operands that give the same mask take the general path.
+        const word32* const x = reinterpret_cast<const word32*>(pos.stack_end - 1);
+        if (((x[0] ^ 1) | x[1] | x[2] | x[3] | x[4] | x[5] | x[6] | x[7]) == 0)
+        {
+            if (INTX_UNLIKELY(pos.stack_end - 1 == stack_bottom))
+                return fail(EVMC_STACK_UNDERFLOW);
+            if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
+                return fail(EVMC_OUT_OF_GAS);
+            word32* const y = reinterpret_cast<word32*>(pos.stack_end - 2);
+            y[5] = 0;
+            y[6] = 0;
+            y[7] = 0;
+            pos.stack_end -= 1;
+            pos.code_it += 5;
+            return true;
+        }
+    }
     // c = a << b: a byte shifted by b < 256 lands in words b / 32 and b / 32 + 1.
     word32* const c = reinterpret_cast<word32*>(pos.stack_end);
     c[0] = 0;
@@ -1076,9 +1473,11 @@ template <Opcode Op>
     c[7] = 0;
     const unsigned ws = b >> 5;
     const unsigned bs = b & 31;
-    c[ws] = a << bs;
+    // Through one pointer: indexing c twice, GCC computes the address of c[ws + 1] apart.
+    word32* const cw = c + ws;
+    cw[0] = a << bs;
     if (ws < 7)
-        c[ws + 1] = (a >> 1) >> (31 - bs);
+        cw[1] = (a >> 1) >> (31 - bs);
     // x = c - x: CSR SUB_AND_NEGATE (0x04) is *x10 = *x11 - *x10, as instr::core::sub() uses it.
 #if defined(AIRBENDER) && defined(__riscv)
     register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(pos.stack_end - 1);
@@ -1090,19 +1489,6 @@ template <Opcode Op>
 #endif
     pos.code_it += 4;
     return true;
-}
-
-/// One 256-bit stack slot to another (distinct and 32-byte aligned): one MEMCOPY delegation.
-[[gnu::always_inline]] inline void copy_slot(uint256* dst, const uint256* src) noexcept
-{
-#if defined(AIRBENDER) && defined(__riscv)
-    register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(dst);
-    register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(src);
-    register uint32_t r12 asm("x12") = 0x80;
-    asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-#else
-    *dst = *src;
-#endif
 }
 
 /// *dst += *src: the one BigInt delegation ADD makes.
@@ -1129,8 +1515,8 @@ constexpr bool swap2_fuses(Opcode op) noexcept
 
 /// SWAP1 and Op, entered after SWAP1's checks with the swap not yet made; pos.code_it is at Op.
 template <Opcode Op>
-[[gnu::always_inline]] inline bool swap1_then(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+[[gnu::always_inline]] inline bool swap1_then(const uint256* bottom2, const uint256* stack_limit,
+    Position& pos, int64_t& gas, ExecutionState& state, [[maybe_unused]] JumpBase jb) noexcept
 {
     const auto fail = [&](evmc_status_code status) noexcept {
         state.status = status;
@@ -1154,18 +1540,18 @@ template <Opcode Op>
         const uint32_t dst = w[0];
         const auto& analysis = *state.analysis.baseline;
         if (INTX_UNLIKELY((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0 ||
-                          !analysis.check_jumpdest(dst)))
+                          !analysis.check_jumpdest_in(jb.map, dst)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
         copy_slot(s - 2, s - 1);
         pos.stack_end = s - 1;
         if (INTX_UNLIKELY(!deduct_gas(gas, 1)))
             return fail(EVMC_OUT_OF_GAS);
-        pos.code_it = &analysis.code()[dst] + 1;
+        pos.code_it = landing(jb, dst);
         return true;
     }
     else if constexpr (Op == OP_SWAP2)
     {
-        if (INTX_UNLIKELY(s <= stack_bottom + 2))
+        if (INTX_UNLIKELY(s <= bottom2))
             return fail(EVMC_STACK_UNDERFLOW);
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
@@ -1295,6 +1681,14 @@ int64_t dispatch_cgoto(
 
     const auto stack_bottom = state.stack_space.bottom();
     const auto stack_limit = stack_limit_of(stack_bottom);
+    auto jb = jump_base(code, state);
+#if EVMONE_RV32_DISPATCH
+    // Hidden so that GCC keeps both in registers instead of reloading them through the analysis
+    // on each jump.
+    asm("" : "+r"(jb.code1), "+r"(jb.map));
+#endif
+    const auto bottom1 = stack_floor_of(stack_bottom);
+    const auto bottom2 = stack_bottom + 2;
 
     // Code iterator and stack top pointer for interpreter loop.
     Position position{code, stack_bottom};
@@ -1302,8 +1696,8 @@ int64_t dispatch_cgoto(
     goto* CGOTO(*position.code_it);
 
 #define ON_OPCODE_INVOKE(OPCODE)                                                                 \
-    if (const auto next =                                                                        \
-            invoke<OPCODE, false>(cost_table, stack_bottom, stack_limit, position, gas, state);  \
+    if (const auto next = invoke<OPCODE, false>(                                                 \
+            cost_table, stack_bottom, bottom1, bottom2, stack_limit, position, gas, state, jb);  \
         next.code_it == nullptr)                                                                 \
     {                                                                                            \
         return gas;                                                                              \
@@ -1338,8 +1732,8 @@ int64_t dispatch_cgoto(
     else if constexpr (OPCODE == OP_SWAP1 || OPCODE == OP_SWAP2)                                 \
     {                                                                                            \
         /* The swap's checks; the swap is made by the successor's SWAPn_THEN_ entry. */          \
-        if (const auto status = check_requirements<OPCODE>(                                      \
-                cost_table, gas, position.stack_end, stack_bottom, stack_limit);                 \
+        if (const auto status = check_requirements<OPCODE>(cost_table, gas,                      \
+                position.stack_end, stack_bottom, bottom1, bottom2, stack_limit);                \
             status != EVMC_SUCCESS)                                                              \
         {                                                                                        \
             state.status = status;                                                               \
@@ -1407,7 +1801,7 @@ PUSH1_THEN_UNDEFINED:
     SWAP1_THEN_##OPCODE : ASM_COMMENT(SWAP1_##OPCODE);                                           \
     if constexpr (swap1_fuses(OPCODE))                                                           \
     {                                                                                            \
-        if (!swap1_then<OPCODE>(stack_bottom, stack_limit, position, gas, state))                \
+        if (!swap1_then<OPCODE>(bottom2, stack_limit, position, gas, state, jb))                 \
             return gas;                                                                          \
         goto* CGOTO(*position.code_it);                                                          \
     }                                                                                            \
@@ -1449,7 +1843,7 @@ SWAP2_THEN_UNDEFINED:
 #endif
 }  // namespace
 
-evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* ctx,
+evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* ctx,
     evmc_revision rev, const evmc_message& msg, const CodeAnalysis& analysis) noexcept
 {
     const auto code = analysis.code();
@@ -1479,10 +1873,11 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
             gas = dispatch<false>(cost_table, state, gas, code_begin);
     }
 
-    const auto result = make_execution_result(state, gas);
+    // Not const: the result is returned by NRVO (evmc::Result cannot be copied).
+    auto result = make_execution_result(state, gas);
 
     if (INTX_UNLIKELY(tracer != nullptr))
-        tracer->notify_execution_end(result);
+        tracer->notify_execution_end(result.raw());
 
     return result;
 }
@@ -1494,7 +1889,7 @@ evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_co
     const bytes_view container{code, code_size};
 
     const auto code_analysis = analyze(container);
-    return execute(*vm, *host, ctx, rev, *msg, code_analysis);
+    return execute(*vm, *host, ctx, rev, *msg, code_analysis).release_raw();
     // return evmc_result{EVMC_SUCCESS, msg->gas};
 }
 }  // namespace evmone::baseline

@@ -6,7 +6,7 @@
 #include "create_address.hpp"
 #include "delegation.hpp"
 #include "instructions.hpp"
-#include <variant>
+#include <cstddef>
 
 namespace evmone::instr::core
 {
@@ -16,19 +16,26 @@ constexpr auto CALL_VALUE_COST = 9000;
 constexpr auto CALL_VALUE_COST_AMSTERDAM = ACCOUNT_WRITE + CALL_STIPEND;
 constexpr auto ACCOUNT_CREATION_COST = 25000;
 
-/// Get target address of a code executing instruction.
-///
-/// Returns EIP-7702 delegate address if addr is delegated, or addr itself otherwise.
-/// Applies gas charge for accessing delegate account and may fail with out of gas.
-inline std::variant<evmc::address, Result> get_target_address(
-    const evmc::address& addr, int64_t& gas_left, ExecutionState& state) noexcept
+/// The EIP-7702 delegation of the target of a code executing instruction.
+enum class Delegation
+{
+    none,        ///< Not delegated, or delegated to itself: the target's own code runs.
+    delegated,   ///< The delegate's code runs.
+    out_of_gas,  ///< The access to the delegate account ran out of gas.
+};
+
+/// Resolves the EIP-7702 delegation of the target addr: if addr is delegated, writes the delegate
+/// address to code_addr (which the caller has set to addr) and applies the gas charge for accessing
+/// the delegate account, which may fail with out of gas.
+inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& code_addr,
+    int64_t& gas_left, ExecutionState& state) noexcept
 {
     if (state.rev < EVMC_PRAGUE)
-        return addr;
+        return Delegation::none;
 
     const auto delegate_addr = get_delegate_address(state.host, addr);
     if (!delegate_addr)
-        return addr;
+        return Delegation::none;
 
     const auto delegate_account_access_cost =
         (state.host.access_account(*delegate_addr) == EVMC_ACCESS_COLD ?
@@ -36,7 +43,7 @@ inline std::variant<evmc::address, Result> get_target_address(
                 WARM_ACCESS);
 
     if ((gas_left -= delegate_account_access_cost) < 0)
-        return Result{EVMC_OUT_OF_GAS, gas_left};
+        return Delegation::out_of_gas;
 
     // EIP-7928: once the access cost is committed (no OOG), the delegate
     // address must appear in the block access list even if the CALL itself
@@ -45,7 +52,18 @@ inline std::variant<evmc::address, Result> get_target_address(
     // observes the read.
     (void)state.host.account_exists(*delegate_addr);
 
-    return *delegate_addr;
+    code_addr = *delegate_addr;
+    return *delegate_addr != addr ? Delegation::delegated : Delegation::none;
+}
+
+/// Sends the message of a CALL or CREATE to the host. Through the C callback the C++ Host's
+/// evmc::Result is released to a raw evmc_result and wrapped again in HostContext::call, two
+/// copies of the result per call; the same virtual call on the C++ Host returns it as is.
+inline evmc::Result host_call(ExecutionState& state, const evmc_message& msg) noexcept
+{
+    if (state.cpp_host != nullptr) [[likely]]
+        return state.cpp_host->call(msg);
+    return state.host.call(msg);
 }
 
 /// Absorbs a child's state-gas back to the parent (EIP-8037).
@@ -70,6 +88,56 @@ inline void absorb_child_state_gas(
     // caller's spilled counter. Do this by refilling all returned state-gas to zeroed `left`.
     state.state_gas.left = 0;
     state.state_gas.refill(gas_left, result.state_gas.left);
+}
+
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
+    defined(EVMONE_RV32_DISPATCH_TEST)
+/// Whether the call family runs with the state Host only, as on rv32 (EVMONE_RV32_DISPATCH_TEST
+/// builds that configuration on the host for testing), where no frame has state gas before
+/// Amsterdam (see call_impl).
+constexpr bool STATE_HOST_ONLY = true;
+#else
+constexpr bool STATE_HOST_ONLY = false;
+#endif
+
+/// The value operand of the instructions without one.
+constexpr uint256 NO_VALUE{};
+
+/// Writes the address in the low 20 bytes of x to dst, as intx::be::trunc<evmc::address>(x).
+inline void to_address(evmc::address& dst, const uint256& x) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Byte i of the big-endian address is byte 19 - i of x's little-endian words: one byte load
+    // and store each, 40 instructions, where trunc byte-swaps all 32 bytes into a temporary and
+    // then copies 20 of them. One asm block, as in intx's bswap256_bytes: GCC's bswap pass would
+    // turn separate C byte copies back into word swaps of 10 instructions per word.
+    using Bytes = uint8_t[32];
+    const void* const src = &x;
+    uint32_t t;
+#define EVMONE_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
+    asm(EVMONE_RB(19, 0) EVMONE_RB(18, 1) EVMONE_RB(17, 2) EVMONE_RB(16, 3) EVMONE_RB(15, 4)
+        EVMONE_RB(14, 5) EVMONE_RB(13, 6) EVMONE_RB(12, 7) EVMONE_RB(11, 8) EVMONE_RB(10, 9)
+        EVMONE_RB(9, 10) EVMONE_RB(8, 11) EVMONE_RB(7, 12) EVMONE_RB(6, 13) EVMONE_RB(5, 14)
+        EVMONE_RB(4, 15) EVMONE_RB(3, 16) EVMONE_RB(2, 17) EVMONE_RB(1, 18) EVMONE_RB(0, 19)
+        : [t] "=&r"(t), "=m"(dst.bytes)
+        : [d] "r"(dst.bytes), [s] "r"(src), "m"(*static_cast<const Bytes*>(src)));
+#undef EVMONE_RB
+#else
+    dst = intx::be::trunc<evmc::address>(x);
+#endif
+}
+
+/// Writes the big-endian value x to dst, a message's value.
+inline void store_value(evmc_uint256be& dst, const uint256& x) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // The value of a message on the stack is 4-byte aligned, and a transferred amount has a few
+    // significant words: the word-wise conversion stores each leading zero word as one zero word.
+    static_assert(offsetof(evmc_message, value) % 4 == 0 && alignof(evmc_message) >= 4);
+    intx::internal::bswap256_to_aligned(dst.bytes, &x);
+#else
+    intx::be::store(dst.bytes, x);
+#endif
 }
 }  // namespace
 
@@ -103,17 +171,23 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     static constexpr bool HAS_VALUE_ARG = Op == OP_CALL || Op == OP_CALLCODE;
 
-    const auto gas = stack.pop();
-    const auto dst = intx::be::trunc<evmc::address>(stack.pop());
-    const auto value = HAS_VALUE_ARG ? stack.pop() : 0;
-    const auto has_value = value != 0;
-    const auto input_offset_u256 = stack.pop();
-    const auto input_size_u256 = stack.pop();
-    const auto output_offset_u256 = stack.pop();
-    const auto output_size_u256 = stack.pop();
+    // Built field by field, not value-initialized: that would clear all 144 bytes first (a memset
+    // call on rv32), each to be written again. Every field is assigned before host.call() below;
+    // only the padding is left, and nothing reads it.
+    evmc_message msg;  // NOLINT(cppcoreguidelines-pro-type-member-init)
 
-    stack.push(0);  // Assume failure.
-    state.return_data.clear();
+    // The operands are read in place, not copied: the stack slots stay valid. The push of the
+    // result overwrites the last one (the output size), so it comes after the memory checks, which
+    // read it last; the failures before it end the frame, whose stack and return data go with it.
+    const auto& gas = stack.pop();
+    evmc::address dst;
+    to_address(dst, stack.pop());
+    const auto& value = HAS_VALUE_ARG ? stack.pop() : NO_VALUE;
+    const auto has_value = value != 0;
+    const auto& input_offset_u256 = stack.pop();
+    const auto& input_size_u256 = stack.pop();
+    const auto& output_offset_u256 = stack.pop();
+    const auto& output_size_u256 = stack.pop();
 
     if constexpr (Op == OP_CALL)
     {
@@ -133,6 +207,9 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     const auto output_offset = static_cast<size_t>(output_offset_u256);
     const auto output_size = static_cast<size_t>(output_size_u256);
 
+    stack.push(0);  // Assume failure.
+    state.return_data.clear();
+
     if constexpr (HAS_VALUE_ARG)
     {
         const auto call_value_cost =
@@ -147,19 +224,10 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
-    // Avoid std::variant overhead for pre-Prague revisions (the common case).
-    evmc::address code_addr;
-    if (state.rev < EVMC_PRAGUE) [[likely]]
-    {
-        code_addr = dst;
-    }
-    else
-    {
-        const auto target_addr_or_result = get_target_address(dst, gas_left, state);
-        if (const auto* result = std::get_if<Result>(&target_addr_or_result))
-            return *result;
-        code_addr = std::get<evmc::address>(target_addr_or_result);
-    }
+    msg.code_address = dst;
+    const auto delegation = resolve_delegation(dst, msg.code_address, gas_left, state);
+    if (delegation == Delegation::out_of_gas)
+        return {EVMC_OUT_OF_GAS, gas_left};
 
     bool new_account_charged = false;  // NOLINT(*-const-correctness)
     if constexpr (Op == OP_CALL)
@@ -177,12 +245,12 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         }
     }
 
-    evmc_message msg{.kind = to_call_kind(Op)};
-    msg.flags = (Op == OP_STATICCALL) ? uint32_t{EVMC_STATIC} : state.msg->flags;
-    if (dst != code_addr)
+    msg.kind = to_call_kind(Op);
+    msg.flags = (Op == OP_STATICCALL) ?
+                    uint32_t{EVMC_STATIC} :
+                    state.msg->flags & ~std::underlying_type_t<evmc_flags>{EVMC_DELEGATED};
+    if (delegation == Delegation::delegated)
         msg.flags |= EVMC_DELEGATED;
-    else
-        msg.flags &= ~std::underlying_type_t<evmc_flags>{EVMC_DELEGATED};
 #ifdef EVMONE_WORD_LAYOUT
     // Set here, after the flags are known: STATICCALL replaced them and the others inherit them.
     msg.flags |= wl::FLAG_WORD_INPUT | wl::FLAG_WORD_OUTPUT;
@@ -190,10 +258,13 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     msg.depth = state.msg->depth + 1;
     msg.state_gas = state.state_gas.left;
     msg.recipient = (Op == OP_CALL || Op == OP_STATICCALL) ? dst : state.msg->recipient;
-    msg.code_address = code_addr;
     msg.sender = (Op == OP_DELEGATECALL) ? state.msg->sender : state.msg->recipient;
-    msg.value =
-        (Op == OP_DELEGATECALL) ? state.msg->value : intx::be::store<evmc::uint256be>(value);
+    if constexpr (Op == OP_DELEGATECALL)
+        msg.value = state.msg->value;
+    else if (HAS_VALUE_ARG && has_value)
+        store_value(msg.value, value);
+    else
+        msg.value = {};
 
     if (input_size > 0)
     {
@@ -201,6 +272,13 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         msg.input_data = &state.memory[input_offset];
         msg.input_size = input_size;
     }
+    else
+    {
+        msg.input_data = nullptr;
+        msg.input_size = 0;
+    }
+    msg.code = nullptr;
+    msg.code_size = 0;
 
     msg.gas = std::numeric_limits<int64_t>::max();
     if (gas < msg.gas)
@@ -236,7 +314,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
-    const auto result = state.host.call(msg);
+    const auto result = host_call(state, msg);
     state.return_data.assign(result.output_data, result.output_size);
     stack.top() = result.status_code == EVMC_SUCCESS;
 
@@ -252,7 +330,11 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     const auto gas_used = msg.gas - result.gas_left;
     gas_left -= gas_used;
     state.gas_refund += result.gas_refund;
-    absorb_child_state_gas(gas_left, state, result);
+    // Before Amsterdam no frame has state gas: a transaction's message starts with none, and every
+    // charge and refill is an Amsterdam rule, so the child returns none and absorbing it changes
+    // nothing. Only the state Host is held to that; a test host may return state gas anyway.
+    if (!STATE_HOST_ONLY || state.rev >= EVMC_AMSTERDAM)
+        absorb_child_state_gas(gas_left, state, result);
 
     if constexpr (Op == OP_CALL)
     {
@@ -364,7 +446,7 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     msg.flags = wl::FLAG_WORD_OUTPUT;  // The REVERT data is read as return data.
 #endif
 
-    const auto result = state.host.call(msg);
+    const auto result = host_call(state, msg);
     gas_left -= msg.gas - result.gas_left;
     state.gas_refund += result.gas_refund;
     absorb_child_state_gas(gas_left, state, result);

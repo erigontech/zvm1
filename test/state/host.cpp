@@ -10,6 +10,8 @@
 #include <evmone/state_gas.hpp>
 #include <evmone/vm.hpp>
 #include <evmone/word_layout.hpp>
+#include <cstddef>
+#include <cstring>
 
 namespace evmone::state
 {
@@ -20,6 +22,29 @@ namespace
 void set_state_gas(evmc::Result& r, int64_t left, int64_t spilled) noexcept
 {
     r.state_gas = {.left = left, .spilled = spilled};
+}
+
+/// Whether the message runs the code of its recipient: msg.code_address == msg.recipient.
+bool runs_recipient_code(const evmc_message& msg) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // Word by word, in place: operator== takes evmc::address, and converting the plain
+    // evmc_address fields copies both. The fields are word aligned in the message.
+    typedef uint32_t __attribute__((may_alias)) Word;
+    static_assert(offsetof(evmc_message, recipient) % sizeof(Word) == 0 &&
+                  offsetof(evmc_message, code_address) % sizeof(Word) == 0 &&
+                  alignof(evmc_message) >= sizeof(Word) && sizeof(evmc_address) % sizeof(Word) == 0);
+    const Word* const a = reinterpret_cast<const Word*>(msg.code_address.bytes);
+    const Word* const b = reinterpret_cast<const Word*>(msg.recipient.bytes);
+    for (size_t i = 0; i < sizeof(evmc_address) / sizeof(Word); ++i)
+    {
+        if (a[i] != b[i])
+            return false;
+    }
+    return true;
+#else
+    return std::memcmp(msg.code_address.bytes, msg.recipient.bytes, sizeof(evmc_address)) == 0;
+#endif
 }
 
 /// The status and the journaled update of a slot's value, shared by set_storage() and sstore().
@@ -407,16 +432,18 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
     }
     const evmc_message& msg = *msg_ptr;
 
+    // The recipient's account of a call, which exists from here on: both branches insert it.
+    Account* recipient_acc = nullptr;
     if (msg.kind == EVMC_CALL)
     {
-        auto* recipient_acc = m_state.find(msg.recipient);
+        recipient_acc = m_state.find(msg.recipient);
         if (recipient_acc == nullptr)
             m_state.journal_new_account(msg.recipient);
         // TODO: Both branches will insert new account so better to do it in common path.
 
         if (evmc::is_zero(msg.value))
         {
-            m_state.touch(msg.recipient);
+            recipient_acc = &m_state.touch(msg.recipient);
         }
         else
         {
@@ -458,7 +485,12 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
         return r;
     }
 
-    const auto code_acc = m_state.find(msg.code_address);
+    // A call that runs the recipient's own code (not a delegated one) has its account already:
+    // find() would return the same entry, loaded as touch() and insert() leave it, and the node
+    // stays where it is through the inserts since.
+    const auto code_acc = (msg.kind == EVMC_CALL && runs_recipient_code(msg)) ?
+                              recipient_acc :
+                              m_state.find(msg.code_address);
     if (code_acc == nullptr || code_acc->code_hash == Account::EMPTY_CODE_HASH)
     {
         auto r = evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
@@ -472,8 +504,8 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     if (my_vm->has_cached_execution())
     {
-        return evmc::Result{my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
-            [this](const address& addr) { return m_state.get_code(addr); })};
+        return my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
+            [this](const address& addr) { return m_state.get_code(addr); });
     }
 
     // TODO: get_code() performs the account lookup. Add a way to get an account with code?

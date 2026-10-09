@@ -7,7 +7,6 @@
 /// EVMC instance (class VM) and entry point of evmone is defined here.
 
 #include "vm.hpp"
-#include "advanced_execution.hpp"
 #include "baseline.hpp"
 #include <evmone/evmone.h>
 #include <cassert>
@@ -22,6 +21,19 @@
 
 #if EVMONE_TRACING
 #include <iostream>
+#endif
+
+/// Whether the "advanced" option, which selects the advanced interpreter, is available. Naming
+/// advanced::execute here keeps that interpreter and its instruction tables (op_tables is 32 KB)
+/// in the binary even when nothing selects it, which costs a zkVM guest that copies its read-only
+/// data into RAM at the start of every run. Embedders that only run the baseline interpreter
+/// compile it out.
+#ifndef EVMONE_ADVANCED
+#define EVMONE_ADVANCED 1
+#endif
+
+#if EVMONE_ADVANCED
+#include "advanced_execution.hpp"
 #endif
 
 namespace evmone
@@ -42,12 +54,15 @@ evmc_set_option_result set_option(evmc_vm* c_vm, char const* c_name, char const*
         (c_value != nullptr) ? std::string_view{c_value} : std::string_view{};
     [[maybe_unused]] auto& vm = *static_cast<VM*>(c_vm);
 
+#if EVMONE_ADVANCED
     if (name == "advanced")
     {
         c_vm->execute = evmone::advanced::execute;
         return EVMC_SET_OPTION_SUCCESS;
     }
-    else if (name == "cgoto")
+    else
+#endif
+    if (name == "cgoto")
     {
 #if EVMONE_CGOTO_SUPPORTED
         if (value == "no")
@@ -106,6 +121,7 @@ ExecutionState& VM::get_execution_state(size_t depth) noexcept
     return m_execution_states[depth];
 }
 
+#if !EVMONE_LEAN_CODE_CACHE
 std::shared_ptr<baseline::CodeAnalysis> CodeCache::get(const evmc::bytes32& code_hash)
 {
     const auto it = map_.find(code_hash);
@@ -134,27 +150,11 @@ void CodeCache::put(const evmc::bytes32& code_hash, std::shared_ptr<baseline::Co
         lru_list_.pop_back();
     }
 }
-
+#endif
 
 bool VM::has_cached_execution() const noexcept
 {
     return execute == static_cast<decltype(execute)>(baseline::execute);
-}
-
-evmc_result VM::execute_cached_code(evmc::Host& host, evmc_revision rev, const evmc_message& msg,
-    const evmc::bytes32& code_hash,
-    const std::function<evmc::bytes_view(evmc::address)>& get_code) noexcept
-{
-    auto p = m_code_cache.get(code_hash);
-    if (p == nullptr)
-    {
-        const auto code = get_code(msg.code_address);
-        p = std::make_shared<baseline::CodeAnalysis>(baseline::analyze(code));
-        m_code_cache.put(code_hash, p);
-    }
-
-    const auto& ca = *p;
-    return baseline::execute(*this, evmc::Host::get_interface(), host.to_context(), rev, msg, ca);
 }
 
 }  // namespace evmone

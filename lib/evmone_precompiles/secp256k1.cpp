@@ -4,9 +4,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "secp256k1.hpp"
 #include "keccak.hpp"
+#include <cstring>
 #include <memory>
 #include <new>
 #include <type_traits>
+
+#if (defined(AIRBENDER) && defined(__riscv)) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// ecrecover_msm_single(): GLV halves, width-12 NAFs of G and width-5 NAFs of R over a table of odd
+/// multiples on a common z, with in-place point operations. EVMONE_RV32_DISPATCH_TEST builds it on
+/// the host for testing, with bigint_op() computed in software.
+#define EVMONE_SECP256K1_MSM_SINGLE 1
+#else
+#define EVMONE_SECP256K1_MSM_SINGLE 0
+#endif
 
 #if defined(SP1TURBO) || defined(SP1)
 #include <sp1_syscalls.hpp>
@@ -676,7 +686,7 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
 #endif
 
 
-#if defined(AIRBENDER) && defined(__riscv)
+#if EVMONE_SECP256K1_MSM_SINGLE
 namespace
 {
 ecc::ProjPoint<Curve> ecrecover_msm_single(
@@ -725,9 +735,9 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
 
     // 6. Calculate public key point Q = u1×G + u2×R.
     const auto Rpt = AffinePoint{r_mont, *y};
-#if defined(AIRBENDER) && defined(__riscv)
+#if EVMONE_SECP256K1_MSM_SINGLE
     // GLV halves: width-12 NAFs over the precomputed odd multiples of G and phi(G), width-5 NAFs
-    // over odd multiples of R and phi(R) in Jacobian coordinates.
+    // over odd multiples of R and phi(R) on a common z (see ecrecover_msm_single()).
     const auto Q = ecrecover_msm_single(u1.value(), u2.value(), Rpt);
 #else
     const auto Q = msm(u1.value(), G, u2.value(), Rpt);
@@ -806,11 +816,19 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
 #endif
 }
 
-#if defined(AIRBENDER) && defined(__riscv)
+#if EVMONE_SECP256K1_MSM_SINGLE
 namespace
 {
-/// n default-constructed elements in 32-byte aligned storage: the BigInt CSR paths of the field
-/// arithmetic need aligned operands, and the guest's allocator only guarantees 8 bytes.
+/// n elements in 32-byte aligned storage: the BigInt CSR paths of the field arithmetic need
+/// aligned operands, and the guest's allocator only guarantees 8 bytes. The elements start
+/// uninitialized (zeroing them, and the run-time 1 of each ProjPoint's y, was dead work): callers
+/// write every element before they read it, and a ProjPoint element is not the point at infinity
+/// until written. In ecrecover_batch() every array is gated by live[]: an entry is written and
+/// read only while it is live. A read of an unwritten element would go unnoticed by the corpus
+/// and the tests, because the guest's bump allocator hands out memory that was never written, so
+/// it reads as zero; only review and a poisoned-heap harness see it. The host build of this code
+/// (EVMONE_RV32_DISPATCH_TEST) keeps value-initializing: the uninitialized constructors exist on
+/// the guest only.
 template <typename T>
 class AlignedArray
 {
@@ -825,7 +843,16 @@ public:
         p_ = reinterpret_cast<T*>(
             (reinterpret_cast<uintptr_t>(raw_.get()) + 31) & ~static_cast<uintptr_t>(31));
         for (size_t i = 0; i < n; ++i)
+        {
+#if defined(AIRBENDER) && defined(__riscv)
+            if constexpr (requires { typename T::uninit_tag; })
+                new (&p_[i]) T{typename T::uninit_tag{}};
+            else
+                new (&p_[i]) T{ecc::uninit};
+#else
             new (&p_[i]) T{};
+#endif
+        }
     }
     T& operator[](size_t i) noexcept { return p_[i]; }
 };
@@ -947,24 +974,64 @@ unsigned wnaf(Digit* naf, const word32* w) noexcept
 }
 
 /// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
-constexpr auto FP_ONE = Curve::Fp::one();
+constexpr const auto& FP_ONE = ecc::ProjPoint<Curve>::ONE;
 
-/// dbl_inplace, madd_inplace and jadd_inplace rebind their operands through __builtin_assume_aligned(.., 32),
+/// dbl_inplace and madd_inplace rebind their operands through __builtin_assume_aligned(.., 32),
 /// so the inlined ModArith operations fold their alignment tests. Every caller passes 32-byte-aligned storage
 /// (FieldElement's value_ is alignas(32)); a misaligned operand would be undefined behavior and would make the
 /// BigInt CSR fault. There is no assert(): the guest is built with NDEBUG, and these functions do not exist on
 /// the host.
+#if defined(AIRBENDER) && defined(__riscv)
 static_assert(alignof(ecc::ProjPoint<Curve>) == 32 && alignof(AffinePoint) == 32 && alignof(Curve::Fp) == 32);
+#endif
+
+/// p, which on rv32 the compiler is told is 32-byte aligned. The host build of these functions
+/// (EVMONE_RV32_DISPATCH_TEST) has 8-byte aligned field elements, and no alignment to fold.
+template <typename T>
+[[gnu::always_inline]] inline T* assume_aligned_32(T* p) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv)
+    return static_cast<T*>(__builtin_assume_aligned(p, 32));
+#else
+    return p;
+#endif
+}
 
 /// x = x OP y on the BigInt delegation (x and y 32-byte aligned and distinct); returns the
 /// carry/borrow flag the operation leaves in x12.
 [[gnu::always_inline]] inline uint32_t bigint_op(void* x, const void* y, uint32_t op) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv)
     register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(x);
     register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(y);
     register uint32_t a2 asm("x12") = op;
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
     return a2;
+#else
+    // The host's uint256 has the memory layout of the delegation's 8 little-endian words.
+    uint256 a;
+    uint256 b;
+    std::memcpy(&a, x, sizeof a);
+    std::memcpy(&b, y, sizeof b);
+    uint256 r;
+    switch (op)
+    {
+    case 0x02:  // SUB
+        r = a - b;
+        break;
+    case 0x04:  // SUB_AND_NEGATE
+        r = b - a;
+        break;
+    case 0x08:  // MUL_LOW
+        r = static_cast<uint256>(intx::umul(a, b));
+        break;
+    default:  // MUL_HIGH
+        r = static_cast<uint256>(intx::umul(a, b) >> 256);
+        break;
+    }
+    std::memcpy(x, &r, sizeof r);
+    return 0;
+#endif
 }
 constexpr uint32_t BIGINT_SUB = 0x02, BIGINT_SUB_AND_NEGATE = 0x04, BIGINT_MUL_LOW = 0x08,
                    BIGINT_MUL_HIGH = 0x10;
@@ -1065,7 +1132,7 @@ std::array<ecc::SignedScalar<uint256>, 2> split_lambda(const uint256& k) noexcep
 __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p_) noexcept
 {
     using FE = Curve::Fp;
-    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
+    auto& p = *assume_aligned_32(&p_);
     auto& [x1, y1, z1] = p;
     DECL_FE_COPY(FE, yy, y1); yy *= y1;          // Y^2
     z1 *= y1;                                    // Z' = YZ
@@ -1090,21 +1157,44 @@ __attribute__((flatten)) void dbl_inplace(ecc::ProjPoint<Curve>& p_) noexcept
     return a == 0;
 }
 
+/// How a madd_inplace() variant differs from the plain one, chosen at compile time because a run-time
+/// flag in the body shared with msm_wnaf() and the batch table would cost every call.
+enum class MaddMode
+{
+    plain,
+    /// Also writes the ratio z3/z1 (= h) to the storage at `ratio_`: the odd multiples of R share one z
+    /// after rescaling them by these (see ecrecover_msm_single()).
+    ratio,
+    /// (x2, y2) is a point of the curve the accumulator's curve is isomorphic to through
+    /// (x, y) -> (Zg^2 x, Zg^3 y), mapped by the factor Zg at `zg_`: u2 and s2 take z1 Zg where z1 is
+    /// squared and cubed, which costs one multiplication where mapping the point costs two.
+    zinv,
+};
+
 /// p += (x2, y2), an affine point other than infinity, in place: the add-1998-cmo-2 formula with
 /// z2 = 1, written into p's own coordinates as each one dies, skipping the copies through the
 /// returned point. Its result (X3 : Y3 : Z3) is the same point as ecc::add()'s (4 X3 : 8 Y3 : 2 Z3),
 /// which is fine because callers use points only projectively (see dbl_inplace()). Taking the
-/// coordinates apart lets a negated table point pass only its new y. With Live the caller knows p
-/// is not infinity either, which saves the 8-word test of z. Returns true if the sum is the point
-/// at infinity (p == -(x2, y2)), and then leaves p with z == 0.
-template <bool Live = false>
-__attribute__((flatten)) bool madd_inplace(
-    ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_, const Curve::Fp& y2_) noexcept
+/// coordinates apart lets a table point pass only its y. With Live the caller knows p is not
+/// infinity either, which saves the 8-word test of z. With NegY it adds (x2, -y2) instead,
+/// without materializing -y2: the formula's r = s2 - y1 becomes -r = s2 + y1 (r only enters
+/// squared and as the factor of v - x3, which then flips to x3 - v), so the result is
+/// bit-identical to passing -y2, and r == 0 still marks the doubling and infinity cases. Returns
+/// true if the sum is the point at infinity (p == -(x2, y2), or p == (x2, y2) with NegY), and then
+/// leaves p with z == 0. The ratio and zinv modes need Live: p is never the point at infinity
+/// there. The formulas use no curve constant, so p may run on any curve y^2 = x^3 + b'.
+template <bool Live = false, MaddMode Mode = MaddMode::plain, bool NegY = false>
+__attribute__((flatten)) bool madd_inplace(ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_,
+    const Curve::Fp& y2_, [[maybe_unused]] const Curve::Fp* zg_ = nullptr,
+    [[maybe_unused]] Curve::Fp* ratio_ = nullptr) noexcept
 {
+    static_assert(Live || Mode == MaddMode::plain);
+    // The not-live set of p would store y2, not -y2, and the ratio table is built from +y points.
+    static_assert(!NegY || (Live && Mode != MaddMode::ratio));
     using FE = Curve::Fp;
-    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
-    const auto& x2 = *static_cast<const FE*>(__builtin_assume_aligned(&x2_, 32));
-    const auto& y2 = *static_cast<const FE*>(__builtin_assume_aligned(&y2_, 32));
+    auto& p = *assume_aligned_32(&p_);
+    const auto& x2 = *assume_aligned_32(&x2_);
+    const auto& y2 = *assume_aligned_32(&y2_);
     auto& [x1, y1, z1] = p;
     if constexpr (!Live)
     {
@@ -1116,85 +1206,51 @@ __attribute__((flatten)) bool madd_inplace(
             return false;
         }
     }
-    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
+    // The z that z1z1 and s2 are built from: z1, or z1 Zg when x2 and y2 are in the scale-Zg
+    // curve's coordinates and p's own z stays unscaled, so that z3 = z1 h stays unscaled too.
+    alignas(32) char az_raw_[Mode == MaddMode::zinv ? sizeof(FE) : 1];
+    const FE* zs = &z1;
+    if constexpr (Mode == MaddMode::zinv)
+    {
+        const auto& zg = *assume_aligned_32(zg_);
+        auto* const az = ::new (static_cast<void*>(az_raw_)) FE(z1);
+        *az *= zg;
+        zs = az;
+    }
+    DECL_FE_COPY(FE, z1z1, *zs); z1z1 *= *zs;    // z1^2
     DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
-    z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
+    z1z1 *= *zs; z1z1 *= y2;                     // s2 = y2 z1^3
     h -= x1;                                     // h = u2 - x1
-    z1z1 -= y1;                                  // r = s2 - y1
+    // Before the h == 0 test: z1z1 == 0 must see +/-r there.
+    if constexpr (NegY)
+        z1z1 += y1;                              // -r = s2 + y1
+    else
+        z1z1 -= y1;                              // r = s2 - y1
     if (is_zero_low_first(h)) [[unlikely]]
     {
-        if (z1z1 == 0)  // p == (x2, y2)
+        if (z1z1 == 0)  // p == (x2, y2), or with NegY p == (x2, -y2)
         {
             dbl_inplace(p);
             return false;
         }
-        z1 = FE{};  // p == -(x2, y2): the sum is the point at infinity.
+        z1 = FE{};  // p == -(x2, y2), or with NegY p == (x2, y2): the sum is the point at infinity.
         return true;
     }
+    if constexpr (Mode == MaddMode::ratio)
+        ::new (static_cast<void*>(assume_aligned_32(ratio_))) FE(h);  // z3 / z1
     z1 *= h;                                     // z3 = z1 h
     DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
     h *= hh;                                     // h^3
     hh *= x1;                                    // v = x1 h^2
     x1 = z1z1; x1 *= z1z1;                       // r^2
     x1 -= h; x1 -= hh; x1 -= hh;                 // x3 = r^2 - h^3 - 2v
-    hh -= x1;                                    // v - x3
+    if constexpr (NegY)
+        hh.rsub(x1);                             // x3 - v
+    else
+        hh -= x1;                                // v - x3
     y1 *= h;                                     // y1 h^3
-    z1z1 *= hh;                                  // r (v - x3)
+    z1z1 *= hh;                                  // r (v - x3), as (-r) (x3 - v) with NegY
     y1.rsub(z1z1);                               // y3 = r (v - x3) - y1 h^3
-    return false;
-}
-
-/// p += (x2 : y2 : z2), a Jacobian point other than infinity, in place: ecc::add()'s
-/// add-1998-cmo-2 formula written into p's own coordinates as each one dies (see madd_inplace()).
-/// Returns true if the sum is the point at infinity, and then leaves p with z == 0.
-template <bool Live = false>
-__attribute__((flatten)) bool jadd_inplace(ecc::ProjPoint<Curve>& p_, const Curve::Fp& x2_,
-    const Curve::Fp& y2_, const Curve::Fp& z2_) noexcept
-{
-    using FE = Curve::Fp;
-    auto& p = *static_cast<ecc::ProjPoint<Curve>*>(__builtin_assume_aligned(&p_, 32));
-    const auto& x2 = *static_cast<const FE*>(__builtin_assume_aligned(&x2_, 32));
-    const auto& y2 = *static_cast<const FE*>(__builtin_assume_aligned(&y2_, 32));
-    const auto& z2 = *static_cast<const FE*>(__builtin_assume_aligned(&z2_, 32));
-    auto& [x1, y1, z1] = p;
-    if constexpr (!Live)
-    {
-        if (p == 0)
-        {
-            x1 = x2;
-            y1 = y2;
-            z1 = z2;
-            return false;
-        }
-    }
-    DECL_FE_COPY(FE, z1z1, z1); z1z1 *= z1;      // z1^2
-    DECL_FE_COPY(FE, z2z2, z2); z2z2 *= z2;      // z2^2
-    DECL_FE_COPY(FE, u1, x1); u1 *= z2z2;        // u1 = x1 z2^2
-    DECL_FE_COPY(FE, h, x2); h *= z1z1;          // u2 = x2 z1^2
-    z1z1 *= z1; z1z1 *= y2;                      // s2 = y2 z1^3
-    z2z2 *= z2; z2z2 *= y1;                      // s1 = y1 z2^3
-    h -= u1;                                     // h = u2 - u1
-    z1z1 -= z2z2;                                // r = s2 - s1
-    if (is_zero_low_first(h)) [[unlikely]]
-    {
-        if (z1z1 == 0)  // p == (x2 : y2 : z2)
-        {
-            dbl_inplace(p);
-            return false;
-        }
-        z1 = FE{};  // p == -(x2 : y2 : z2): the sum is the point at infinity.
-        return true;
-    }
-    DECL_FE_COPY(FE, hh, h); hh *= h;            // h^2
-    u1 *= hh;                                    // v = u1 h^2
-    hh *= h;                                     // h^3
-    x1 = z1z1; x1 *= z1z1;                       // r^2
-    x1 -= hh; x1 -= u1; x1 -= u1;                // x3 = r^2 - h^3 - 2v
-    u1 -= x1;                                    // v - x3
-    hh *= z2z2;                                  // s1 h^3
-    y1 = z1z1; y1 *= u1;                         // r (v - x3)
-    y1 -= hh;                                    // y3 = r (v - x3) - s1 h^3
-    z1 *= z2; z1 *= h;                           // z3 = z1 z2 h
     return false;
 }
 
@@ -1225,6 +1281,18 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
             started = true;
         }
     };
+    // add(x, -y) for the G table's negated digits, without computing -y unless it must be stored.
+    const auto add_neg = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+        if (started)
+            started = !madd_inplace<true, MaddMode::plain, true>(result, x, y);
+        else
+        {
+            result.x = x;
+            result.y = -y;
+            result.z = FP_ONE;
+            started = true;
+        }
+    };
     for (auto i = top; i-- != 0;)
     {
         if (started)
@@ -1245,7 +1313,7 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
         {
             const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_ga)
-                add(pt.x, -pt.y);
+                add_neg(pt.x, pt.y);
             else
                 add(pt.x, pt.y);
         }
@@ -1253,7 +1321,7 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != neg_gb)
-                add(pt.x, -pt.y);
+                add_neg(pt.x, pt.y);
             else
                 add(pt.x, pt.y);
         }
@@ -1262,36 +1330,71 @@ ecc::ProjPoint<Curve> msm_wnaf(bool neg_ga, bool neg_gb, const int16_t* naf_ga,
 }
 
 /// u1*G + u2*R for a single signature (the ECRECOVER precompile), which has no batch to share
-/// inversions with: msm_wnaf()'s digits, with the odd multiples of R kept in Jacobian coordinates
-/// (2R by doubling, 3R by a mixed addition, the rest by Jacobian ones) and phi applied as
-/// (BETA X : Y : Z). No table addition can hit P == +/-Q (see ecrecover_batch()).
+/// inversions with: msm_wnaf()'s digits, with phi applied as (BETA X, Y). The odd multiples of R are
+/// brought to one common z the way libsecp256k1's ecmult_odd_multiples_table() and
+/// ge_table_set_globalz() do, so that every table addition is a mixed one (a Jacobian one costs a
+/// third more, and about 42 of them run per call): with 2R = (X : Y : C),
+/// (x, y) -> (C^2 x, C^3 y) takes the curve to the one where 2R is affine (X, Y), where the
+/// 2j+1 multiples follow by mixed additions that each leave their z ratio h behind (z3 = z1 h), and
+/// scaling the entries by the products of the later ratios puts all of them on the z of the last,
+/// z_7. Read as affine points, the entries are then the multiples of R on the curve the scale
+/// Zg = z_7 C maps to, y^2 = x^3 + 7 Zg^6. The accumulator runs on that curve (the doublings and
+/// additions use no curve constant; phi is an endomorphism of every y^2 = x^3 + b'), the G digits
+/// are added by the zinv mode of madd_inplace(), and the result's z is multiplied by Zg at the end,
+/// which gives the same point on secp256k1 and keeps z == 0 exactly for the point at infinity (Zg is
+/// not 0). No table addition can hit P == +/-Q (see ecrecover_batch()), so no ratio is 0 either.
 ecc::ProjPoint<Curve> ecrecover_msm_single(
     const uint256& u1, const uint256& u2, const AffinePoint& R) noexcept
 {
     using Point = ecc::ProjPoint<Curve>;
+    using FE = Curve::Fp;
     const auto [a1, b1] = split_lambda(u1);
     const auto [a2, b2] = split_lambda(u2);
 
-    alignas(32) std::byte t_raw[R_TABLE_SIZE * sizeof(Point)];
-    alignas(32) std::byte e_raw[2 * R_TABLE_SIZE * sizeof(Curve::Fp)];
-    auto* const t = reinterpret_cast<Point*>(t_raw);
-    auto* const bx = reinterpret_cast<Curve::Fp*>(e_raw);  // BETA X_j
-    auto* const ny = bx + R_TABLE_SIZE;                      // -Y_j
-    auto& r1 = *new (&t[0]) Point{};
-    r1.x = R.x;
-    r1.y = R.y;
-    r1.z = FP_ONE;
-    Point two_r = r1;
+    alignas(32) std::byte t_raw[R_TABLE_SIZE * sizeof(AffinePoint)];
+    alignas(32) std::byte e_raw[2 * R_TABLE_SIZE * sizeof(FE)];
+    alignas(32) std::byte h_raw[(R_TABLE_SIZE - 1) * sizeof(FE)];
+    auto* const t = reinterpret_cast<AffinePoint*>(t_raw);
+    auto* const bx = reinterpret_cast<FE*>(e_raw);  // BETA X_j
+    auto* const ny = bx + R_TABLE_SIZE;               // -Y_j
+    auto* const hs = reinterpret_cast<FE*>(h_raw);   // hs[j - 1] = z_j / z_(j-1)
+    Point two_r{R.x, R.y, FP_ONE};
     dbl_inplace(two_r);
-    madd_inplace<true>(*new (&t[1]) Point{two_r}, R.x, R.y);
-    for (size_t j = 2; j < R_TABLE_SIZE; ++j)
-        jadd_inplace<true>(*new (&t[j]) Point{t[j - 1]}, two_r.x, two_r.y, two_r.z);
-    const auto beta = Curve::Fp{Curve::BETA};
+    const auto& c = two_r.z;
+    {
+        auto& r1 = *new (&t[0]) AffinePoint{R.x, R.y};
+        DECL_FE_COPY(FE, cc, c); cc *= c;        // C^2
+        r1.x *= cc;
+        cc *= c;                                 // C^3
+        r1.y *= cc;
+    }
+    Point acc{t[0].x, t[0].y, FP_ONE};
+    for (size_t j = 1; j < R_TABLE_SIZE; ++j)
+    {
+        madd_inplace<true, MaddMode::ratio>(acc, two_r.x, two_r.y, nullptr, &hs[j - 1]);
+        new (&t[j]) AffinePoint{acc.x, acc.y};
+    }
+    // The entries 0..6 are on the z of the entries before them: z_j. Each is scaled by
+    // s = z_7 / z_j = h_(j+1) ... h_7 to z_7, (x, y, z_j) -> (s^2 x, s^3 y, s z_j).
+    DECL_FE_COPY(FE, s, hs[R_TABLE_SIZE - 2]);
+    DECL_FE_COPY(FE, ss, s);
+    for (size_t j = R_TABLE_SIZE - 1; j-- != 0;)
+    {
+        if (j != R_TABLE_SIZE - 2)
+            s *= hs[j];
+        ss = s;
+        ss *= s;
+        t[j].x *= ss;
+        ss *= s;
+        t[j].y *= ss;
+    }
+    DECL_FE_COPY(FE, zg, acc.z); zg *= c;        // Zg = z_7 C
+    const auto beta = FE{Curve::BETA};
     for (size_t j = 0; j < R_TABLE_SIZE; ++j)
     {
-        new (&bx[j]) Curve::Fp{t[j].x};
+        new (&bx[j]) FE{t[j].x};
         bx[j] *= beta;
-        new (&ny[j]) Curve::Fp{-t[j].y};
+        new (&ny[j]) FE{-t[j].y};
     }
 
     alignas(4) int8_t naf_a[WNAF_LEN + 3]{};
@@ -1306,7 +1409,7 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
 
     Point result;  // The point at infinity.
     bool started = false;  // As in msm_wnaf(): an addition that cancels the sum restarts it.
-    const auto add = [&](const Curve::Fp& x, const Curve::Fp& y) noexcept {
+    const auto add = [&](const FE& x, const FE& y) noexcept {
         if (started)
             started = !madd_inplace<true>(result, x, y);
         else
@@ -1317,14 +1420,33 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
             started = true;
         }
     };
-    const auto add_jac = [&](const Curve::Fp& x, const Curve::Fp& y, const Curve::Fp& z) noexcept {
+    // A G digit is a point of secp256k1, which the accumulator's curve sees as (Zg^2 x, Zg^3 y):
+    // the addition does that through az, and a restart through zg2 and zg3, computed when first
+    // needed because a signature that starts on a R digit never needs them.
+    DECL_FE_COPY(FE, zg2, zg);
+    DECL_FE_COPY(FE, zg3, zg);
+    bool have_zg_powers = false;
+    // NegY adds the negated point (x, -y) without computing -y, as in madd_inplace().
+    const auto add_g = [&](const FE& x, const FE& y, auto neg_y) noexcept {
+        constexpr bool NegY = decltype(neg_y)::value;
         if (started)
-            started = !jadd_inplace<true>(result, x, y, z);
+            started = !madd_inplace<true, MaddMode::zinv, NegY>(result, x, y, &zg);
         else
         {
+            if (!have_zg_powers)
+            {
+                zg2 *= zg;
+                zg3 = zg2;
+                zg3 *= zg;
+                have_zg_powers = true;
+            }
             result.x = x;
+            result.x *= zg2;
             result.y = y;
-            result.z = z;
+            result.y *= zg3;
+            if constexpr (NegY)
+                result.y = -result.y;
+            result.z = FP_ONE;
             started = true;
         }
     };
@@ -1336,30 +1458,31 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
         if (const int d = naf_a[i]; d != 0)
         {
             const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
-            add_jac(t[j].x, (d < 0) != a2.sign ? ny[j] : t[j].y, t[j].z);
+            add(t[j].x, (d < 0) != a2.sign ? ny[j] : t[j].y);
         }
         if (const int d = naf_b[i]; d != 0)
         {
             const auto j = static_cast<size_t>((d > 0 ? d : -d) >> 1);
-            add_jac(bx[j], (d < 0) != b2.sign ? ny[j] : t[j].y, t[j].z);
+            add(bx[j], (d < 0) != b2.sign ? ny[j] : t[j].y);
         }
         if (const int d = naf_ga[i]; d != 0)
         {
             const auto& pt = G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != a1.sign)
-                add(pt.x, -pt.y);
+                add_g(pt.x, pt.y, std::true_type{});
             else
-                add(pt.x, pt.y);
+                add_g(pt.x, pt.y, std::false_type{});
         }
         if (const int d = naf_gb[i]; d != 0)
         {
             const auto& pt = PHI_G_ODD[(d > 0 ? d : -d) >> 1];
             if ((d < 0) != b1.sign)
-                add(pt.x, -pt.y);
+                add_g(pt.x, pt.y, std::true_type{});
             else
-                add(pt.x, pt.y);
+                add_g(pt.x, pt.y, std::false_type{});
         }
     }
+    result.z *= zg;
     return result;
 }
 }  // namespace
