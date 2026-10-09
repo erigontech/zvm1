@@ -48,6 +48,16 @@ struct Constant : std::integral_constant<int, N>
 using zero_t = Constant<0>;
 using one_t = Constant<1>;
 
+#if defined(AIRBENDER) && defined(__riscv)
+/// Selects the constructors that leave a field element or point uninitialized at run time, for
+/// storage that is written before it is read (see AlignedArray in secp256k1.cpp).
+struct uninit_t
+{
+    explicit uninit_t() = default;
+};
+inline constexpr uninit_t uninit{};
+#endif
+
 /// The order specification (prime number) for a finite field.
 template <typename T>
 concept FieldSpec = requires { T::ORDER; };
@@ -81,6 +91,9 @@ public:
     FieldElement() = default;
 
 #if defined(AIRBENDER) && defined(__riscv)
+    /// Leaves the value uninitialized at run time: the caller writes it before reading it.
+    constexpr explicit FieldElement(uninit_t) noexcept : value_{typename uint_type::uninit_tag{}} {}
+
     /// CSR MEMCOPY-accelerated copy constructor.
     /// Both source and destination value_ are alignas(32), so CSR MEMCOPY (4 insns)
     /// replaces the default word-by-word copy (16 insns on rv32), saving 12 insns per copy.
@@ -284,6 +297,9 @@ struct AffinePoint
 
     AffinePoint() = default;
     constexpr AffinePoint(const FE& x_, const FE& y_) noexcept : x{x_}, y{y_} {}
+#if defined(AIRBENDER) && defined(__riscv)
+    constexpr explicit AffinePoint(uninit_t u) noexcept : x{u}, y{u} {}
+#endif
 
     /// Create the point from literal values. Only available when Curve defines uint_type.
     template <typename C = Curve>
@@ -338,15 +354,18 @@ template <typename Curve>
 struct ProjPoint
 {
     using FE = Curve::Fp;
+    /// 1 in Montgomery form, folded at compile time: FE::one() at run time is a CSR multiplication.
+    static constexpr FE ONE = FE::one();
     FE x;
-    FE y = FE::one();
+    FE y = ONE;
     FE z;
 
     ProjPoint() = default;
+#if defined(AIRBENDER) && defined(__riscv)
+    constexpr explicit ProjPoint(uninit_t u) noexcept : x{u}, y{u}, z{u} {}
+#endif
     constexpr ProjPoint(const FE& x_, const FE& y_, const FE& z_) noexcept : x{x_}, y{y_}, z{z_} {}
-    constexpr explicit ProjPoint(const AffinePoint<Curve>& p) noexcept
-      : x{p.x}, y{p.y}, z{FE::one()}
-    {}
+    constexpr explicit ProjPoint(const AffinePoint<Curve>& p) noexcept : x{p.x}, y{p.y}, z{ONE} {}
 
     friend constexpr bool operator==(const ProjPoint& p, zero_t) noexcept { return p.z == 0; }
 
