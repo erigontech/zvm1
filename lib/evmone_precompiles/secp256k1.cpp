@@ -819,8 +819,16 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
 #if EVMONE_SECP256K1_MSM_SINGLE
 namespace
 {
-/// n default-constructed elements in 32-byte aligned storage: the BigInt CSR paths of the field
-/// arithmetic need aligned operands, and the guest's allocator only guarantees 8 bytes.
+/// n elements in 32-byte aligned storage: the BigInt CSR paths of the field arithmetic need
+/// aligned operands, and the guest's allocator only guarantees 8 bytes. The elements start
+/// uninitialized (zeroing them, and the run-time 1 of each ProjPoint's y, was dead work): callers
+/// write every element before they read it, and a ProjPoint element is not the point at infinity
+/// until written. In ecrecover_batch() every array is gated by live[]: an entry is written and
+/// read only while it is live. A read of an unwritten element would go unnoticed by the corpus
+/// and the tests, because the guest's bump allocator hands out memory that was never written, so
+/// it reads as zero; only review and a poisoned-heap harness see it. The host build of this code
+/// (EVMONE_RV32_DISPATCH_TEST) keeps value-initializing: the uninitialized constructors exist on
+/// the guest only.
 template <typename T>
 class AlignedArray
 {
@@ -835,7 +843,16 @@ public:
         p_ = reinterpret_cast<T*>(
             (reinterpret_cast<uintptr_t>(raw_.get()) + 31) & ~static_cast<uintptr_t>(31));
         for (size_t i = 0; i < n; ++i)
+        {
+#if defined(AIRBENDER) && defined(__riscv)
+            if constexpr (requires { typename T::uninit_tag; })
+                new (&p_[i]) T{typename T::uninit_tag{}};
+            else
+                new (&p_[i]) T{ecc::uninit};
+#else
             new (&p_[i]) T{};
+#endif
+        }
     }
     T& operator[](size_t i) noexcept { return p_[i]; }
 };
@@ -957,7 +974,7 @@ unsigned wnaf(Digit* naf, const word32* w) noexcept
 }
 
 /// 1 in Montgomery form, folded at compile time (Fp::one() at run time is a CSR multiplication).
-constexpr auto FP_ONE = Curve::Fp::one();
+constexpr const auto& FP_ONE = ecc::ProjPoint<Curve>::ONE;
 
 /// dbl_inplace and madd_inplace rebind their operands through __builtin_assume_aligned(.., 32),
 /// so the inlined ModArith operations fold their alignment tests. Every caller passes 32-byte-aligned storage

@@ -44,7 +44,7 @@ static_assert((Curve::X1 + Curve::X2) / 2 < (uint256{1} << 128) &&
               (Curve::MINUS_Y1 + Curve::Y2) / 2 < (uint256{1} << 128));
 
 /// 1 in Montgomery form, folded at compile time (Fq::one() at run time is a CSR multiplication).
-constexpr auto FP_ONE = Fq::one();
+constexpr const auto& FP_ONE = Point::ONE;
 
 /// v, which on rv32 the compiler is told is 32-byte aligned, so that the ModArith operations
 /// inlined into dbl_inplace() and madd_inplace() fold their alignment tests (as in
