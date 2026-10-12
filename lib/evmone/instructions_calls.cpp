@@ -44,6 +44,9 @@ inline std::variant<evmc::address, Result> get_target_address(
     // touch on it. Force the lazy-load now so the BAL StateView decorator
     // observes the read.
     (void)state.host.account_exists(*delegate_addr);
+    // The delegate's code is read here, before a value transfer can light-fail, as in
+    // execution-specs; a stateless witness must therefore carry it.
+    (void)state.host.get_code_size(*delegate_addr);
 
     return *delegate_addr;
 }
