@@ -671,8 +671,8 @@ static inline ALWAYS_INLINE void keccak(
         // zero the rest of the state, rather than zeroing everything (8 CSR MEMCOPY delegations)
         // and then XOR-ing the block in, which reloads the zero state word by word. The scratch
         // lanes past the state need no clearing (see buf_zero_state_from()).
-        const uint32_t* const s = (const uint32_t*)data;
-        uint32_t* const d = (uint32_t*)buf;
+        const keccak_word32* const s = (const keccak_word32*)data;
+        keccak_word32* const d = (keccak_word32*)buf;
         size_t i;
 #pragma GCC unroll 34
         for (i = 0; i < 2 * block_words; ++i)

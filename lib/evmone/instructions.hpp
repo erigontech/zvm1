@@ -1339,7 +1339,7 @@ template <size_t Len>
 inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
 {
     static constexpr size_t NUM_DATA_WORDS = (Len + 3) / 4;
-    auto* const w = reinterpret_cast<uint32_t*>(stack.end());
+    word32* const w = reinterpret_cast<word32*>(stack.end());
     const uint8_t* const d = pos + 1;  // Skip the opcode.
     if constexpr (Len == 32)
     {

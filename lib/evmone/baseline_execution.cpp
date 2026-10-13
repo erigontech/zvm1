@@ -260,7 +260,7 @@ struct Position
         return fail(EVMC_OUT_OF_GAS);
     // stack_end is one past the top item: the condition is the top item, under the pushed
     // destination.
-    const auto* const cw = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const word32* const cw = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const bool taken = (cw[0] | cw[1] | cw[2] | cw[3] | cw[4] | cw[5] | cw[6] | cw[7]) != 0;
     pos.stack_end -= 1;  // One pushed, two popped.
     if (taken)
@@ -302,13 +302,13 @@ template <Opcode Op>
     }
     if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 10)))
         return fail(EVMC_OUT_OF_GAS);
-    const auto* const a = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const word32* const a = reinterpret_cast<const word32*>(pos.stack_end - 1);
     bool taken;
     if constexpr (Op == OP_ISZERO)
         taken = (a[0] | a[1] | a[2] | a[3] | a[4] | a[5] | a[6] | a[7]) == 0;
     else
     {
-        const auto* const b = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+        const word32* const b = reinterpret_cast<const word32*>(pos.stack_end - 2);
         taken = ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) | (a[4] ^ b[4]) |
                     (a[5] ^ b[5]) | (a[6] ^ b[6]) | (a[7] ^ b[7])) == 0;
     }
@@ -364,7 +364,7 @@ template <Opcode Op>
     sel = sel << 8 | c[4];
     asm("" : "+r"(sel));
     sel = sel << 8 | c[5];
-    const auto* const w = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
+    const word32* const w = reinterpret_cast<const word32*>(pos.stack_end - 1);
     const bool taken =
         ((w[0] ^ sel) | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
     if (taken)
@@ -416,8 +416,8 @@ template <Opcode Op>
         return fail(EVMC_OUT_OF_GAS);
     if (INTX_UNLIKELY(!deduct_gas(gas, 3 + 3 + 10)))
         return fail(EVMC_OUT_OF_GAS);
-    const auto* const top = reinterpret_cast<const uint32_t*>(pos.stack_end - 1);
-    const auto* const second = reinterpret_cast<const uint32_t*>(pos.stack_end - 2);
+    const word32* const top = reinterpret_cast<const word32*>(pos.stack_end - 1);
+    const word32* const second = reinterpret_cast<const word32*>(pos.stack_end - 2);
     // LT leaves top < second, GT leaves second < top; ISZERO inverts; JUMPI jumps on non-zero.
     const bool taken = Op == OP_LT ? !lt256(top, second) : !lt256(second, top);
     pos.stack_end -= 2;  // The comparison leaves one of two, PUSH2 one more, JUMPI takes two.
@@ -584,7 +584,7 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 /// The push itself: the immediate is the byte before the successor.
 [[gnu::always_inline]] inline void push1_commit(Position& pos) noexcept
 {
-    auto* const w = reinterpret_cast<uint32_t*>(pos.stack_end);
+    word32* const w = reinterpret_cast<word32*>(pos.stack_end);
     w[0] = pos.code_it[-1];
     w[1] = 0;
     w[2] = 0;
@@ -679,7 +679,7 @@ template <Opcode Op>
             return fail(EVMC_STACK_UNDERFLOW);
         if (INTX_UNLIKELY(!deduct_gas(gas, 3)))
             return fail(EVMC_OUT_OF_GAS);
-        auto* const x = reinterpret_cast<uint32_t*>(pos.stack_end - 1);
+        word32* const x = reinterpret_cast<word32*>(pos.stack_end - 1);
         const unsigned bs = imm & 31;
         switch (imm >> 5)  // The word shift: a byte is below 256, so there is no "all out" case.
         {
@@ -769,7 +769,7 @@ template <Opcode Op>
     const uint32_t a = pos.code_it[-1];
     const uint32_t b = pos.code_it[1];
     // c = a << b: a byte shifted by b < 256 lands in words b / 32 and b / 32 + 1.
-    auto* const c = reinterpret_cast<uint32_t*>(pos.stack_end);
+    word32* const c = reinterpret_cast<word32*>(pos.stack_end);
     c[0] = 0;
     c[1] = 0;
     c[2] = 0;
