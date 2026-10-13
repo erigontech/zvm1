@@ -84,7 +84,9 @@ set_target_properties(
 if(BUILD_TESTING AND NOT AIRBENDER AND NOT SP1 AND NOT CMAKE_CROSSCOMPILING
         AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(BLST_TEST_DIR ${CMAKE_CURRENT_BINARY_DIR}/blst-airbender/src)
-    set(BLST_TEST_FILES vect.c vect.h bytes.h no_asm.h)
+    # patch_blst_airbender.sh patches src/fp12_tower.c too (the fused cyclotomic squaring
+    # output stage), so the host-test copy needs it.
+    set(BLST_TEST_FILES vect.c vect.h bytes.h no_asm.h fp12_tower.c)
     list(TRANSFORM BLST_TEST_FILES PREPEND ${SOURCE_DIR}/src/ OUTPUT_VARIABLE BLST_TEST_INPUTS)
     list(TRANSFORM BLST_TEST_FILES PREPEND ${BLST_TEST_DIR}/)
     add_custom_command(
