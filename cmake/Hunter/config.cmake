@@ -3,13 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 hunter_config(
-    intx
-    VERSION 0.15.0
-    URL https://github.com/chfast/intx/archive/v0.15.0.tar.gz
-    SHA1 571b3f4c5a7b09135755720b478bc03f9d7ba7bb
-)
-
-hunter_config(
     GTest
     VERSION 1.18.0
     URL https://github.com/google/googletest/archive/v1.18.0.tar.gz

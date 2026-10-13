@@ -62,7 +62,8 @@ struct Transaction
     }
 
     Type type = Type::legacy;
-    bytes data;
+    // z6m local: non-owning; caller guarantees lifetime
+    bytes_view data{};
     int64_t gas_limit = 0;
     intx::uint256 max_gas_price;
     intx::uint256 max_priority_gas_price;

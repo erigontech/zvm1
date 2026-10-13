@@ -138,13 +138,10 @@ if(EVMONE_FUZZING)
     endif()
 endif()
 
-set(EVMONE_INTX_DIR "" CACHE PATH "Path to local intx source directory")
-if(EVMONE_INTX_DIR)
-    add_subdirectory(${EVMONE_INTX_DIR} intx)
-else()
-    hunter_add_package(intx)
-    find_package(intx CONFIG REQUIRED)
-endif()
+# intx is vendored under third_party/intx (a snapshot of https://github.com/chfast/intx).
+# EVMONE_INTX_DIR can still be overridden to point at an external intx source tree.
+set(EVMONE_INTX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/intx" CACHE PATH "Path to local intx source directory")
+add_subdirectory(${EVMONE_INTX_DIR} intx)
 
 set(include_dir ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

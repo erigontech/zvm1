@@ -242,6 +242,11 @@ static inline ALWAYS_INLINE uint64_t load_le_word(const uint8_t* data)
 }
 
 #if defined(AIRBENDER)
+/// A 32-bit word of the input or of the state: may alias them. The input is any object (a
+/// uint256, 64-bit lanes) and the state is 64-bit lanes, which plain uint32_t accesses would not
+/// be ordered against under strict aliasing.
+typedef uint32_t __attribute__((may_alias)) keccak_word32;
+
 /// Loads a 64-bit little-endian integer from any address. load_le_word() may assume 8-byte
 /// alignment on RISC-V; here 4-byte aligned inputs take two word loads (~4 insns), anything
 /// else falls back to the copy, which -mstrict-align lowers byte by byte.
@@ -249,7 +254,7 @@ static inline ALWAYS_INLINE uint64_t load_le_any(const uint8_t* data)
 {
     if (__builtin_expect(((uintptr_t)data & 3) == 0, 1))
     {
-        const uint32_t* w = (const uint32_t*)data;
+        const keccak_word32* w = (const keccak_word32*)data;
         return to_le64((uint64_t)w[0] | ((uint64_t)w[1] << 32));
     }
     uint64_t word;
@@ -772,8 +777,17 @@ static NO_INLINE NO_SANITIZE_ADDRESS void absorb_input_unaligned(
     absorb_input(state, block_words, data, size, misalign);
 }
 
+/// A 64-bit word of the hash keccak() stores into its caller's ethash_hash256: may alias any type
+/// the caller reads the hash's bytes through. A read through a plain word type of another width
+/// (uint32_t, say) would not be ordered against plain uint64_t stores under strict aliasing.
+#if __has_attribute(may_alias)
+typedef uint64_t __attribute__((may_alias)) keccak_word64;
+#else
+typedef uint64_t keccak_word64;
+#endif
+
 static inline ALWAYS_INLINE void keccak(
-    uint64_t* out, size_t bits, const uint8_t* data, size_t size)
+    keccak_word64* out, size_t bits, const uint8_t* data, size_t size)
 {
     const size_t hash_size = bits / 8;
     const size_t block_words = (1600 - bits * 2) / 8 / WORD_SIZE;
@@ -788,8 +802,8 @@ static inline ALWAYS_INLINE void keccak(
         // zero the rest of the state, rather than zeroing everything (8 CSR MEMCOPY delegations)
         // and then XOR-ing the block in, which reloads the zero state word by word. The scratch
         // lanes past the state need no clearing (see buf_zero_state_from()).
-        const uint32_t* const s = (const uint32_t*)data;
-        uint32_t* const d = (uint32_t*)buf;
+        const keccak_word32* const s = (const keccak_word32*)data;
+        keccak_word32* const d = (keccak_word32*)buf;
         size_t i;
 #pragma GCC unroll 34
         for (i = 0; i < 2 * block_words; ++i)
@@ -840,7 +854,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
         // than load_le + XOR), then zero only the remaining buf words.
         {
             int i;
-            uint32_t* bufW = (uint32_t*)buf;
+            keccak_word32* bufW = (keccak_word32*)buf;
             const uint8_t* d = data;
             size_t remaining = size;
 
@@ -859,7 +873,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
             }
             if (0)
             {
-                const uint32_t* dW = (const uint32_t*)d;
+                const keccak_word32* dW = (const keccak_word32*)d;
                 size_t full_words = remaining / 4;
                 for (size_t j = 0; j < full_words; ++j)
                     bufW[j] = dW[j];
@@ -877,7 +891,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
                     d += 8;
                     remaining -= 8;
                 }
-                bufW = (uint32_t*)buf_iter;
+                bufW = (keccak_word32*)buf_iter;
             }
 
             // Handle remaining bytes + padding byte 0x01.
@@ -888,7 +902,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
             lw[remaining] = 0x01;
             {
                 // Write last_word at current position (may be uint32_t-misaligned).
-                uint32_t* lwd = (uint32_t*)&last_word;
+                const keccak_word32* lwd = (const keccak_word32*)&last_word;
                 bufW[0] = lwd[0];
                 bufW[1] = lwd[1];
                 bufW += 2;
