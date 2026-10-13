@@ -120,7 +120,26 @@ struct div_result
 /// Addition with carry.
 constexpr result_with_carry<uint64_t> addc(uint64_t x, uint64_t y, bool carry = false) noexcept
 {
-#if __has_builtin(__builtin_addcll)
+    // On rv32im, __builtin_addcll generates ~30 instructions with branches because
+    // GCC's 64-bit carry detection on 32-bit targets uses conditional branches.
+    // Manual 32-bit decomposition compiles to ~14 branchless add/sltu instructions.
+#if defined(__riscv) && __riscv_xlen == 32
+    const auto x_lo = static_cast<uint32_t>(x);
+    const auto x_hi = static_cast<uint32_t>(x >> 32);
+    const auto y_lo = static_cast<uint32_t>(y);
+    const auto y_hi = static_cast<uint32_t>(y >> 32);
+
+    auto lo = x_lo + y_lo;
+    uint32_t c = (lo < x_lo);
+    lo += carry;
+    c += (lo < static_cast<uint32_t>(carry));
+    auto hi = x_hi + y_hi;
+    uint32_t cout = (hi < x_hi);
+    hi += c;
+    cout += (hi < c);
+
+    return {(static_cast<uint64_t>(hi) << 32) | lo, cout != 0};
+#elif __has_builtin(__builtin_addcll)
     if (!std::is_constant_evaluated())
     {
         unsigned long long carryout = 0;  // NOLINT(google-runtime-int)
@@ -138,18 +157,38 @@ constexpr result_with_carry<uint64_t> addc(uint64_t x, uint64_t y, bool carry = 
     }
 #endif
 
+#if !defined(__riscv) || __riscv_xlen != 32
     const auto s = x + y;
     const auto carry1 = s < x;
     const auto t = s + carry;
     const auto carry2 = t < s;
     return {t, carry1 || carry2};
+#endif
 }
 
 /// Subtraction with carry (borrow).
 constexpr result_with_carry<uint64_t> subc(uint64_t x, uint64_t y, bool carry = false) noexcept
 {
+    // On rv32im, __builtin_subcll generates ~30 instructions with branches.
+    // Manual 32-bit decomposition compiles to ~14 branchless sub/sltu instructions.
+#if defined(__riscv) && __riscv_xlen == 32
+    const auto x_lo = static_cast<uint32_t>(x);
+    const auto x_hi = static_cast<uint32_t>(x >> 32);
+    const auto y_lo = static_cast<uint32_t>(y);
+    const auto y_hi = static_cast<uint32_t>(y >> 32);
+
+    auto lo = x_lo - y_lo;
+    uint32_t b = (x_lo < y_lo);
+    const auto lo2 = lo - carry;
+    b += (lo < static_cast<uint32_t>(carry));
+    auto hi = x_hi - y_hi;
+    uint32_t bout = (x_hi < y_hi);
+    const auto hi2 = hi - b;
+    bout += (hi < b);
+
+    return {(static_cast<uint64_t>(hi2) << 32) | lo2, bout != 0};
 // Use __builtin_subcll if available (except buggy Xcode 14.3.1 on arm64).
-#if __has_builtin(__builtin_subcll) && __apple_build_version__ != 14030022
+#elif __has_builtin(__builtin_subcll) && __apple_build_version__ != 14030022
     if (!std::is_constant_evaluated())
     {
         unsigned long long carryout = 0;  // NOLINT(google-runtime-int)
@@ -167,11 +206,13 @@ constexpr result_with_carry<uint64_t> subc(uint64_t x, uint64_t y, bool carry = 
     }
 #endif
 
+#if !defined(__riscv) || __riscv_xlen != 32
     const auto d = x - y;
     const auto carry1 = x < y;
     const auto e = d - carry;
     const auto carry2 = d < uint64_t{carry};
     return {e, carry1 || carry2};
+#endif
 }
 
 /// Addition with carry.
@@ -448,7 +489,33 @@ using uint128 = uint<128>;
 /// Full unsigned multiplication 64 x 64 -> 128.
 constexpr uint128 umul(uint64_t x, uint64_t y) noexcept
 {
-#if INTX_HAS_BUILTIN_INT128
+#if defined(__riscv) && __riscv_xlen == 32
+    // rv32im: use uint32_t operands so GCC emits native mul+mulhu pairs
+    // (4 pairs for the cross-products) instead of __muldi3/__multi3 libcalls.
+    if (!std::is_constant_evaluated())
+    {
+        const auto xl = static_cast<uint32_t>(x);
+        const auto xh = static_cast<uint32_t>(x >> 32);
+        const auto yl = static_cast<uint32_t>(y);
+        const auto yh = static_cast<uint32_t>(y >> 32);
+
+        // Each uint64_t(u32) * uint64_t(u32) compiles to mul+mulhu on rv32im.
+        const uint64_t t0 = static_cast<uint64_t>(xl) * yl;
+        const uint64_t t1 = static_cast<uint64_t>(xh) * yl;
+        const uint64_t t2 = static_cast<uint64_t>(xl) * yh;
+        const uint64_t t3 = static_cast<uint64_t>(xh) * yh;
+
+        const uint64_t u1 = t1 + static_cast<uint32_t>(t0 >> 32);
+        const uint64_t u2 = t2 + static_cast<uint32_t>(u1);
+
+        const uint64_t lo =
+            (static_cast<uint64_t>(static_cast<uint32_t>(u2)) << 32) |
+            static_cast<uint32_t>(t0);
+        const uint64_t hi = t3 + (u2 >> 32) + (u1 >> 32);
+        return {lo, hi};
+    }
+    // constexpr: fall through to portable path below.
+#elif INTX_HAS_BUILTIN_INT128
     return builtin_uint128{x} * builtin_uint128{y};
 #elif defined(_MSC_VER) && _MSC_VER >= 1925 && defined(_M_X64)
     if (!std::is_constant_evaluated())
@@ -603,6 +670,15 @@ constexpr uint16_t bswap(uint16_t x) noexcept
 
 constexpr uint32_t bswap(uint32_t x) noexcept
 {
+    // On rv32im without Zbb, __builtin_bswap32 generates a __bswapsi2 libcall.
+    // Use inline shift-and-mask that compiles to ~8 instructions.
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    if (!std::is_constant_evaluated())
+    {
+        const auto a = ((x << 8) & 0xFF00FF00u) | ((x >> 8) & 0x00FF00FFu);
+        return (a << 16) | (a >> 16);
+    }
+#endif
 #if __has_builtin(__builtin_bswap32)
     return __builtin_bswap32(x);
 #else
@@ -617,6 +693,16 @@ constexpr uint32_t bswap(uint32_t x) noexcept
 
 constexpr uint64_t bswap(uint64_t x) noexcept
 {
+    // On rv32im without Zbb, __builtin_bswap64 generates a __bswapdi2 libcall.
+    // Decompose into two inline bswap32 + half-swap: ~18 instructions vs libcall.
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    if (!std::is_constant_evaluated())
+    {
+        const auto lo = static_cast<uint32_t>(x);
+        const auto hi = static_cast<uint32_t>(x >> 32);
+        return (static_cast<uint64_t>(bswap(lo)) << 32) | bswap(hi);
+    }
+#endif
 #if __has_builtin(__builtin_bswap64)
     return __builtin_bswap64(x);
 #else
@@ -997,10 +1083,23 @@ struct uint
     static_assert(N % word_num_bits == 0, "Number of bits must be a multiply of 64");
 
 private:
-    uint64_t words_[num_words]{};
+    uint64_t words_[num_words];
 
 public:
-    constexpr uint() noexcept = default;
+    /// Tag type for constructing without zero-initialization.
+    struct uninit_tag {};
+
+    constexpr uint() noexcept : words_{} {}
+
+    /// Construct without zero-initializing the storage at runtime.
+    /// The caller MUST fully overwrite all words before reading.
+    /// In constexpr context, zero-inits for correctness; at runtime, truly uninitialized.
+    constexpr explicit uint(uninit_tag) noexcept
+    {
+        if (std::is_constant_evaluated())
+            for (auto& w : words_)
+                w = 0;
+    }
 
     /// Implicit converting constructor for any smaller uint type.
     template <unsigned M>
@@ -1009,6 +1108,8 @@ public:
     {
         for (size_t i = 0; i < uint<M>::num_words; ++i)
             words_[i] = x[i];
+        for (size_t i = uint<M>::num_words; i < num_words; ++i)
+            words_[i] = 0;
     }
 
 #if INTX_HAS_BUILTIN_INT128
@@ -1029,13 +1130,38 @@ public:
     {
         INTX_REQUIRE(words.size() <= num_words);
         std::ranges::copy(words, words_);
+        for (size_t i = words.size(); i < num_words; ++i)
+            words_[i] = 0;
     }
 
     constexpr uint64_t& operator[](size_t i) noexcept { return words_[i]; }
 
     constexpr const uint64_t& operator[](size_t i) const noexcept { return words_[i]; }
 
-    constexpr explicit operator bool() const noexcept { return *this != uint{}; }
+    constexpr explicit operator bool() const noexcept
+    {
+#if defined(__riscv) && __riscv_xlen == 32
+        // On rv32im, short-circuit on the low word for the common case.
+        // Most EVM non-zero values (booleans, addresses, counters) have non-zero
+        // low bits, so this avoids loading and OR-folding all 8 uint32 halves.
+        // Uses uint32_t to avoid 64-bit decomposition overhead, through a named may_alias type
+        // (auto would drop the attribute): plain uint32_t loads need not see uint64_t stores.
+        typedef uint32_t __attribute__((may_alias)) w32;
+        const w32* const w = reinterpret_cast<const w32*>(words_);
+        if ((w[0] | w[1]) != 0)
+            return true;
+        // Fall through: check upper words only if low word is zero.
+        uint32_t upper = 0;
+        for (size_t i = 2; i < num_words * 2; ++i)
+            upper |= w[i];
+        return upper != 0;
+#else
+        uint64_t folded = 0;
+        for (size_t i = 0; i < num_words; ++i)
+            folded |= words_[i];
+        return folded != 0;
+#endif
+    }
 
     /// Explicit converting operator to smaller uint types.
     template <unsigned M>
@@ -1078,6 +1204,19 @@ public:
 
     friend constexpr uint operator+(const uint& x, const uint& y) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (N == 256) {
+            if (!std::is_constant_evaluated()) {
+                alignas(32) uint r = x;
+                alignas(32) uint b = y;
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&r);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                register uint32_t a2 asm("x12") = 0x01;  // ADD
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                return r;
+            }
+        }
+#endif
         return addc(x, y).value;
     }
 
@@ -1087,6 +1226,19 @@ public:
 
     friend constexpr uint operator-(const uint& x, const uint& y) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (N == 256) {
+            if (!std::is_constant_evaluated()) {
+                alignas(32) uint r = x;
+                alignas(32) uint b = y;
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&r);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                register uint32_t a2 asm("x12") = 0x02;  // SUB
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                return r;
+            }
+        }
+#endif
         return subc(x, y).value;
     }
 
@@ -1096,6 +1248,142 @@ public:
     /// and discarding the high part of the result product.
     friend constexpr uint operator*(const uint& x, const uint& y) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (N == 256) {
+            if (!std::is_constant_evaluated()) {
+                alignas(32) uint r = x;
+                alignas(32) uint b = y;
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&r);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                register uint32_t a2 asm("x12") = 0x08;  // MUL_LOW
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                return r;
+            }
+        }
+#endif
+#if defined(__riscv) && __riscv_xlen == 32
+        // rv32im specialization for uint256: work with native uint32_t limbs.
+        // Each uint64_t word is two uint32_t halves (little-endian), giving 8 limbs
+        // per uint256. We only need the low 256 bits (limbs 0..7), so we skip
+        // any product where i+j >= 8. This gives 36 mul+mulhu pairs vs 64 for full.
+        // Fully unrolled column-wise accumulation with a 3-word (96-bit) accumulator
+        // {c2, c1, c0} to avoid overflow: max column has 8 products, each <= 2^64-2^33+1,
+        // sum <= 8*(2^64) < 2^67, plus carry_in < 2^35, well within 96 bits.
+        if constexpr (N == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                const uint32_t a0 = static_cast<uint32_t>(x[0]);
+                const uint32_t a1 = static_cast<uint32_t>(x[0] >> 32);
+                const uint32_t a2 = static_cast<uint32_t>(x[1]);
+                const uint32_t a3 = static_cast<uint32_t>(x[1] >> 32);
+                const uint32_t a4 = static_cast<uint32_t>(x[2]);
+                const uint32_t a5 = static_cast<uint32_t>(x[2] >> 32);
+                const uint32_t a6 = static_cast<uint32_t>(x[3]);
+                const uint32_t a7 = static_cast<uint32_t>(x[3] >> 32);
+
+                const uint32_t b0 = static_cast<uint32_t>(y[0]);
+                const uint32_t b1 = static_cast<uint32_t>(y[0] >> 32);
+                const uint32_t b2 = static_cast<uint32_t>(y[1]);
+                const uint32_t b3 = static_cast<uint32_t>(y[1] >> 32);
+                const uint32_t b4 = static_cast<uint32_t>(y[2]);
+                const uint32_t b5 = static_cast<uint32_t>(y[2] >> 32);
+                const uint32_t b6 = static_cast<uint32_t>(y[3]);
+                const uint32_t b7 = static_cast<uint32_t>(y[3] >> 32);
+
+                // 96-bit accumulator {c2, c1, c0} to prevent overflow.
+                // MAC: acc += (uint64_t)ai * bj
+                // After each column: result limb = c0, shift right by 32.
+                uint32_t c0 = 0, c1 = 0, c2 = 0;
+                uint64_t t;
+
+                // Macro: accumulate one product into {c2,c1,c0}.
+                // t = (uint64_t)ai * bj; c0 += lo(t); carry -> c1 += hi(t) + carry; -> c2
+                #define INTX_RV32_MAC(ai, bj)                               \
+                    t = static_cast<uint64_t>(ai) * (bj);                   \
+                    c0 += static_cast<uint32_t>(t);                         \
+                    t = static_cast<uint64_t>(c1) +                         \
+                        static_cast<uint32_t>(t >> 32) + (c0 < static_cast<uint32_t>(t)); \
+                    c1 = static_cast<uint32_t>(t);                          \
+                    c2 += static_cast<uint32_t>(t >> 32);
+
+                uint32_t r0, r1, r2, r3, r4, r5, r6, r7;
+
+                // Column 0 (1 product)
+                t = static_cast<uint64_t>(a0) * b0;
+                c0 = static_cast<uint32_t>(t);
+                c1 = static_cast<uint32_t>(t >> 32);
+                c2 = 0;
+                r0 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 1 (2 products)
+                INTX_RV32_MAC(a0, b1)
+                INTX_RV32_MAC(a1, b0)
+                r1 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 2 (3 products)
+                INTX_RV32_MAC(a0, b2)
+                INTX_RV32_MAC(a1, b1)
+                INTX_RV32_MAC(a2, b0)
+                r2 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 3 (4 products)
+                INTX_RV32_MAC(a0, b3)
+                INTX_RV32_MAC(a1, b2)
+                INTX_RV32_MAC(a2, b1)
+                INTX_RV32_MAC(a3, b0)
+                r3 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 4 (5 products)
+                INTX_RV32_MAC(a0, b4)
+                INTX_RV32_MAC(a1, b3)
+                INTX_RV32_MAC(a2, b2)
+                INTX_RV32_MAC(a3, b1)
+                INTX_RV32_MAC(a4, b0)
+                r4 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 5 (6 products)
+                INTX_RV32_MAC(a0, b5)
+                INTX_RV32_MAC(a1, b4)
+                INTX_RV32_MAC(a2, b3)
+                INTX_RV32_MAC(a3, b2)
+                INTX_RV32_MAC(a4, b1)
+                INTX_RV32_MAC(a5, b0)
+                r5 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 6 (7 products)
+                INTX_RV32_MAC(a0, b6)
+                INTX_RV32_MAC(a1, b5)
+                INTX_RV32_MAC(a2, b4)
+                INTX_RV32_MAC(a3, b3)
+                INTX_RV32_MAC(a4, b2)
+                INTX_RV32_MAC(a5, b1)
+                INTX_RV32_MAC(a6, b0)
+                r6 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 7 (8 products, only low 32 bits needed — no carry-out)
+                INTX_RV32_MAC(a0, b7)
+                INTX_RV32_MAC(a1, b6)
+                INTX_RV32_MAC(a2, b5)
+                INTX_RV32_MAC(a3, b4)
+                INTX_RV32_MAC(a4, b3)
+                INTX_RV32_MAC(a5, b2)
+                INTX_RV32_MAC(a6, b1)
+                INTX_RV32_MAC(a7, b0)
+                r7 = c0;
+
+                #undef INTX_RV32_MAC
+
+                uint<256> p;
+                p[0] = static_cast<uint64_t>(r0) | (static_cast<uint64_t>(r1) << 32);
+                p[1] = static_cast<uint64_t>(r2) | (static_cast<uint64_t>(r3) << 32);
+                p[2] = static_cast<uint64_t>(r4) | (static_cast<uint64_t>(r5) << 32);
+                p[3] = static_cast<uint64_t>(r6) | (static_cast<uint64_t>(r7) << 32);
+                return p;
+            }
+        }
+#endif
+
         uint<N> p;
         for (size_t j = 0; j < num_words; j++)
         {
@@ -1179,6 +1467,17 @@ public:
     {
         if constexpr (N == 256)
         {
+            // On rv32im (no __int128), direct word-by-word comparison from MSW to LSW
+            // avoids constructing uint128 temporaries and generates tighter code.
+#if defined(__riscv) && __riscv_xlen == 32
+            // Compare from most significant word to least significant.
+            for (size_t i = num_words; i > 0; --i)
+            {
+                if (x[i - 1] != y[i - 1])
+                    return x[i - 1] < y[i - 1];
+            }
+            return false;  // Equal.
+#else
             auto xp = uint128{x[2], x[3]};
             auto yp = uint128{y[2], y[3]};
             if (xp == yp)
@@ -1187,6 +1486,7 @@ public:
                 yp = uint128{y[0], y[1]};
             }
             return xp < yp;
+#endif
         }
         else
             return subc(x, y).carry;
@@ -1382,6 +1682,157 @@ inline const uint8_t* as_bytes(const T& x) noexcept
     static_assert(std::is_trivially_copyable_v<T>);  // As in bit_cast.
     return reinterpret_cast<const uint8_t*>(&x);
 }
+
+#if defined(__riscv) && __riscv_xlen == 32
+/// rv32im specialization: full uint256 x uint256 -> uint512 multiply using
+/// native uint32_t limbs. Fully unrolled column-wise schoolbook with a 96-bit
+/// accumulator {c2,c1,c0} to handle carry without overflow.
+/// 64 mul+mulhu pairs, all branchless.
+constexpr uint<512> umul(const uint<256>& x, const uint<256>& y) noexcept
+{
+#if defined(AIRBENDER)
+    if (!std::is_constant_evaluated()) {
+        alignas(32) uint<256> lo = x;
+        alignas(32) uint<256> hi = x;
+        alignas(32) uint<256> b = y;
+        register uintptr_t a0 asm("x10");
+        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+        register uint32_t a2 asm("x12");
+
+        a0 = reinterpret_cast<uintptr_t>(&lo);
+        a2 = 0x08;  // MUL_LOW
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+
+        a0 = reinterpret_cast<uintptr_t>(&hi);
+        a2 = 0x10;  // MUL_HIGH
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+
+        return {lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+    }
+#endif
+    const uint32_t a0 = static_cast<uint32_t>(x[0]);
+    const uint32_t a1 = static_cast<uint32_t>(x[0] >> 32);
+    const uint32_t a2 = static_cast<uint32_t>(x[1]);
+    const uint32_t a3 = static_cast<uint32_t>(x[1] >> 32);
+    const uint32_t a4 = static_cast<uint32_t>(x[2]);
+    const uint32_t a5 = static_cast<uint32_t>(x[2] >> 32);
+    const uint32_t a6 = static_cast<uint32_t>(x[3]);
+    const uint32_t a7 = static_cast<uint32_t>(x[3] >> 32);
+
+    const uint32_t b0 = static_cast<uint32_t>(y[0]);
+    const uint32_t b1 = static_cast<uint32_t>(y[0] >> 32);
+    const uint32_t b2 = static_cast<uint32_t>(y[1]);
+    const uint32_t b3 = static_cast<uint32_t>(y[1] >> 32);
+    const uint32_t b4 = static_cast<uint32_t>(y[2]);
+    const uint32_t b5 = static_cast<uint32_t>(y[2] >> 32);
+    const uint32_t b6 = static_cast<uint32_t>(y[3]);
+    const uint32_t b7 = static_cast<uint32_t>(y[3] >> 32);
+
+    uint32_t c0 = 0, c1 = 0, c2 = 0;
+    uint64_t t;
+
+    // MAC: accumulate one uint32_t x uint32_t product into 96-bit {c2,c1,c0}.
+    #define INTX_RV32_UMUL_MAC(ai, bj)                                      \
+        t = static_cast<uint64_t>(ai) * (bj);                               \
+        c0 += static_cast<uint32_t>(t);                                     \
+        t = static_cast<uint64_t>(c1) +                                     \
+            static_cast<uint32_t>(t >> 32) + (c0 < static_cast<uint32_t>(t)); \
+        c1 = static_cast<uint32_t>(t);                                      \
+        c2 += static_cast<uint32_t>(t >> 32);
+
+    uint32_t r[16];
+
+    // Column 0
+    t = static_cast<uint64_t>(a0) * b0;
+    c0 = static_cast<uint32_t>(t); c1 = static_cast<uint32_t>(t >> 32); c2 = 0;
+    r[0] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 1
+    INTX_RV32_UMUL_MAC(a0, b1) INTX_RV32_UMUL_MAC(a1, b0)
+    r[1] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 2
+    INTX_RV32_UMUL_MAC(a0, b2) INTX_RV32_UMUL_MAC(a1, b1)
+    INTX_RV32_UMUL_MAC(a2, b0)
+    r[2] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 3
+    INTX_RV32_UMUL_MAC(a0, b3) INTX_RV32_UMUL_MAC(a1, b2)
+    INTX_RV32_UMUL_MAC(a2, b1) INTX_RV32_UMUL_MAC(a3, b0)
+    r[3] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 4
+    INTX_RV32_UMUL_MAC(a0, b4) INTX_RV32_UMUL_MAC(a1, b3)
+    INTX_RV32_UMUL_MAC(a2, b2) INTX_RV32_UMUL_MAC(a3, b1)
+    INTX_RV32_UMUL_MAC(a4, b0)
+    r[4] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 5
+    INTX_RV32_UMUL_MAC(a0, b5) INTX_RV32_UMUL_MAC(a1, b4)
+    INTX_RV32_UMUL_MAC(a2, b3) INTX_RV32_UMUL_MAC(a3, b2)
+    INTX_RV32_UMUL_MAC(a4, b1) INTX_RV32_UMUL_MAC(a5, b0)
+    r[5] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 6
+    INTX_RV32_UMUL_MAC(a0, b6) INTX_RV32_UMUL_MAC(a1, b5)
+    INTX_RV32_UMUL_MAC(a2, b4) INTX_RV32_UMUL_MAC(a3, b3)
+    INTX_RV32_UMUL_MAC(a4, b2) INTX_RV32_UMUL_MAC(a5, b1)
+    INTX_RV32_UMUL_MAC(a6, b0)
+    r[6] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 7
+    INTX_RV32_UMUL_MAC(a0, b7) INTX_RV32_UMUL_MAC(a1, b6)
+    INTX_RV32_UMUL_MAC(a2, b5) INTX_RV32_UMUL_MAC(a3, b4)
+    INTX_RV32_UMUL_MAC(a4, b3) INTX_RV32_UMUL_MAC(a5, b2)
+    INTX_RV32_UMUL_MAC(a6, b1) INTX_RV32_UMUL_MAC(a7, b0)
+    r[7] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 8
+    INTX_RV32_UMUL_MAC(a1, b7) INTX_RV32_UMUL_MAC(a2, b6)
+    INTX_RV32_UMUL_MAC(a3, b5) INTX_RV32_UMUL_MAC(a4, b4)
+    INTX_RV32_UMUL_MAC(a5, b3) INTX_RV32_UMUL_MAC(a6, b2)
+    INTX_RV32_UMUL_MAC(a7, b1)
+    r[8] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 9
+    INTX_RV32_UMUL_MAC(a2, b7) INTX_RV32_UMUL_MAC(a3, b6)
+    INTX_RV32_UMUL_MAC(a4, b5) INTX_RV32_UMUL_MAC(a5, b4)
+    INTX_RV32_UMUL_MAC(a6, b3) INTX_RV32_UMUL_MAC(a7, b2)
+    r[9] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 10
+    INTX_RV32_UMUL_MAC(a3, b7) INTX_RV32_UMUL_MAC(a4, b6)
+    INTX_RV32_UMUL_MAC(a5, b5) INTX_RV32_UMUL_MAC(a6, b4)
+    INTX_RV32_UMUL_MAC(a7, b3)
+    r[10] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 11
+    INTX_RV32_UMUL_MAC(a4, b7) INTX_RV32_UMUL_MAC(a5, b6)
+    INTX_RV32_UMUL_MAC(a6, b5) INTX_RV32_UMUL_MAC(a7, b4)
+    r[11] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 12
+    INTX_RV32_UMUL_MAC(a5, b7) INTX_RV32_UMUL_MAC(a6, b6)
+    INTX_RV32_UMUL_MAC(a7, b5)
+    r[12] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 13
+    INTX_RV32_UMUL_MAC(a6, b7) INTX_RV32_UMUL_MAC(a7, b6)
+    r[13] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 14
+    INTX_RV32_UMUL_MAC(a7, b7)
+    r[14] = c0; r[15] = c1;
+
+    #undef INTX_RV32_UMUL_MAC
+
+    uint<512> p;
+    for (unsigned w = 0; w < 8; ++w)
+        p[w] = static_cast<uint64_t>(r[2 * w]) |
+               (static_cast<uint64_t>(r[2 * w + 1]) << 32);
+    return p;
+}
+#endif
 
 template <unsigned N>
 constexpr uint<2 * N> umul(const uint<N>& x, const uint<N>& y) noexcept
@@ -1899,6 +2350,27 @@ constexpr div_result<uint<N>> sdivrem(const uint<N>& u, const uint<N>& v) noexce
 
 constexpr uint256 bswap(const uint256& x) noexcept
 {
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    // Inline bswap32 logic with shared mask constants across all 8 half-word swaps.
+    // Saves ~30 insns vs 8 separate bswap32 calls that each reconstruct the masks.
+    if (!std::is_constant_evaluated())
+    {
+        // Hoist the byte-swap mask constants so they're computed once.
+        const uint32_t m1 = 0xFF00FF00u;
+        const uint32_t m2 = 0x00FF00FFu;
+        auto bs = [m1, m2](uint32_t v) -> uint32_t {
+            const auto a = ((v << 8) & m1) | ((v >> 8) & m2);
+            return (a << 16) | (a >> 16);
+        };
+        // bswap64(w) = (bswap32(lo) << 32) | bswap32(hi), then reverse word order.
+        auto bs64 = [&bs](uint64_t w) -> uint64_t {
+            const auto lo = static_cast<uint32_t>(w);
+            const auto hi = static_cast<uint32_t>(w >> 32);
+            return (static_cast<uint64_t>(bs(lo)) << 32) | bs(hi);
+        };
+        return {bs64(x[3]), bs64(x[2]), bs64(x[1]), bs64(x[0])};
+    }
+#endif
     return {bswap(x[3]), bswap(x[2]), bswap(x[1]), bswap(x[0])};
 }
 
@@ -2060,10 +2532,37 @@ inline T load(const uint8_t (&src)[M]) noexcept
 {
     static_assert(M <= sizeof(T),
         "the size of source bytes must not exceed the size of the destination uint");
-    T x{};
-    std::memcpy(&as_bytes(x)[sizeof(T) - M], src, M);
-    x = to_big_endian(x);
-    return x;
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (M == sizeof(T) && sizeof(T) == 32)
+    {
+        // Full-size load: inline word copy avoids memcpy function call overhead.
+        // The words are of a named may_alias type (auto would drop the attribute): raw_ is read
+        // back as T, whose words are uint64_t, and plain uint32_t stores need not be seen there.
+        typedef uint32_t __attribute__((may_alias)) w32;
+        alignas(32) char raw_[sizeof(T)];
+        w32* const d = reinterpret_cast<w32*>(raw_);
+        if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
+        {
+            const w32* const s = reinterpret_cast<const w32*>(src);
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+            d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
+        }
+        else
+        {
+            std::memcpy(raw_, src, M);
+        }
+        auto& x = *reinterpret_cast<T*>(raw_);
+        x = to_big_endian(x);
+        return x;
+    }
+    else
+#endif
+    {
+        T x{};
+        std::memcpy(&as_bytes(x)[sizeof(T) - M], src, M);
+        x = to_big_endian(x);
+        return x;
+    }
 }
 
 /// Loads an integer value from the span of bytes of big-endian order.
@@ -2091,8 +2590,32 @@ inline IntT load(const T& t) noexcept
 template <typename T>
 inline void store(uint8_t (&dst)[sizeof(T)], const T& x) noexcept
 {
-    const auto d = to_big_endian(x);
-    std::memcpy(dst, &d, sizeof(d));
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (sizeof(T) == 32)
+    {
+        // Inline bswap + word-store to avoid memcpy function call overhead.
+        // The words are of a named may_alias type (auto would drop the attribute): d's words are
+        // uint64_t, and plain uint32_t loads need not see the stores that computed them.
+        typedef uint32_t __attribute__((may_alias)) w32;
+        const auto d = to_big_endian(x);
+        if ((reinterpret_cast<uintptr_t>(dst) & 3) == 0)  // 4-byte aligned
+        {
+            const w32* const s = reinterpret_cast<const w32*>(&d);
+            w32* const dd = reinterpret_cast<w32*>(dst);
+            dd[0] = s[0]; dd[1] = s[1]; dd[2] = s[2]; dd[3] = s[3];
+            dd[4] = s[4]; dd[5] = s[5]; dd[6] = s[6]; dd[7] = s[7];
+        }
+        else
+        {
+            std::memcpy(dst, &d, sizeof(d));
+        }
+    }
+    else
+#endif
+    {
+        const auto d = to_big_endian(x);
+        std::memcpy(dst, &d, sizeof(d));
+    }
 }
 
 /// Stores an integer value into the span of bytes in big-endian order.
@@ -2150,18 +2673,83 @@ inline T trunc(const uint<N>& x) noexcept
 
 namespace unsafe
 {
+
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Inline 32-byte copy: avoids calling memcpy (which is a function call under -fno-builtin)
+/// for the hot 32-byte load path (MLOAD, SLOAD key conversion, etc.).
+/// Uses 4-byte word loads when src is 4-byte aligned; falls back to byte loads otherwise.
+inline void copy32(void* dst, const uint8_t* src) noexcept
+{
+    // The words of a named may_alias type (auto would drop the attribute): dst is read back as a
+    // uint256, whose words are uint64_t, and plain uint32_t stores need not be seen there.
+    typedef uint32_t __attribute__((may_alias)) w32;
+    w32* const d = static_cast<w32*>(dst);
+    if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
+    {
+        const w32* const s = reinterpret_cast<const w32*>(src);
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+        d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
+    }
+    else
+    {
+        std::memcpy(dst, src, 32);
+    }
+}
+#endif
+
 /// Loads an uint value from a buffer. The user must make sure
 /// that the provided buffer is big enough. Therefore, marked "unsafe".
 template <typename IntT>
 inline IntT load(const uint8_t* src) noexcept
 {
-    // Align bytes.
-    // TODO: Using memcpy() directly triggers this optimization bug in GCC:
-    //   https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
-    alignas(IntT) std::byte aligned_storage[sizeof(IntT)];
-    std::memcpy(&aligned_storage, src, sizeof(IntT));
-    // TODO(C++23): Use std::start_lifetime_as<uint256>().
-    return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (sizeof(IntT) == 32)
+    {
+        alignas(32) std::byte aligned_storage[32];
+        copy32(&aligned_storage, src);
+        return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+    }
+    else if constexpr (sizeof(IntT) == 8)
+    {
+        // Inline 8-byte BE load: construct numeric value directly from bytes.
+        // Avoids memcpy function call on rv32 with -fno-builtin.
+        const auto hi = static_cast<uint32_t>(src[0]) << 24
+                      | static_cast<uint32_t>(src[1]) << 16
+                      | static_cast<uint32_t>(src[2]) << 8
+                      | static_cast<uint32_t>(src[3]);
+        const auto lo = static_cast<uint32_t>(src[4]) << 24
+                      | static_cast<uint32_t>(src[5]) << 16
+                      | static_cast<uint32_t>(src[6]) << 8
+                      | static_cast<uint32_t>(src[7]);
+        return static_cast<IntT>((static_cast<uint64_t>(hi) << 32) | lo);
+    }
+    else if constexpr (sizeof(IntT) == 4)
+    {
+        // Inline 4-byte BE load: construct value directly from bytes.
+        return static_cast<IntT>(
+            static_cast<uint32_t>(src[0]) << 24
+          | static_cast<uint32_t>(src[1]) << 16
+          | static_cast<uint32_t>(src[2]) << 8
+          | static_cast<uint32_t>(src[3]));
+    }
+    else if constexpr (sizeof(IntT) == 2)
+    {
+        // Inline 2-byte BE load.
+        return static_cast<IntT>(
+            static_cast<uint16_t>(src[0]) << 8
+          | static_cast<uint16_t>(src[1]));
+    }
+    else
+#endif
+    {
+        // Align bytes.
+        // TODO: Using memcpy() directly triggers this optimization bug in GCC:
+        //   https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
+        alignas(IntT) std::byte aligned_storage[sizeof(IntT)];
+        std::memcpy(&aligned_storage, src, sizeof(IntT));
+        // TODO(C++23): Use std::start_lifetime_as<uint256>().
+        return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+    }
 }
 
 /// Stores an integer value at the provided pointer in big-endian order. The user must make sure
@@ -2169,13 +2757,77 @@ inline IntT load(const uint8_t* src) noexcept
 template <typename T>
 inline void store(uint8_t* dst, const T& x) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (sizeof(T) == 8)
+    {
+        // Inline 8-byte BE store: decompose numeric value directly into bytes.
+        const auto v = static_cast<uint64_t>(x);
+        const auto hi = static_cast<uint32_t>(v >> 32);
+        const auto lo = static_cast<uint32_t>(v);
+        dst[0] = static_cast<uint8_t>(hi >> 24);
+        dst[1] = static_cast<uint8_t>(hi >> 16);
+        dst[2] = static_cast<uint8_t>(hi >> 8);
+        dst[3] = static_cast<uint8_t>(hi);
+        dst[4] = static_cast<uint8_t>(lo >> 24);
+        dst[5] = static_cast<uint8_t>(lo >> 16);
+        dst[6] = static_cast<uint8_t>(lo >> 8);
+        dst[7] = static_cast<uint8_t>(lo);
+    }
+    else if constexpr (sizeof(T) == 4)
+    {
+        const auto v = static_cast<uint32_t>(x);
+        dst[0] = static_cast<uint8_t>(v >> 24);
+        dst[1] = static_cast<uint8_t>(v >> 16);
+        dst[2] = static_cast<uint8_t>(v >> 8);
+        dst[3] = static_cast<uint8_t>(v);
+    }
+    else if constexpr (sizeof(T) == 2)
+    {
+        const auto v = static_cast<uint16_t>(x);
+        dst[0] = static_cast<uint8_t>(v >> 8);
+        dst[1] = static_cast<uint8_t>(v);
+    }
+    else
+    {
+        const auto d = to_big_endian(x);
+        std::memcpy(dst, &d, sizeof(d));
+    }
+#else
     const auto d = to_big_endian(x);
     std::memcpy(dst, &d, sizeof(d));
+#endif
 }
 
 /// Specialization for uint256.
 inline void store(uint8_t* dst, const uint256& x) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im with -fno-builtin, std::memcpy is a function call. Inline the
+    // bswap + store to avoid 4 function calls for 8-byte memcpy chunks.
+    // bswap each uint64 word → 2 x bswap32 + swap halves, then store as uint32 words.
+    const auto v0 = to_big_endian(x[0]);
+    const auto v1 = to_big_endian(x[1]);
+    const auto v2 = to_big_endian(x[2]);
+    const auto v3 = to_big_endian(x[3]);
+    if ((reinterpret_cast<uintptr_t>(dst) & 3) == 0)  // 4-byte aligned
+    {
+        // A named may_alias word type (auto would drop the attribute): dst may hold words of
+        // other types, such as a bytes32 later read through uint64_t.
+        typedef uint32_t __attribute__((may_alias)) w32;
+        w32* const d = reinterpret_cast<w32*>(dst);
+        d[0] = static_cast<uint32_t>(v3);       d[1] = static_cast<uint32_t>(v3 >> 32);
+        d[2] = static_cast<uint32_t>(v2);       d[3] = static_cast<uint32_t>(v2 >> 32);
+        d[4] = static_cast<uint32_t>(v1);       d[5] = static_cast<uint32_t>(v1 >> 32);
+        d[6] = static_cast<uint32_t>(v0);       d[7] = static_cast<uint32_t>(v0 >> 32);
+    }
+    else
+    {
+        std::memcpy(dst, &v3, sizeof(v3));
+        std::memcpy(dst + 8, &v2, sizeof(v2));
+        std::memcpy(dst + 16, &v1, sizeof(v1));
+        std::memcpy(dst + 24, &v0, sizeof(v0));
+    }
+#else
     // Store byte-swapped words in primitive temporaries. This helps with memory aliasing
     // and GCC bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
     // TODO: Use std::byte instead of uint8_t.
@@ -2189,6 +2841,7 @@ inline void store(uint8_t* dst, const uint256& x) noexcept
     std::memcpy(dst + 8, &v2, sizeof(v2));
     std::memcpy(dst + 16, &v1, sizeof(v1));
     std::memcpy(dst + 24, &v0, sizeof(v0));
+#endif
 }
 
 }  // namespace unsafe
