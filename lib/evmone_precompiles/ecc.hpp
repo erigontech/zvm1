@@ -109,6 +109,9 @@ public:
     {
         if (!std::is_constant_evaluated())
         {
+            // The delegation needs distinct operands (the VM asserts x10 != x11).
+            if (this == &other) [[unlikely]]
+                return *this;
             register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&value_);
             register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&other.value_);
             register uint32_t a2 asm("x12") = 0x80;
