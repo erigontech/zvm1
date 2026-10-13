@@ -21,6 +21,12 @@ path = sys.argv[1]
 with open(path) as f:
     src = f.read()
 
+def replace_once(src, old, new):
+    # A target that a blst upgrade moved would otherwise leave the generic code in silently.
+    if old not in src:
+        sys.exit("ERR: patch target not found in no_asm.h: " + old.strip().splitlines()[0])
+    return src.replace(old, new, 1)
+
 airbender_384 = r"""/* Airbender BigInt CSR (0x7CA) accelerated 384-bit Montgomery arithmetic.
  * AIRBENDER_BIGINT_CSR marker for idempotent patching.
  *
@@ -279,7 +285,7 @@ MUL_MONT_IMPL(384)
 #endif
 """
 
-src = src.replace('MUL_MONT_IMPL(384)', airbender_384, 1)
+src = replace_once(src, 'MUL_MONT_IMPL(384)', airbender_384)
 print("Patched mul_mont_384/sqr_mont_384")
 
 # Patch ADD_MOD_IMPL(384) to use CSR ADD/SUB for the low 256-bit chunk.
@@ -351,7 +357,7 @@ inline void add_mod_384(vec384 ret, const vec384 a,
 #else
 ADD_MOD_IMPL(384)
 #endif"""
-src = src.replace(old_add_384, new_add_384, 1)
+src = replace_once(src, old_add_384, new_add_384)
 print("Patched add_mod_384 with CSR ADD/SUB")
 
 # Patch SUB_MOD_IMPL(384) to use CSR SUB/ADD for the low 256-bit chunk.
@@ -411,7 +417,7 @@ inline void sub_mod_384(vec384 ret, const vec384 a,
 #else
 SUB_MOD_IMPL(384)
 #endif"""
-src = src.replace(old_sub_384, new_sub_384, 1)
+src = replace_once(src, old_sub_384, new_sub_384)
 print("Patched sub_mod_384 with CSR SUB/ADD")
 
 # Patch REDC_MONT_IMPL(384, 768)
@@ -424,7 +430,7 @@ REDC_MONT_IMPL(384, 768)
 #else
 REDC_MONT_IMPL(384, 768)
 #endif"""
-src = src.replace(old_redc, new_redc, 1)
+src = replace_once(src, old_redc, new_redc)
 print("Patched REDC_MONT_IMPL(384, 768)")
 
 # Patch FROM_MONT_IMPL(384)
@@ -441,7 +447,7 @@ inline void from_mont_384(vec384 ret, const vec384 a,
 #else
 FROM_MONT_IMPL(384)
 #endif"""
-src = src.replace(old_from, new_from, 1)
+src = replace_once(src, old_from, new_from)
 print("Patched FROM_MONT_IMPL(384)")
 
 # Patch mul_mont_384x: redirect mul_mont_n(... NLIMBS(384)) -> mul_mont_384
@@ -485,7 +491,7 @@ new_mul384x = """void mul_mont_384x(vec384x ret, const vec384x a, const vec384x 
     sub_mod_n(ret[1], ret[1], cc, p, NLIMBS(384));
 #endif
 }"""
-src = src.replace(old_mul384x, new_mul384x, 1)
+src = replace_once(src, old_mul384x, new_mul384x)
 print("Patched mul_mont_384x -> mul_mont_384 + add/sub_mod_384")
 
 # Patch sgn0_pty_mont_384: redirect from_mont_n -> from_mont_384
@@ -509,7 +515,7 @@ new_sgn0_384 = """inline limb_t sgn0_pty_mont_384(const vec384 a, const vec384 p
 
     return sgn0_pty_mod_n(tmp, p, NLIMBS(384));
 }"""
-src = src.replace(old_sgn0_384, new_sgn0_384, 1)
+src = replace_once(src, old_sgn0_384, new_sgn0_384)
 print("Patched sgn0_pty_mont_384 -> from_mont_384")
 
 # Patch sgn0_pty_mont_384x: redirect from_mont_n -> from_mont_384
@@ -536,7 +542,7 @@ new_sgn0_384x = """inline limb_t sgn0_pty_mont_384x(const vec384x a, const vec38
 
     return sgn0_pty_mod_384x(tmp, p);
 }"""
-src = src.replace(old_sgn0_384x, new_sgn0_384x, 1)
+src = replace_once(src, old_sgn0_384x, new_sgn0_384x)
 print("Patched sgn0_pty_mont_384x -> from_mont_384")
 
 # Patch sqr_n_mul_mont_383: redirect mul_mont_nonred_n/mul_mont_n -> mul_mont_384
@@ -569,44 +575,9 @@ new_sqr_n_mul = """void sqr_n_mul_mont_383(vec384 ret, const vec384 a, size_t co
     mul_mont_n(ret, ret, b, p, n0, NLIMBS(384));
 #endif
 }"""
-src = src.replace(old_sqr_n_mul, new_sqr_n_mul, 1)
+src = replace_once(src, old_sqr_n_mul, new_sqr_n_mul)
 print("Patched sqr_n_mul_mont_383 -> mul_mont_384")
 
-# Patch sqr_mont_382x: redirect mul_mont_nonred_n -> mul_mont_384
-old_sqr_382x = """    /* "mul_mont_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));" */
-    mul_mont_nonred_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));
-
-    /* "add_mod_n(ret[1], ret[1], ret[1], p, NLIMBS(384));" */
-    for (carry=0, i=0; i<NLIMBS(384); i++) {
-        limb_t a_i = ret[1][i];
-        ret[1][i] = a_i<<1 | carry;
-        carry = a_i>>(LIMB_T_BITS-1);
-    }
-
-    /* "mul_mont_n(ret[0], t0, t1, p, n0, NLIMBS(384));" */
-    mul_mont_nonred_n(ret[0], t0, t1, p, n0, NLIMBS(384));"""
-new_sqr_382x = """    /* "mul_mont_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));" */
-#ifdef AIRBENDER_BIGINT_CSR
-    mul_mont_384(ret[1], a[0], a[1], p, n0);
-#else
-    mul_mont_nonred_n(ret[1], a[0], a[1], p, n0, NLIMBS(384));
-#endif
-
-    /* "add_mod_n(ret[1], ret[1], ret[1], p, NLIMBS(384));" */
-    for (carry=0, i=0; i<NLIMBS(384); i++) {
-        limb_t a_i = ret[1][i];
-        ret[1][i] = a_i<<1 | carry;
-        carry = a_i>>(LIMB_T_BITS-1);
-    }
-
-    /* "mul_mont_n(ret[0], t0, t1, p, n0, NLIMBS(384));" */
-#ifdef AIRBENDER_BIGINT_CSR
-    mul_mont_384(ret[0], t0, t1, p, n0);
-#else
-    mul_mont_nonred_n(ret[0], t0, t1, p, n0, NLIMBS(384));
-#endif"""
-src = src.replace(old_sqr_382x, new_sqr_382x, 1)
-print("Patched sqr_mont_382x -> mul_mont_384")
 
 with open(path, 'w') as f:
     f.write(src)
