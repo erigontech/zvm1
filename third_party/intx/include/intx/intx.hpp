@@ -3224,8 +3224,7 @@ namespace unsafe
 /// Uses 4-byte word loads when src is 4-byte aligned; falls back to byte loads otherwise.
 inline void copy32(void* dst, const uint8_t* src) noexcept
 {
-    // The words of a named may_alias type (auto would drop the attribute): dst is read back as a
-    // uint256, whose words are uint64_t, and plain uint32_t stores need not be seen there.
+    // The words of a named may_alias type, as in internal::bswap256_words: dst is mostly a uint256.
     typedef uint32_t __attribute__((may_alias)) w32;
     w32* const d = static_cast<w32*>(dst);
     if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
