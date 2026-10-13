@@ -19,6 +19,14 @@ namespace evmone
 {
 using code_iterator = const uint8_t*;
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// A 32-bit word of a uint256 (stored as 64-bit words): may alias them. Every word access to a
+/// stack item or other uint256 goes through it: through plain uint32_t, GCC's type-based alias
+/// analysis takes the access not to touch the uint64_t words, and may drop stores as dead or move
+/// loads ahead of the stores they read. Named, since `auto` would deduce plain uint32_t.
+typedef uint32_t __attribute__((may_alias)) word32;
+#endif
+
 /// Represents the pointer to the stack top item
 /// and allows retrieving stack items and manipulating the pointer.
 class StackTop
@@ -203,7 +211,7 @@ inline bool check_memory(
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, use 32-bit word checks to avoid 64-bit OR decomposition overhead.
     // Check that all uint32 words above word[0] are zero (offset fits in 32 bits).
-    const auto* w = reinterpret_cast<const uint32_t*>(&offset);
+    const word32* const w = reinterpret_cast<const word32*>(&offset);
     if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
         return false;
 
@@ -247,7 +255,7 @@ inline bool check_memory(
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, use 32-bit word checks to avoid 64-bit OR decomposition overhead.
-    const auto* sw = reinterpret_cast<const uint32_t*>(&size);
+    const word32* const sw = reinterpret_cast<const word32*>(&size);
     if ((sw[1] | sw[2] | sw[3] | sw[4] | sw[5] | sw[6] | sw[7]) != 0)
         return false;
 #else
@@ -541,7 +549,7 @@ inline void signextend(StackTop stack) noexcept
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, check ext < 31 using 32-bit words to avoid constructing uint256{31}.
-    const auto* ew = reinterpret_cast<const uint32_t*>(&ext);
+    const word32* const ew = reinterpret_cast<const word32*>(&ext);
     if ((ew[1] | ew[2] | ew[3] | ew[4] | ew[5] | ew[6] | ew[7]) == 0 && ew[0] < 31)
 #else
     if (ext < 31)  // For 31 we also don't need to do anything.
@@ -642,7 +650,7 @@ inline void iszero(StackTop stack) noexcept
     // Most EVM values tested for zero (booleans, counters, addresses) have non-zero
     // low bits, so checking the low 32-bit word first avoids loading all 8 words.
     auto& x = stack.top();
-    const auto* w = reinterpret_cast<const uint32_t*>(&x);
+    const word32* const w = reinterpret_cast<const word32*>(&x);
     // Fast path: if any of the low 2 words (first uint64_t) are non-zero,
     // value is not zero → result is 0.
     if ((w[0] | w[1]) != 0)
@@ -665,8 +673,8 @@ inline void and_(StackTop stack) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // In-place 32-bit word ops: 32 insns vs ~48 for temp+copy via operator&=.
     auto& y = stack.pop();
-    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
-    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    word32* const xw = reinterpret_cast<word32*>(&stack.top());
+    const word32* const yw = reinterpret_cast<const word32*>(&y);
     xw[0] &= yw[0]; xw[1] &= yw[1]; xw[2] &= yw[2]; xw[3] &= yw[3];
     xw[4] &= yw[4]; xw[5] &= yw[5]; xw[6] &= yw[6]; xw[7] &= yw[7];
 #else
@@ -678,8 +686,8 @@ inline void or_(StackTop stack) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     auto& y = stack.pop();
-    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
-    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    word32* const xw = reinterpret_cast<word32*>(&stack.top());
+    const word32* const yw = reinterpret_cast<const word32*>(&y);
     xw[0] |= yw[0]; xw[1] |= yw[1]; xw[2] |= yw[2]; xw[3] |= yw[3];
     xw[4] |= yw[4]; xw[5] |= yw[5]; xw[6] |= yw[6]; xw[7] |= yw[7];
 #else
@@ -691,8 +699,8 @@ inline void xor_(StackTop stack) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     auto& y = stack.pop();
-    auto* xw = reinterpret_cast<uint32_t*>(&stack.top());
-    const auto* yw = reinterpret_cast<const uint32_t*>(&y);
+    word32* const xw = reinterpret_cast<word32*>(&stack.top());
+    const word32* const yw = reinterpret_cast<const word32*>(&y);
     xw[0] ^= yw[0]; xw[1] ^= yw[1]; xw[2] ^= yw[2]; xw[3] ^= yw[3];
     xw[4] ^= yw[4]; xw[5] ^= yw[5]; xw[6] ^= yw[6]; xw[7] ^= yw[7];
 #else
@@ -704,7 +712,7 @@ inline void not_(StackTop stack) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // In-place inversion: 24 insns vs ~32 for operator~ + assign.
-    auto* w = reinterpret_cast<uint32_t*>(&stack.top());
+    word32* const w = reinterpret_cast<word32*>(&stack.top());
     w[0] = ~w[0]; w[1] = ~w[1]; w[2] = ~w[2]; w[3] = ~w[3];
     w[4] = ~w[4]; w[5] = ~w[5]; w[6] = ~w[6]; w[7] = ~w[7];
 #else
@@ -720,7 +728,7 @@ inline void byte(StackTop stack) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, check if n < 32 using 32-bit words to avoid constructing uint256{32}.
     // n < 32 iff upper words are all zero and low word < 32.
-    const auto* nw = reinterpret_cast<const uint32_t*>(&n);
+    const word32* const nw = reinterpret_cast<const word32*>(&n);
     const bool n_valid =
         (nw[1] | nw[2] | nw[3] | nw[4] | nw[5] | nw[6] | nw[7]) == 0 && nw[0] < 32;
 #else
@@ -825,7 +833,7 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
     // if index overflows 32 bits (any high word non-zero → index > any size_t value).
-    const auto* iw = reinterpret_cast<const uint32_t*>(&index);
+    const word32* const iw = reinterpret_cast<const word32*>(&index);
     const bool index_overflows_32bit =
         (iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0;
     if (index_overflows_32bit || state.msg->input_size <= iw[0])
@@ -1149,7 +1157,7 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, use 32-bit word checks: dst must fit in word[0] (32-bit code offsets).
-    const auto* w = reinterpret_cast<const uint32_t*>(&dst);
+    const word32* const w = reinterpret_cast<const word32*>(&dst);
     const auto hi_part_is_nonzero = (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0;
     if (hi_part_is_nonzero || !state.analysis.baseline->check_jumpdest(w[0])) [[unlikely]]
 #else

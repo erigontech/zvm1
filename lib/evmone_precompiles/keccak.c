@@ -209,6 +209,11 @@ static inline ALWAYS_INLINE uint64_t load_le_word(const uint8_t* data)
 }
 
 #if defined(AIRBENDER)
+/// A 32-bit word of the input or of the state: may alias them. The input is any object (a
+/// uint256, 64-bit lanes) and the state is 64-bit lanes, which plain uint32_t accesses would not
+/// be ordered against under strict aliasing.
+typedef uint32_t __attribute__((may_alias)) keccak_word32;
+
 /// Loads a 64-bit little-endian integer from any address. load_le_word() may assume 8-byte
 /// alignment on RISC-V; here 4-byte aligned inputs take two word loads (~4 insns), anything
 /// else falls back to the copy, which -mstrict-align lowers byte by byte.
@@ -216,7 +221,7 @@ static inline ALWAYS_INLINE uint64_t load_le_any(const uint8_t* data)
 {
     if (__builtin_expect(((uintptr_t)data & 3) == 0, 1))
     {
-        const uint32_t* w = (const uint32_t*)data;
+        const keccak_word32* w = (const keccak_word32*)data;
         return to_le64((uint64_t)w[0] | ((uint64_t)w[1] << 32));
     }
     uint64_t word;
@@ -662,14 +667,14 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
         // than load_le + XOR), then zero only the remaining buf words.
         {
             int i;
-            uint32_t* bufW = (uint32_t*)buf;
+            keccak_word32* bufW = (keccak_word32*)buf;
             const uint8_t* d = data;
             size_t remaining = size;
 
             // Fast path: copy full 4-byte words when data is 4-byte aligned.
             if (__builtin_expect(((uintptr_t)d & 3) == 0, 1))
             {
-                const uint32_t* dW = (const uint32_t*)d;
+                const keccak_word32* dW = (const keccak_word32*)d;
                 size_t full_words = remaining / 4;
                 for (size_t j = 0; j < full_words; ++j)
                     bufW[j] = dW[j];
@@ -687,7 +692,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
                     d += 8;
                     remaining -= 8;
                 }
-                bufW = (uint32_t*)buf_iter;
+                bufW = (keccak_word32*)buf_iter;
             }
 
             // Handle remaining bytes + padding byte 0x01.
@@ -698,7 +703,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
             lw[remaining] = 0x01;
             {
                 // Write last_word at current position (may be uint32_t-misaligned).
-                uint32_t* lwd = (uint32_t*)&last_word;
+                const keccak_word32* lwd = (const keccak_word32*)&last_word;
                 bufW[0] = lwd[0];
                 bufW[1] = lwd[1];
                 bufW += 2;
@@ -707,7 +712,7 @@ union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
             // Zero remaining buf words up to buf[31] (256 bytes total).
             // Use CSR MEMCOPY when 32-byte aligned, else word stores.
             {
-                uint32_t* end = (uint32_t*)buf + 64;  // buf[32] uint64_t = 64 uint32_t
+                keccak_word32* const end = (keccak_word32*)buf + 64;  // buf[32] uint64_t = 64 words
                 while (bufW < end)
                 {
                     if (((uintptr_t)bufW & 31) == 0 && (end - bufW) >= 8)

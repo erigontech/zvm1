@@ -138,8 +138,9 @@ ecc::ProjPoint<Curve> ecrecover_msm_glv(
         // Work with 32-bit words directly for 128-bit scalars.
         uint32_t aw[4], bww[4];
         {
-            const auto* ka = reinterpret_cast<const uint32_t*>(&k2a);
-            const auto* kb = reinterpret_cast<const uint32_t*>(&k2b);
+            typedef uint32_t __attribute__((may_alias)) word;
+            const word* const ka = reinterpret_cast<const word*>(&k2a);
+            const word* const kb = reinterpret_cast<const word*>(&k2b);
             for (int j = 0; j < 4; ++j) { aw[j] = ka[j]; bww[j] = kb[j]; }
         }
 
