@@ -2243,11 +2243,405 @@ constexpr div_result<uint<M>, uint<N>> udivrem_top2(const uint<M>& u, const uint
     return {q, uint<N>{rw}};
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(INTX_DIV32_TEST)
+/// Division on 32-bit words for rv32, where a 64-bit word multiplication is 4 multiplications and
+/// a dozen carry instructions but the 32 x 32 -> 64 one is mul + mulhu and divu is native:
+/// the algorithms above (Moller-Granlund reciprocals, Knuth's D) with B = 2^32.
+namespace div32
+{
+using u32 = uint32_t;
+using u64 = uint64_t;
+/// A 32-bit word of a uint<N> (stored as 64-bit words): may alias them.
+typedef uint32_t __attribute__((may_alias)) w32;
+
+/// Leading zeros of each non-zero byte value.
+inline constexpr auto clz_byte_table = []() noexcept {
+    std::array<uint8_t, 256> table{};
+    for (size_t i = 1; i < table.size(); ++i)
+        table[i] = static_cast<uint8_t>(std::countl_zero(static_cast<uint8_t>(i)));
+    return table;
+}();
+
+/// Leading zeros of a non-zero word (0 would give 24): 2 compare-and-shift steps bring its top
+/// set bit into the top byte, and the table counts the rest in place of 3 more steps. libgcc's
+/// __clzsi2 is a call, around which the caller spills its live registers.
+constexpr unsigned clz_nonzero(u32 x) noexcept
+{
+    unsigned n = 0;
+    if (x < 0x10000)
+    {
+        n += 16;
+        x <<= 16;
+    }
+    if (x < 0x1000000)
+    {
+        n += 8;
+        x <<= 8;
+    }
+    return n + clz_byte_table[x >> 24];
+}
+
+/// floor((B^2 - 1) / d) - B for normalized d: the 64/32 division (~d : B-1) / d, whose quotient
+/// fits a word as ~d < d. Hacker's Delight divlu: two 32/16-digit steps on divu.
+constexpr u32 reciprocal_2by1(u32 d) noexcept
+{
+    const u32 u1 = ~d;
+    const u32 dh = d >> 16;
+    const u32 dl = d & 0xffff;
+    u32 q1 = u1 / dh;
+    u32 rhat = u1 - q1 * dh;
+    while (q1 >= 0x10000 || q1 * dl > ((rhat << 16) | 0xffff))
+    {
+        --q1;
+        rhat += dh;
+        if (rhat >= 0x10000)
+            break;
+    }
+    const u32 u21 = (u1 << 16) + 0xffff - q1 * d;
+    u32 q0 = u21 / dh;
+    rhat = u21 - q0 * dh;
+    while (q0 >= 0x10000 || q0 * dl > ((rhat << 16) | 0xffff))
+    {
+        --q0;
+        rhat += dh;
+        if (rhat >= 0x10000)
+            break;
+    }
+    return (q1 << 16) | q0;
+}
+
+constexpr u32 reciprocal_3by2(u32 d1, u32 d0) noexcept
+{
+    auto v = reciprocal_2by1(d1);
+    auto p = d1 * v;
+    p += d0;
+    if (p < d0)
+    {
+        --v;
+        if (p >= d1)
+        {
+            --v;
+            p -= d1;
+        }
+        p -= d1;
+    }
+    const auto t = u64{v} * d0;
+    const auto t1 = static_cast<u32>(t >> 32);
+    p += t1;
+    if (p < t1)
+    {
+        --v;
+        if (p >= d1)
+        {
+            if (p > d1 || static_cast<u32>(t) >= d0)
+                --v;
+        }
+    }
+    return v;
+}
+
+/// (u1 : u0) / d for u1 < d and v = reciprocal_2by1(d): returns the quotient, rem = remainder.
+constexpr u32 udivrem_2by1(u32 u1, u32 u0, u32 d, u32 v, u32& rem) noexcept
+{
+    const u64 q = u64{v} * u1 + (u64{u1} << 32 | u0);
+    auto q1 = static_cast<u32>(q >> 32) + 1;
+    const auto q0 = static_cast<u32>(q);
+    auto r = u0 - q1 * d;
+    if (r > q0)
+    {
+        --q1;
+        r += d;
+    }
+    if (r >= d)
+    {
+        ++q1;
+        r -= d;
+    }
+    rem = r;
+    return q1;
+}
+
+/// (u2 : u1 : u0) / d for (u2 : u1) < d and v = reciprocal_3by2(d): returns the quotient,
+/// rem = the 2-word remainder.
+constexpr u32 udivrem_3by2(u32 u2, u32 u1, u32 u0, u64 d, u32 v, u64& rem) noexcept
+{
+    const auto d1 = static_cast<u32>(d >> 32);
+    const auto d0 = static_cast<u32>(d);
+    const u64 q = u64{v} * u2 + (u64{u2} << 32 | u1);
+    auto q1 = static_cast<u32>(q >> 32);
+    const auto q0 = static_cast<u32>(q);
+    const u32 r1 = u1 - q1 * d1;
+    const u64 t = u64{d0} * q1;
+    u64 r = (u64{r1} << 32 | u0) - t - d;
+    ++q1;
+    if (static_cast<u32>(r >> 32) >= q0)
+    {
+        --q1;
+        r += d;
+    }
+    if (r >= d)
+    {
+        ++q1;
+        r -= d;
+    }
+    rem = r;
+    return q1;
+}
+
+/// x[0..n) -= y[0..n) * mult, returns the borrow out of the top word.
+constexpr u32 submul(u32* x, const u32* y, size_t n, u32 mult) noexcept
+{
+    u32 borrow = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const auto s = x[i] - borrow;
+        const auto p = u64{y[i]} * mult;
+        borrow = static_cast<u32>(p >> 32) + (x[i] < s);
+        x[i] = s - static_cast<u32>(p);
+        borrow += (s < x[i]);
+    }
+    return borrow;
+}
+
+/// x[0..n) += y[0..n), returns the carry out.
+constexpr u32 add(u32* x, const u32* y, size_t n) noexcept
+{
+    u32 carry = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const auto s = x[i] + y[i];
+        const auto c1 = static_cast<u32>(s < x[i]);
+        x[i] = s + carry;
+        carry = c1 | static_cast<u32>(x[i] < s);
+    }
+    return carry;
+}
+
+/// Knuth's D over the normalized u[0..ulen) by d[0..dlen), dlen >= 3: q[0..ulen-dlen) gets the
+/// quotient digits, u[0..dlen) the normalized remainder.
+[[gnu::always_inline]] constexpr void udivrem_knuth(
+    w32* q, u32* u, size_t ulen, const u32* d, size_t dlen) noexcept
+{
+    const auto d1 = d[dlen - 1];
+    const auto d0 = d[dlen - 2];
+    const u64 divisor = u64{d1} << 32 | d0;
+    const auto reciprocal = reciprocal_3by2(d1, d0);
+    for (size_t j = ulen - dlen - 1;; --j)
+    {
+        const auto u2 = u[j + dlen];
+        const auto u1 = u[j + dlen - 1];
+        const auto u0 = u[j + dlen - 2];
+
+        u32 qhat;
+        if ((u64{u2} << 32 | u1) == divisor) [[unlikely]]  // Division overflows.
+        {
+            qhat = ~u32{0};
+            u[j + dlen] = u2 - submul(&u[j], d, dlen, qhat);
+        }
+        else
+        {
+            u64 rhat;
+            qhat = udivrem_3by2(u2, u1, u0, divisor, reciprocal, rhat);
+
+            const auto overflow = submul(&u[j], d, dlen - 2, qhat);
+            const auto rl = static_cast<u32>(rhat);
+            const auto rh = static_cast<u32>(rhat >> 32);
+            u[j + dlen - 2] = rl - overflow;
+            const auto b1 = static_cast<u32>(rl < overflow);
+            u[j + dlen - 1] = rh - b1;
+            if (rh < b1) [[unlikely]]
+            {
+                --qhat;
+                u[j + dlen - 1] += d1 + add(&u[j], d, dlen - 1);
+            }
+        }
+
+        q[j] = qhat;
+        if (j == 0)
+            break;
+    }
+}
+
+/// udivrem_knuth() for a divisor length known at compile time: its inner loops unroll without
+/// per-word exit tests, and the divisor, copied out of d, stays in registers.
+template <size_t DLEN>
+[[gnu::always_inline]] constexpr void udivrem_knuth_fixed(
+    w32* q, u32* u, size_t ulen, const u32* d) noexcept
+{
+    u32 dr[DLEN];
+    for (size_t i = 0; i < DLEN; ++i)
+        dr[i] = d[i];
+    udivrem_knuth(q, u, ulen, dr, DLEN);
+}
+
+/// r[0..n) = u[0..n) >> shift: the remainder out of the normalized one.
+[[gnu::always_inline]] constexpr void unnormalize(
+    w32* r, const u32* u, size_t n, unsigned shift) noexcept
+{
+    if (shift != 0)
+    {
+        u32 lo = u[0];
+        for (size_t i = 0; i < n - 1; ++i)
+        {
+            const u32 hi = u[i + 1];
+            r[i] = (lo >> shift) | (hi << (32 - shift));
+            lo = hi;
+        }
+        r[n - 1] = lo >> shift;
+    }
+    else
+    {
+        for (size_t i = 0; i < n; ++i)
+            r[i] = u[i];
+    }
+}
+
+template <typename T>
+[[gnu::always_inline]] inline T uninit_uint() noexcept
+{
+    if constexpr (requires { typename T::uninit_tag; })
+        return T{typename T::uninit_tag{}};
+    else
+        return T{};
+}
+
+template <unsigned M, unsigned N>
+constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& y) noexcept
+{
+    constexpr size_t UW = M / 32;
+    constexpr size_t VW = N / 32;
+    // Spelled out: `auto` would deduce plain uint32_t, dropping may_alias, and then GCC is free to
+    // drop the result stores as dead stores to uint64_t words.
+    const w32* const uw = reinterpret_cast<const w32*>(&x);
+    const w32* const vw = reinterpret_cast<const w32*>(&y);
+    // The quotient digits and the remainder go straight into the result. Every path returns this
+    // one object, so GCC builds it in the caller's return slot (NRVO) instead of copying it there.
+    div_result<uint<M>, uint<N>> res{uninit_uint<uint<M>>(), uninit_uint<uint<N>>()};
+    w32* const qw = reinterpret_cast<w32*>(&res.quot);
+    w32* const rw = reinterpret_cast<w32*>(&res.rem);
+
+    size_t n = VW;
+    while (n > 0 && vw[n - 1] == 0)
+        --n;
+    INTX_REQUIRE(n != 0);  // Division by 0.
+    size_t m = UW;
+    while (m > 0 && uw[m - 1] == 0)
+        --m;
+    if (m < n)  // x < y: the quotient is 0, the remainder x.
+    {
+        for (size_t i = 0; i < UW; ++i)
+            qw[i] = 0;
+        for (size_t i = 0; i < VW; ++i)
+            rw[i] = i < UW ? uw[i] : 0;
+        return res;
+    }
+
+    // Normalize: shift both left until the divisor's top word has its top bit set. The whole
+    // numerator is shifted, since with constant indices that is cheaper than a loop over its m
+    // significant words. The divisor is shifted over its n significant words, or over all of them
+    // under a wider numerator (MULMOD, whose modulus mostly has all words significant). un[m]
+    // takes the numerator's shifted-out top bits; the words above it come out zero. Only
+    // un[0..m] and dn[0..n) are used.
+    const auto shift = clz_nonzero(vw[n - 1]);
+    const size_t dwords = M > N ? VW : n;
+    u32 un[UW + 1];
+    u32 dn[VW];
+    if (shift != 0)
+    {
+        const auto rs = 32 - shift;
+        u32 hi = vw[dwords - 1];
+        for (size_t i = dwords - 1; i != 0; --i)
+        {
+            const u32 lo = vw[i - 1];
+            dn[i] = (hi << shift) | (lo >> rs);
+            hi = lo;
+        }
+        dn[0] = hi << shift;
+        hi = uw[UW - 1];
+        un[UW] = hi >> rs;
+        for (size_t i = UW - 1; i != 0; --i)
+        {
+            const u32 lo = uw[i - 1];
+            un[i] = (hi << shift) | (lo >> rs);
+            hi = lo;
+        }
+        un[0] = hi << shift;
+    }
+    else
+    {
+        for (size_t i = 0; i < dwords; ++i)
+            dn[i] = vw[i];
+        for (size_t i = 0; i < UW; ++i)
+            un[i] = uw[i];
+        un[UW] = 0;
+    }
+    // Count the normalized numerator's top word if significant.
+    const size_t ulen = (un[m] != 0 || un[m - 1] >= dn[n - 1]) ? m + 1 : m;
+    if (ulen <= n)  // x < y
+    {
+        for (size_t i = 0; i < UW; ++i)
+            qw[i] = 0;
+        for (size_t i = 0; i < VW; ++i)
+            rw[i] = i < UW ? uw[i] : 0;
+        return res;
+    }
+
+    // A full-width divisor under a wider numerator (MULMOD): the loops over its words get fixed
+    // lengths, and the remainder fills all words.
+    const bool full_divisor = M > N && n == VW;
+    // Zero the result, one store per word (the remainder only if it is not filled), then write
+    // the quotient digits [0, ulen - n) and the remainder over it.
+    for (size_t i = 0; i < UW; ++i)
+        qw[i] = 0;
+    if (!full_divisor)
+    {
+        for (size_t i = 0; i < VW; ++i)
+            rw[i] = 0;
+    }
+    if (n == 1)
+    {
+        const auto d = dn[0];
+        const auto v = reciprocal_2by1(d);
+        u32 rem = un[ulen - 1];
+        for (size_t i = ulen - 1; i-- != 0;)
+            qw[i] = udivrem_2by1(rem, un[i], d, v, rem);
+        rw[0] = rem >> shift;
+    }
+    else if (n == 2)
+    {
+        const u64 d = u64{dn[1]} << 32 | dn[0];
+        const auto v = reciprocal_3by2(dn[1], dn[0]);
+        u64 rem = u64{un[ulen - 1]} << 32 | un[ulen - 2];
+        for (size_t i = ulen - 2; i-- != 0;)
+            qw[i] = udivrem_3by2(static_cast<u32>(rem >> 32), static_cast<u32>(rem), un[i], d, v, rem);
+        rem >>= shift;
+        rw[0] = static_cast<u32>(rem);
+        rw[1] = static_cast<u32>(rem >> 32);
+    }
+    else if (full_divisor)
+    {
+        udivrem_knuth_fixed<VW>(qw, un, ulen, dn);
+        unnormalize(rw, un, VW, shift);
+    }
+    else
+    {
+        udivrem_knuth(qw, un, ulen, dn, n);
+        unnormalize(rw, un, n, shift);
+    }
+    return res;
+}
+}  // namespace div32
+#endif
+
 }  // namespace internal
 
 template <unsigned M, unsigned N>
 constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& u, const uint<N>& v) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if (!std::is_constant_evaluated())
+        return internal::div32::udivrem(u, v);
+#endif
     // For equal sizes, a divisor with the top word set gives a single word quotient.
     constexpr auto TOP1 = M == N;
     // A divisor with one significant word less than the numerator gives a two word quotient.
@@ -2523,6 +2917,72 @@ inline void store(uint8_t* dst, const T& x) noexcept
 }  // namespace le
 
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+namespace internal
+{
+/// Writes the 32 bytes at s in reverse byte order to d: d[k] = bswap32(s[7 - k]) word-wise.
+/// Both must be 4-byte aligned; d == s is allowed (all words are loaded first).
+///
+/// This is the whole 256-bit big-endian conversion in 8 loads, 8 stores and the shared-mask
+/// swaps, instead of copying into an aligned temporary and swapping that (8 more loads and
+/// stores), or swapping 64-bit words as pairs of 32-bit halves.
+[[gnu::always_inline]] inline void bswap256_words(void* d, const void* s) noexcept
+{
+    // Words of a named may_alias type (auto would drop the attribute): d is a uint256, whose
+    // words are uint64_t, and s a byte buffer. Through plain uint32_t the stores to d do not
+    // alias the uint64_t reads of the result, and GCC is free to drop them as dead stores.
+    typedef uint32_t __attribute__((may_alias)) w32;
+    const w32* const sw = static_cast<const w32*>(s);
+    w32* const dw = static_cast<w32*>(d);
+    uint32_t w[8];
+#pragma GCC unroll 8
+    for (int i = 0; i < 8; ++i)
+        w[i] = sw[i];
+    const uint32_t m1 = 0xFF00FF00u;
+    const uint32_t m2 = 0x00FF00FFu;
+#pragma GCC unroll 8
+    for (int k = 0; k < 8; ++k)
+    {
+        const auto v = w[7 - k];
+        const auto a = ((v << 8) & m1) | ((v >> 8) & m2);
+        dw[k] = (a << 16) | (a >> 16);
+    }
+}
+
+[[gnu::always_inline]] inline bool is_aligned4(const void* p) noexcept
+{
+    return (reinterpret_cast<uintptr_t>(p) & 3) == 0;
+}
+
+/// Writes the 32 bytes at s in reverse byte order to d with byte loads and stores.
+/// d and s must not overlap; neither needs any alignment.
+///
+/// Without rev8, a word swap costs 8 ALU instructions, so lw + swap + sw is 10 instructions
+/// per 4 bytes (plus the masks) where lbu + sb is 8, and memory need not be word-aligned.
+/// Use it when the destination is memory anyway; a value built in registers is better served
+/// by bswap256_words. One asm block keeps it to one scratch register: as separate C byte
+/// copies GCC hoists the loads and spills hot registers around them.
+[[gnu::always_inline]] inline void bswap256_bytes(void* d, const void* s) noexcept
+{
+    using Bytes = uint8_t[32];
+    uint32_t t;
+#define INTX_RB(si, di) "lbu %[t], " #si "(%[s])\n\tsb %[t], " #di "(%[d])\n\t"
+    asm(
+        INTX_RB(31, 0) INTX_RB(30, 1) INTX_RB(29, 2) INTX_RB(28, 3)
+        INTX_RB(27, 4) INTX_RB(26, 5) INTX_RB(25, 6) INTX_RB(24, 7)
+        INTX_RB(23, 8) INTX_RB(22, 9) INTX_RB(21, 10) INTX_RB(20, 11)
+        INTX_RB(19, 12) INTX_RB(18, 13) INTX_RB(17, 14) INTX_RB(16, 15)
+        INTX_RB(15, 16) INTX_RB(14, 17) INTX_RB(13, 18) INTX_RB(12, 19)
+        INTX_RB(11, 20) INTX_RB(10, 21) INTX_RB(9, 22) INTX_RB(8, 23)
+        INTX_RB(7, 24) INTX_RB(6, 25) INTX_RB(5, 26) INTX_RB(4, 27)
+        INTX_RB(3, 28) INTX_RB(2, 29) INTX_RB(1, 30) INTX_RB(0, 31)
+        : [t] "=&r"(t), "=m"(*static_cast<Bytes*>(d))
+        : [d] "r"(d), [s] "r"(s), "m"(*static_cast<const Bytes*>(s)));
+#undef INTX_RB
+}
+}  // namespace internal
+#endif
+
 namespace be  // Conversions to/from BE bytes.
 {
 /// Loads an integer value from bytes of big-endian order.
@@ -2535,24 +2995,16 @@ inline T load(const uint8_t (&src)[M]) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (M == sizeof(T) && sizeof(T) == 32)
     {
-        // Full-size load: inline word copy avoids memcpy function call overhead.
-        // The words are of a named may_alias type (auto would drop the attribute): raw_ is read
-        // back as T, whose words are uint64_t, and plain uint32_t stores need not be seen there.
-        typedef uint32_t __attribute__((may_alias)) w32;
-        alignas(32) char raw_[sizeof(T)];
-        w32* const d = reinterpret_cast<w32*>(raw_);
-        if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
-        {
-            const w32* const s = reinterpret_cast<const w32*>(src);
-            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
-            d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
-        }
+        // Full-size load: byte-reverse straight from the source words into the result.
+        T x{typename T::uninit_tag{}};
+        if (internal::is_aligned4(src))
+            internal::bswap256_words(&x, src);
         else
         {
+            alignas(32) char raw_[sizeof(T)];
             std::memcpy(raw_, src, M);
+            internal::bswap256_words(&x, raw_);
         }
-        auto& x = *reinterpret_cast<T*>(raw_);
-        x = to_big_endian(x);
         return x;
     }
     else
@@ -2592,24 +3044,7 @@ inline void store(uint8_t (&dst)[sizeof(T)], const T& x) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (sizeof(T) == 32)
-    {
-        // Inline bswap + word-store to avoid memcpy function call overhead.
-        // The words are of a named may_alias type (auto would drop the attribute): d's words are
-        // uint64_t, and plain uint32_t loads need not see the stores that computed them.
-        typedef uint32_t __attribute__((may_alias)) w32;
-        const auto d = to_big_endian(x);
-        if ((reinterpret_cast<uintptr_t>(dst) & 3) == 0)  // 4-byte aligned
-        {
-            const w32* const s = reinterpret_cast<const w32*>(&d);
-            w32* const dd = reinterpret_cast<w32*>(dst);
-            dd[0] = s[0]; dd[1] = s[1]; dd[2] = s[2]; dd[3] = s[3];
-            dd[4] = s[4]; dd[5] = s[5]; dd[6] = s[6]; dd[7] = s[7];
-        }
-        else
-        {
-            std::memcpy(dst, &d, sizeof(d));
-        }
-    }
+        internal::bswap256_bytes(dst, &x);
     else
 #endif
     {
@@ -2705,9 +3140,16 @@ inline IntT load(const uint8_t* src) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (sizeof(IntT) == 32)
     {
-        alignas(32) std::byte aligned_storage[32];
-        copy32(&aligned_storage, src);
-        return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+        IntT x{typename IntT::uninit_tag{}};
+        if (internal::is_aligned4(src))
+            internal::bswap256_words(&x, src);
+        else
+        {
+            alignas(32) std::byte aligned_storage[32];
+            std::memcpy(&aligned_storage, src, 32);
+            internal::bswap256_words(&x, &aligned_storage);
+        }
+        return x;
     }
     else if constexpr (sizeof(IntT) == 8)
     {
@@ -2751,6 +3193,16 @@ inline IntT load(const uint8_t* src) noexcept
         return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
     }
 }
+
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Loads 32 big-endian bytes from src into the existing value x, which must not overlap src.
+/// Reversing the bytes straight into x beats building the value in registers when x lives in
+/// memory anyway (an EVM stack slot), see internal::bswap256_bytes.
+inline void load_into(uint256& x, const uint8_t* src) noexcept
+{
+    internal::bswap256_bytes(&x, src);
+}
+#endif
 
 /// Stores an integer value at the provided pointer in big-endian order. The user must make sure
 /// that the provided buffer is big enough to fit the value. Therefore, marked "unsafe".
@@ -2802,31 +3254,8 @@ inline void store(uint8_t* dst, const T& x) noexcept
 inline void store(uint8_t* dst, const uint256& x) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // On rv32im with -fno-builtin, std::memcpy is a function call. Inline the
-    // bswap + store to avoid 4 function calls for 8-byte memcpy chunks.
-    // bswap each uint64 word → 2 x bswap32 + swap halves, then store as uint32 words.
-    const auto v0 = to_big_endian(x[0]);
-    const auto v1 = to_big_endian(x[1]);
-    const auto v2 = to_big_endian(x[2]);
-    const auto v3 = to_big_endian(x[3]);
-    if ((reinterpret_cast<uintptr_t>(dst) & 3) == 0)  // 4-byte aligned
-    {
-        // A named may_alias word type (auto would drop the attribute): dst may hold words of
-        // other types, such as a bytes32 later read through uint64_t.
-        typedef uint32_t __attribute__((may_alias)) w32;
-        w32* const d = reinterpret_cast<w32*>(dst);
-        d[0] = static_cast<uint32_t>(v3);       d[1] = static_cast<uint32_t>(v3 >> 32);
-        d[2] = static_cast<uint32_t>(v2);       d[3] = static_cast<uint32_t>(v2 >> 32);
-        d[4] = static_cast<uint32_t>(v1);       d[5] = static_cast<uint32_t>(v1 >> 32);
-        d[6] = static_cast<uint32_t>(v0);       d[7] = static_cast<uint32_t>(v0 >> 32);
-    }
-    else
-    {
-        std::memcpy(dst, &v3, sizeof(v3));
-        std::memcpy(dst + 8, &v2, sizeof(v2));
-        std::memcpy(dst + 16, &v1, sizeof(v1));
-        std::memcpy(dst + 24, &v0, sizeof(v0));
-    }
+    // The destination is memory, so reverse the bytes straight into it (any alignment).
+    internal::bswap256_bytes(dst, &x);
 #else
     // Store byte-swapped words in primitive temporaries. This helps with memory aliasing
     // and GCC bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
