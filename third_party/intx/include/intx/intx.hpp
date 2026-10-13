@@ -1890,9 +1890,32 @@ constexpr unsigned count_significant_words(const uint<N>& x) noexcept
     return 0;
 }
 
+namespace internal
+{
+/// count_significant_bytes() of a 64-bit word by comparisons on its significant 32-bit half,
+/// without a leading-zero count. 4 to 7 instructions inline on rv32.
+constexpr unsigned count_significant_bytes_by_compare(uint64_t x) noexcept
+{
+    const auto hi = static_cast<uint32_t>(x >> 32);
+    const auto v = hi != 0 ? hi : static_cast<uint32_t>(x);
+    // This form keeps the comparison results as values; nested constant ternaries become
+    // branches between constant loads.
+    const unsigned n =
+        v >= 0x10000 ? 3 + unsigned{v >= 0x1000000} : unsigned{v >= 0x100} + unsigned{v != 0};
+    return hi != 0 ? 4 + n : n;
+}
+}  // namespace internal
+
 constexpr unsigned count_significant_bytes(uint64_t x) noexcept
 {
+    // rv32im has no leading-zero count: clz() of a 64-bit word is a call to libgcc's __clzdi2,
+    // around which the caller spills its live registers. The RLP encoders and EXP's gas count
+    // call this on every length and value.
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    return internal::count_significant_bytes_by_compare(x);
+#else
     return (64 - clz(x) + 7) / 8;
+#endif
 }
 
 template <unsigned N>
@@ -2507,19 +2530,27 @@ template <typename T>
         return T{};
 }
 
-/// x / y into qw[0..M/32) with WithQuot and x % y into rw[0..N/32) with WithRem, for y of n
-/// significant words (n != 0). Either result may be y itself: y is read in full (the normalized
-/// divisor is built from it) before the first store to qw or rw, and x is never a result.
+/// The number of significant words of the W-word number w (0 for 0).
+template <size_t W>
+[[gnu::always_inline]] inline size_t significant_words(const w32* w) noexcept
+{
+    size_t n = W;
+    while (n > 0 && w[n - 1] == 0)
+        --n;
+    return n;
+}
+
+/// x / y into qw[0..M/32) with WithQuot and x % y into rw[0..N/32) with WithRem, for x of m and
+/// y of n significant words (n != 0). Either result may be y itself: y is read in full (the
+/// normalized divisor is built from it) before the first store to qw or rw, and x is never a
+/// result.
 template <unsigned M, unsigned N, bool WithQuot, bool WithRem>
 [[gnu::always_inline]] inline void divide(
-    const w32* uw, const w32* vw, w32* qw, w32* rw, size_t n) noexcept
+    const w32* uw, size_t m, const w32* vw, w32* qw, w32* rw, size_t n) noexcept
 {
     constexpr size_t UW = M / 32;
     constexpr size_t VW = N / 32;
     INTX_REQUIRE(n != 0);  // Division by 0.
-    size_t m = UW;
-    while (m > 0 && uw[m - 1] == 0)
-        --m;
     if (m < n)  // x < y: the quotient is 0, the remainder x.
     {
         if constexpr (WithQuot)
@@ -2658,8 +2689,9 @@ constexpr div_result<uint<M>, uint<N>> udivrem(const uint<M>& x, const uint<N>& 
     size_t n = N / 32;
     while (n > 0 && vw[n - 1] == 0)
         --n;
-    divide<M, N, true, true>(reinterpret_cast<const w32*>(&x), vw, reinterpret_cast<w32*>(&res.quot),
-        reinterpret_cast<w32*>(&res.rem), n);
+    const w32* const uw = reinterpret_cast<const w32*>(&x);
+    divide<M, N, true, true>(uw, significant_words<M / 32>(uw), vw,
+        reinterpret_cast<w32*>(&res.quot), reinterpret_cast<w32*>(&res.rem), n);
     return res;
 }
 
@@ -2669,11 +2701,18 @@ template <unsigned M, unsigned N>
 [[gnu::noinline]] void urem(const uint<M>& x, const uint<N>& y, uint<N>& r) noexcept
 {
     const w32* const vw = reinterpret_cast<const w32*>(&y);
-    size_t n = N / 32;
-    while (n > 0 && vw[n - 1] == 0)
-        --n;
-    divide<M, N, false, true>(
-        reinterpret_cast<const w32*>(&x), vw, nullptr, reinterpret_cast<w32*>(&r), n);
+    const size_t n = significant_words<N / 32>(vw);
+    const w32* const uw = reinterpret_cast<const w32*>(&x);
+    divide<M, N, false, true>(uw, significant_words<M / 32>(uw), vw, nullptr, reinterpret_cast<w32*>(&r), n);
+}
+
+/// As above for x of m significant words, which the caller has just counted.
+template <unsigned M, unsigned N>
+[[gnu::noinline]] void urem(const uint<M>& x, size_t m, const uint<N>& y, uint<N>& r) noexcept
+{
+    const w32* const vw = reinterpret_cast<const w32*>(&y);
+    divide<M, N, false, true>(reinterpret_cast<const w32*>(&x), m, vw, nullptr,
+        reinterpret_cast<w32*>(&r), significant_words<N / 32>(vw));
 }
 
 /// q = x / y, where q may be y itself and y has n significant words (the caller knows: it has
@@ -2681,8 +2720,259 @@ template <unsigned M, unsigned N>
 template <unsigned N>
 [[gnu::noinline]] void udiv(const uint<N>& x, const uint<N>& y, uint<N>& q, size_t n) noexcept
 {
-    divide<N, N, true, false>(reinterpret_cast<const w32*>(&x), reinterpret_cast<const w32*>(&y),
+    const w32* const uw = reinterpret_cast<const w32*>(&x);
+    divide<N, N, true, false>(uw, significant_words<N / 32>(uw), reinterpret_cast<const w32*>(&y),
         reinterpret_cast<w32*>(&q), nullptr, n);
+}
+
+using i64 = int64_t;
+
+/// The NIST P-256 prime 2^256 - 2^224 + 2^192 + 2^96 - 1 (also the secp256r1 field prime), by words.
+inline constexpr u32 p256_words[8] = {
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0, 0, 0, 1, 0xFFFFFFFFu};
+
+/// Folds the signed carry k of a sum w + k * 2^256 into w, at most twice, and subtracts p256 once if
+/// w is still not below it: 2^256 = 2^224 - 2^192 - 2^96 + 1 (mod p256), and the carry that is
+/// left after a fold is in {-1, 0, 1}, then 0.
+[[gnu::always_inline]] inline void p256_finish(w32* r, u32 (&w)[8], i64 k) noexcept
+{
+    while (k != 0)
+    {
+        i64 acc = i64{w[0]} + k;
+        w[0] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[1]};
+        w[1] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[2]};
+        w[2] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[3]} - k;
+        w[3] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[4]};
+        w[4] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[5]};
+        w[5] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[6]} - k;
+        w[6] = static_cast<u32>(acc);
+        acc >>= 32;
+        acc += i64{w[7]} + k;
+        w[7] = static_cast<u32>(acc);
+        k = acc >> 32;
+    }
+    bool ge = true;
+    for (int i = 7; i >= 0; --i)
+    {
+        if (w[i] != p256_words[i])
+        {
+            ge = w[i] > p256_words[i];
+            break;
+        }
+    }
+    if (ge)
+    {
+        u32 borrow = 0;
+        for (int i = 0; i < 8; ++i)
+        {
+            const u64 d = u64{w[i]} - p256_words[i] - borrow;
+            w[i] = static_cast<u32>(d);
+            borrow = static_cast<u32>(d >> 63);
+        }
+    }
+    for (int i = 0; i < 8; ++i)
+        r[i] = w[i];
+}
+
+/// r = t mod p256 for any 16-word t < 2^512, by the fast reduction of FIPS 186-4 D.2.3: 2^(32i)
+/// for i >= 8 rewritten over the words below 2^256, as 8 column sums of signed words. The
+/// remaining carry k * 2^256 has k in [-4, 6].
+[[gnu::noinline]] inline void p256_reduce(w32* r, const w32* c) noexcept
+{
+    const i64 c8 = c[8], c9 = c[9], c10 = c[10], c11 = c[11], c12 = c[12], c13 = c[13], c14 = c[14],
+              c15 = c[15];
+    i64 acc;
+    u32 w[8];
+    acc = i64{c[0]} + c8 + c9 - c11 - c12 - c13 - c14;
+    w[0] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[1]} + c9 + c10 - c12 - c13 - c14 - c15;
+    w[1] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[2]} + c10 + c11 - c13 - c14 - c15;
+    w[2] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[3]} + 2 * (c11 + c12) + c13 - c15 - c8 - c9;
+    w[3] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[4]} + 2 * (c12 + c13) + c14 - c9 - c10;
+    w[4] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[5]} + 2 * (c13 + c14) + c15 - c10 - c11;
+    w[5] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[6]} + 3 * c14 + 2 * c15 + c13 - c8 - c9;
+    w[6] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[7]} + 3 * c15 + c8 - c10 - c11 - c12 - c13;
+    w[7] = static_cast<u32>(acc);
+    p256_finish(r, w, acc >> 32);
+}
+
+/// As p256_reduce for t < 2^288 (c[9..15] == 0): t = lo + c8 * 2^256 = lo + c8 * (2^224 - 2^192 -
+/// 2^96 + 1), with a carry in {-1, 0, 1}.
+[[gnu::noinline]] inline void p256_reduce_short(w32* r, const w32* c) noexcept
+{
+    const i64 c8 = c[8];
+    i64 acc;
+    u32 w[8];
+    acc = i64{c[0]} + c8;
+    w[0] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[1]};
+    w[1] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[2]};
+    w[2] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[3]} - c8;
+    w[3] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[4]};
+    w[4] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[5]};
+    w[5] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[6]} - c8;
+    w[6] = static_cast<u32>(acc);
+    acc >>= 32;
+    acc += i64{c[7]} + c8;
+    w[7] = static_cast<u32>(acc);
+    p256_finish(r, w, acc >> 32);
+}
+
+/// r = t mod (2^256 - 1) for a 16-word t: t = hi * 2^256 + lo = hi + lo.
+[[gnu::noinline]] inline void ones_fold(w32* r, const w32* c) noexcept
+{
+    u32 w[8];
+    u32 carry = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        const u64 s = u64{c[i]} + c[i + 8] + carry;
+        w[i] = static_cast<u32>(s);
+        carry = static_cast<u32>(s >> 32);
+    }
+    // hi + lo <= 2^257 - 2, so the end-around carry cannot carry again. All ones is 0.
+    u32 all = 0xFFFFFFFFu;
+    for (int i = 0; i < 8; ++i)
+    {
+        const u64 s = u64{w[i]} + carry;
+        w[i] = static_cast<u32>(s);
+        carry = static_cast<u32>(s >> 32);
+        all &= w[i];
+    }
+    const u32 keep = all == 0xFFFFFFFFu ? 0 : 0xFFFFFFFFu;
+    for (int i = 0; i < 8; ++i)
+        r[i] = w[i] & keep;
+}
+
+/// r = t mod 2^k = the low k bits of t, for k < 256.
+[[gnu::noinline]] inline void pow2_mask(w32* r, const w32* c, unsigned k) noexcept
+{
+    const unsigned word = k / 32, bit = k % 32;
+    for (unsigned i = 0; i < 8; ++i)
+    {
+        u32 v = c[i];
+        if (i > word || (i == word && bit == 0))
+            v = 0;
+        else if (i == word)
+            v &= (u32{1} << bit) - 1;
+        r[i] = v;
+    }
+}
+
+/// m = x * y % m from the 512-bit product p, into m's slot (m != 0). The moduli the corpus
+/// multiplies by with a sparse form get a closed form in place of the Knuth division: the NIST
+/// P-256 prime, 2^256 - 1 and powers of two. A product below m is its own remainder. Everything
+/// else goes to urem with the product's length, which is scanned here once. All of m is read before
+/// the first store into it, and the closed forms read only p. Every path ends in a tail call, so
+/// there is no frame.
+[[gnu::noinline]] inline void mulmod_reduce(const uint<512>& p, uint<256>& m) noexcept
+{
+    const w32* const pw = reinterpret_cast<const w32*>(&p);
+    w32* const mw = reinterpret_cast<w32*>(&m);
+    // Top down, as a chain of loads and branches: a conjunction of 8 compares compiles to loads
+    // and ors on every call.
+    const size_t len = significant_words<16>(pw);
+    if (len <= 8)
+    {
+        bool below = false;
+        for (int i = 7; i >= 0; --i)
+        {
+            const u32 a = pw[i], b = mw[i];
+            if (a != b)
+            {
+                below = a < b;
+                break;
+            }
+        }
+        if (below)
+        {
+            for (size_t i = 0; i < 8; ++i)
+                mw[i] = pw[i];
+            return;
+        }
+    }
+    const u32 m7 = mw[7];
+    if (m7 == 0xFFFFFFFFu)
+    {
+        if (mw[6] == 1 && (mw[5] | mw[4] | mw[3]) == 0 && (mw[2] & mw[1] & mw[0]) == 0xFFFFFFFFu)
+        {
+            if (len <= 9)
+                p256_reduce_short(mw, pw);
+            else
+                p256_reduce(mw, pw);
+            return;
+        }
+        if ((mw[6] & mw[5] & mw[4] & mw[3] & mw[2] & mw[1] & mw[0]) == 0xFFFFFFFFu)
+        {
+            ones_fold(mw, pw);
+            return;
+        }
+    }
+    else if ((m7 & (m7 - 1)) == 0) [[unlikely]]
+    {
+        // The top word is 0 or a single bit: a power of two if it is the only non-zero word, found
+        // from the top (m7 first: the 2^251 + ... prime of StarkNet has a single bit there).
+        unsigned t = 7;
+        u32 top = m7;
+        u32 low;
+        if (top != 0)
+            low = mw[6] | mw[5] | mw[4] | mw[3] | mw[2] | mw[1] | mw[0];
+        else if ((top = mw[6]) != 0)
+            t = 6, low = mw[5] | mw[4] | mw[3] | mw[2] | mw[1] | mw[0];
+        else if ((top = mw[5]) != 0)
+            t = 5, low = mw[4] | mw[3] | mw[2] | mw[1] | mw[0];
+        else if ((top = mw[4]) != 0)
+            t = 4, low = mw[3] | mw[2] | mw[1] | mw[0];
+        else if ((top = mw[3]) != 0)
+            t = 3, low = mw[2] | mw[1] | mw[0];
+        else if ((top = mw[2]) != 0)
+            t = 2, low = mw[1] | mw[0];
+        else if ((top = mw[1]) != 0)
+            t = 1, low = mw[0];
+        else
+            t = 0, top = mw[0], low = 0;
+        if ((top & (top - 1)) == 0 && low == 0)
+        {
+            pow2_mask(mw, pw, 32 * t + 31 - clz_nonzero(top));
+            return;
+        }
+    }
+    urem(p, len, m, m);
 }
 }  // namespace div32
 #endif
