@@ -900,10 +900,6 @@ typedef uint32_t __attribute__((may_alias)) word32;
 /// one, so a 128-bit scalar has 128/(W+1) non-zero digits on average where its plain NAF has
 /// 128/3. naf must be zeroed (WNAF_LEN digits). Returns the index past the top non-zero digit.
 /// This is libsecp256k1's secp256k1_ecmult_wnaf().
-/// The scalar's words, read from intx values whose words are uint64_t: a named may_alias type
-/// (auto would drop the attribute).
-typedef uint32_t __attribute__((may_alias)) word32;
-
 template <unsigned W, typename Digit>
 unsigned wnaf(Digit* naf, const word32* w) noexcept
 {
