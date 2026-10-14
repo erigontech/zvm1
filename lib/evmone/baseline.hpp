@@ -10,7 +10,8 @@
 #include <cstdlib>
 #include <memory>
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
+    (defined(SP1) && defined(__riscv)) || defined(EVMONE_RV32_DISPATCH_TEST)
 /// JUMPDEST analysis on demand: the scan runs up to the highest jump target checked so far
 /// instead of over the whole code up front (10.7% of the analyzed bytes on mainnet lie past
 /// every target). EVMONE_RV32_DISPATCH_TEST builds it on the host for testing.

@@ -135,8 +135,8 @@ struct InPlaceRegion
     uintptr_t begin = UINTPTR_MAX;
     uintptr_t end = 0;
 };
-// The guest runs one thread; a host test build may run VMs on several.
-#if defined(AIRBENDER)
+// The guests run one thread and have no TLS; a host test build may run VMs on several.
+#if defined(AIRBENDER) || defined(SP1)
 constinit InPlaceRegion in_place_region;
 #else
 constinit thread_local InPlaceRegion in_place_region;
