@@ -344,8 +344,10 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     if (m_rev >= EVMC_AMSTERDAM)
     {
         // EIP-8037: split code deposit into regular and state components.
-        const auto regular_cost = 6 * ((std::ssize(code) + 31) / 32);
-        const auto state_cost = std::ssize(code) * COST_PER_STATE_BYTE;
+        // Unsigned: Airbender's v3 machine has no signed multiply, which a signed widening product
+        // of the code size compiles to on rv32.
+        const auto regular_cost = static_cast<int64_t>(6 * ((uint64_t{code.size()} + 31) / 32));
+        const auto state_cost = static_cast<int64_t>(uint64_t{code.size()} * COST_PER_STATE_BYTE);
         gas_left -= regular_cost;
         if (gas_left < 0 || !state_gas.charge(gas_left, state_cost))
         {

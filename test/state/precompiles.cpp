@@ -103,8 +103,10 @@ PrecompileAnalysis ecpairing_analyze(bytes_view input, evmc_revision rev) noexce
 {
     const auto base_cost = (rev >= EVMC_ISTANBUL) ? 45000 : 100000;
     const auto element_cost = (rev >= EVMC_ISTANBUL) ? 34000 : 80000;
-    const auto num_elements = static_cast<int64_t>(input.size() / 192);
-    return {base_cost + num_elements * element_cost, 32};
+    // Unsigned: Airbender's v3 machine has no signed multiply, which a signed widening product of
+    // these small values compiles to on rv32.
+    const auto num_elements = static_cast<uint64_t>(input.size() / 192);
+    return {static_cast<int64_t>(static_cast<uint64_t>(base_cost) + num_elements * static_cast<uint64_t>(element_cost)), 32};
 }
 
 PrecompileAnalysis blake2bf_analyze(bytes_view input, evmc_revision) noexcept
@@ -254,7 +256,8 @@ PrecompileAnalysis bls12_g1msm_analyze(bytes_view input, evmc_revision) noexcept
     const auto k = input.size() / BLS12_G1_MUL_INPUT_SIZE;
     // assert(k > 0);
     const auto discount = DISCOUNTS[std::min(k, std::size(DISCOUNTS)) - 1];
-    const auto cost = (G1MUL_GAS_COST * discount * static_cast<int64_t>(k)) / 1000;
+    const auto cost =
+        static_cast<int64_t>((uint64_t{G1MUL_GAS_COST} * discount * k) / 1000);  // unsigned: see ecpairing
     return {cost, BLS12_G1_POINT_SIZE};
 }
 
@@ -282,7 +285,8 @@ PrecompileAnalysis bls12_g2msm_analyze(bytes_view input, evmc_revision) noexcept
     const auto k = input.size() / BLS12_G2_MUL_INPUT_SIZE;
     // assert(k > 0);
     const auto discount = DISCOUNTS[std::min(k, std::size(DISCOUNTS)) - 1];
-    const auto cost = (G2MUL_GAS_COST * discount * static_cast<int64_t>(k)) / 1000;
+    const auto cost =
+        static_cast<int64_t>((uint64_t{G2MUL_GAS_COST} * discount * k) / 1000);  // unsigned: see ecpairing
     return {cost, BLS12_G2_POINT_SIZE};
 }
 
@@ -293,12 +297,12 @@ PrecompileAnalysis bls12_pairing_check_analyze(bytes_view input, evmc_revision) 
     if (input.empty() || input.size() % PAIR_SIZE != 0)
         return {GasCostMax, 0};
 
-    const auto npairs = static_cast<int64_t>(input.size()) / PAIR_SIZE;
+    const auto npairs = static_cast<uint64_t>(input.size() / PAIR_SIZE);  // unsigned: see ecpairing
 
     static constexpr auto BLS12_PAIRING_CHECK_BASE_FEE_PRECOMPILE_GAS = 37700;
     static constexpr auto BLS12_PAIRING_CHECK_FEE_PRECOMPILE_GAS = 32600;
-    return {BLS12_PAIRING_CHECK_BASE_FEE_PRECOMPILE_GAS +
-                BLS12_PAIRING_CHECK_FEE_PRECOMPILE_GAS * npairs,
+    return {static_cast<int64_t>(uint64_t{BLS12_PAIRING_CHECK_BASE_FEE_PRECOMPILE_GAS} +
+                                 BLS12_PAIRING_CHECK_FEE_PRECOMPILE_GAS * npairs),
         32};
 }
 
