@@ -1458,7 +1458,23 @@ inline void callvalue(StackTop stack, ExecutionState& state) noexcept
 
 #if defined(__riscv) && !defined(__riscv_zbb)
 // Without a byte-swap instruction an access of unproven alignment is split into byte accesses,
-// and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap.
+// and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap,
+// PUSH data is assembled in big-endian order directly.
+
+/// Big-endian value of the Len bytes at p. The empty asm keeps GCC's bswap pass from taking the
+/// bytes for an unaligned load and a byte swap, which it expands back into a longer shift-and-mask
+/// sequence (as in the rv32 push_data_word()): 3 instructions for each byte after the first.
+template <size_t Len>
+[[gnu::always_inline]] inline uint64_t load_be_bytes(const uint8_t* p) noexcept
+{
+    uint64_t v = p[0];
+    for (size_t i = 1; i < Len; ++i)
+    {
+        asm("" : "+r"(v));
+        v = (v << 8) | p[i];
+    }
+    return v;
+}
 
 [[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
 {
@@ -2119,6 +2135,36 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
             w[k] = 0;
     }
     return d + Len;
+}
+#elif defined(__riscv) && !defined(__riscv_zbb)
+/// PUSH instruction implementation for RISC-V without a byte-swap instruction: each word of the
+/// immediate is assembled in big-endian order straight from its bytes.
+/// @tparam Len The number of push data bytes, e.g. PUSH3 is push<3>.
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    using word_type = uint256::word_type;
+    static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
+    static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
+    static constexpr auto NUM_DATA_WORDS = NUM_FULL_WORDS + (NUM_PARTIAL_BYTES != 0 ? 1 : 0);
+
+    // Each word of the new slot is stored once: pushing zero first leaves dead stores, and a
+    // uint256 built first GCC keeps in a stack temporary for some lengths.
+    auto& r = *stack.end();
+    pos += 1;  // Skip the opcode.
+    if constexpr (NUM_PARTIAL_BYTES != 0)
+    {
+        r[NUM_FULL_WORDS] = load_be_bytes<NUM_PARTIAL_BYTES>(pos);
+        pos += NUM_PARTIAL_BYTES;
+    }
+    for (size_t i = 0; i < NUM_FULL_WORDS; ++i)
+    {
+        r[NUM_FULL_WORDS - 1 - i] = load_be_bytes<sizeof(word_type)>(pos);
+        pos += sizeof(word_type);
+    }
+    for (size_t i = NUM_DATA_WORDS; i < 4; ++i)
+        r[i] = 0;
+    return pos;
 }
 #else
 /// PUSH instruction implementation.
