@@ -79,11 +79,24 @@ size_t scan_jumpdests(JumpdestMap map, const uint8_t* code, size_t from, size_t 
             p += 8;
     }
 #else
-    while (p < end)
+    // Ordinary opcodes dominate, so they are stepped two at a time and share one bound check,
+    // taking them from 4 instructions per byte to 3. p[1] is in bounds because p < end - 1.
+    if (end - p > 1)
     {
-        const auto op = *p;
-        if (op >= OP_JUMPDEST)  // Everything below is neither, including every opcode >= 0x80.
+        const auto* const end1 = end - 1;
+        while (p < end1)
         {
+            auto op = *p;
+            if (op < OP_JUMPDEST)  // Everything below is neither, including every opcode >= 0x80.
+            {
+                op = p[1];
+                if (op < OP_JUMPDEST)  // Both ordinary: one check, two bytes.
+                {
+                    p += 2;
+                    continue;
+                }
+                ++p;
+            }
             if (op >= OP_PUSH1)  // If any PUSH opcode (see explanation above).
             {
                 // Widen before subtracting: left in int, clang narrows the advance back to
@@ -93,7 +106,20 @@ size_t scan_jumpdests(JumpdestMap map, const uint8_t* code, size_t from, size_t 
             }
             if (op == OP_JUMPDEST) [[unlikely]]
                 map.set(static_cast<size_t>(p - base));
+            ++p;
         }
+    }
+
+    while (p < end)  // The last byte, at most one iteration.
+    {
+        const auto op = *p;
+        if (op >= OP_PUSH1)
+        {
+            p += std::ptrdiff_t{op} - OP_PUSH1 + 2;
+            continue;
+        }
+        if (op == OP_JUMPDEST) [[unlikely]]
+            map.set(static_cast<size_t>(p - base));
         ++p;
     }
 #endif
