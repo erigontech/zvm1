@@ -39,6 +39,10 @@ struct StateDiff
 
         /// The StateView's handle for the account (Account::view_handle), null if none.
         const void* view_handle = nullptr;
+
+        /// The Keccak-256 of code, where the State computed it as it set the code (build_diff() always sets it
+        /// with code), so that a consumer of the diff need not hash the code again. Empty if not known.
+        std::optional<bytes32> code_hash;
     };
 
     /// List of modified or created accounts.

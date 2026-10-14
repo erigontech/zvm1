@@ -437,10 +437,14 @@ StateDiff State::build_diff(evmc_revision rev) const
         auto& a = diff.modified_accounts.emplace_back(StateDiff::Entry{addr, m.nonce, m.balance});
         a.view_handle = m.view_handle;
 
-        // Output only the new code.
-        // TODO: Output also the code hash. It will be needed for DB update and MPT hash.
+        // Output only the new code, with its hash: every place that changes the code sets code_hash to
+        // keccak256(code) with it (Host::create(), the EIP-7702 delegation and its clearing), and a journal
+        // revert restores both.
         if (m.code_changed)
+        {
             a.code = m.code;
+            a.code_hash = m.code_hash;
+        }
 
         for (const auto& [k, v] : m.storage)
         {
