@@ -17,13 +17,6 @@ namespace evmone::state
 {
 namespace
 {
-/// EIP-8037: set the state-gas fields on a returned Result. `used` is not stored;
-/// the caller derives it as `initial - left + spilled`.
-void set_state_gas(evmc::Result& r, int64_t left, int64_t spilled) noexcept
-{
-    r.state_gas = {.left = left, .spilled = spilled};
-}
-
 /// Whether the message runs the code of its recipient: msg.code_address == msg.recipient.
 bool runs_recipient_code(const evmc_message& msg) noexcept
 {
@@ -90,10 +83,6 @@ bool runs_recipient_code(const evmc_message& msg) noexcept
             status = EVMC_STORAGE_MODIFIED_RESTORED;  // X → Y → X
     }
 
-    // Journal the value change. From Berlin onward access_storage() journals the
-    // access-status transition separately via JournalStorageAccess so the warm
-    // flag and the slot value can roll back independently (EIP-7928 needs the
-    // warm bit to survive certain reverts that discard the value).
     state.journal_storage_change(storage_slot);
     storage_slot.current = value;  // Update current value.
     return status;
@@ -102,8 +91,8 @@ bool runs_recipient_code(const evmc_message& msg) noexcept
 
 bool Host::account_exists(const address& addr) const noexcept
 {
-    const auto* const acc = m_state.find(addr);
-    return acc != nullptr && (m_rev < EVMC_SPURIOUS_DRAGON || !acc->is_empty());
+    const auto& acc = m_state.get(addr);
+    return !acc.nonexistent && (m_rev < EVMC_SPURIOUS_DRAGON || !acc.is_empty());
 }
 
 bytes32 Host::get_storage(const address& addr, const bytes32& key) const noexcept
@@ -114,19 +103,18 @@ bytes32 Host::get_storage(const address& addr, const bytes32& key) const noexcep
 evmc_storage_status Host::set_storage(
     const address& addr, const bytes32& key, const bytes32& value) noexcept
 {
+    assert(!m_state.get(addr).nonexistent);
     return update_storage(m_state, m_state.get_storage(addr, key), value);
 }
 
 uint256be Host::get_balance(const address& addr) const noexcept
 {
-    const auto* const acc = m_state.find(addr);
-    return (acc != nullptr) ? intx::be::store<uint256be>(acc->balance) : uint256be{};
+    return intx::be::store<uint256be>(m_state.get(addr).balance);
 }
 
 uint64_t Host::get_nonce(const address& addr) const noexcept
 {
-    const auto* const acc = m_state.find(addr);
-    return (acc != nullptr) ? acc->nonce : 0;
+    return m_state.get(addr).nonce;
 }
 
 namespace
@@ -161,11 +149,11 @@ size_t Host::get_code_size(const address& addr) const noexcept
 
 bytes32 Host::get_code_hash(const address& addr) const noexcept
 {
-    const auto* const acc = m_state.find(addr);
-    if (acc == nullptr || acc->is_empty())
+    const auto& acc = m_state.get(addr);
+    if (acc.is_empty())
         return {};
 
-    return acc->code_hash;
+    return acc.code_hash;
 }
 
 size_t Host::copy_code(const address& addr, size_t code_offset, uint8_t* buffer_data,
@@ -180,14 +168,13 @@ size_t Host::copy_code(const address& addr, size_t code_offset, uint8_t* buffer_
 
 bool Host::selfdestruct(const address& addr, const address& beneficiary) noexcept
 {
-    if (m_state.find(beneficiary) == nullptr)
-        m_state.journal_new_account(beneficiary);
     auto& acc = m_state.get(addr);
+    assert(!acc.nonexistent);
     const auto balance = acc.balance;
     auto& beneficiary_acc = m_state.touch(beneficiary);
 
-    m_state.journal_balance_change(beneficiary, beneficiary_acc.balance);
-    m_state.journal_balance_change(addr, balance);
+    m_state.journal_balance_change(beneficiary_acc);
+    m_state.journal_balance_change(acc);
 
     if (m_rev >= EVMC_CANCUN && !acc.just_created)
     {
@@ -219,7 +206,7 @@ bool Host::selfdestruct(const address& addr, const address& beneficiary) noexcep
     // Mark the destruction if not done already.
     if (!acc.destructed)
     {
-        m_state.journal_account_flags(addr, acc);
+        m_state.journal_account_flags(acc);
         acc.destructed = true;
         return true;
     }
@@ -231,45 +218,31 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     assert(msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2);
     assert(msg.recipient != address{});  // Must be computed already.
 
-    // TODO: find()+insert() probes m_modified twice for a new recipient.
-    auto* new_acc = m_state.find(msg.recipient);
-    // EIP-8037 (EELS #3126): the created account's NEW_ACCOUNT state gas is charged at this access
-    // when the deployment address's leaf is empty (per EIP-161). Captured before any mutation.
-    const bool target_empty = new_acc == nullptr || new_acc->is_empty();
-    if (new_acc == nullptr)
+    auto [new_acc, created] = m_state.get_or_create(msg.recipient);
+    if (!created)
     {
-        new_acc = &m_state.insert(msg.recipient);
-        m_state.journal_new_account(msg.recipient);
-    }
-    else
-    {
-        if (is_create_collision(*new_acc))
-        {
-            auto r = evmc::Result{EVMC_FAILURE};  // TODO: Add EVMC errors for creation failures.
-            // Preserve reservoir so the parent (or transition() at depth 0) can refund
-            // any unused state gas. No execution happened, so the derived state gas
-            // used is 0.
-            r.state_gas.left = msg.state_gas;
-            return r;
-        }
-        m_state.journal_create(msg.recipient);
+        // TODO: Add EVMC errors for creation failures.
+        if (is_create_collision(new_acc))
+            return evmc::Result{EVMC_FAILURE, {.left = msg.state_gas}};
+        m_state.journal_create(new_acc);
     }
 
-    //assert(new_acc != nullptr);
-    //assert(new_acc->nonce == 0);
+    //assert(new_acc.nonce == 0);
+    assert(!new_acc.just_created && !new_acc.code_changed);  // The create rollback clears them.
 
     if (m_rev >= EVMC_SPURIOUS_DRAGON)
-        new_acc->nonce = 1;  // No need to journal: create revert will 0 the nonce.
+        new_acc.nonce = 1;  // No need to journal: create revert will 0 the nonce.
 
-    new_acc->just_created = true;
+    new_acc.just_created = true;
 
     auto& sender_acc = m_state.get(msg.sender);  // TODO: Duplicated account lookup.
+    assert(!sender_acc.nonexistent);
     const auto value = intx::be::load<intx::uint256>(msg.value);
     //assert(sender_acc.balance >= value && "EVM must guarantee balance");
-    m_state.journal_balance_change(msg.sender, sender_acc.balance);
-    m_state.journal_balance_change(msg.recipient, new_acc->balance);
+    m_state.journal_balance_change(sender_acc);
+    m_state.journal_balance_change(new_acc);
     sender_acc.balance -= value;
-    new_acc->balance += value;  // The new account may be prefunded.
+    new_acc.balance += value;  // The new account may be prefunded.
 
     if (m_rev >= EVMC_AMSTERDAM)
         emit_transfer_log(m_logs, msg.sender, msg.recipient, value);
@@ -277,44 +250,10 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     auto create_msg = msg;
     create_msg.input_data = nullptr;
     create_msg.input_size = 0;
-
-    // EIP-8037 charge-at-access (EELS #3126): the depth-0 tx-level create charges the created
-    // account's NEW_ACCOUNT state gas here (the opcode CREATE charges it in create_impl). Draw from
-    // the reservoir, spilling into the frame's regular gas; refunded below if no account persists.
-    bool new_account_charged = false;
-    int64_t new_account_spilled = 0;    // Portion drawn from the frame's regular gas.
-    int64_t new_account_reservoir = 0;  // Portion drawn from the state-gas reservoir.
-    if (m_rev >= EVMC_AMSTERDAM && msg.depth == 0 && target_empty)
-    {
-        StateGas sg{{.left = create_msg.state_gas}};
-        if (!sg.charge(create_msg.gas, NEW_ACCOUNT_STATE_GAS))
-        {
-            auto r = evmc::Result{EVMC_OUT_OF_GAS};
-            r.state_gas.left = msg.state_gas;  // no account created: refill the entry reservoir
-            return r;
-        }
-        new_account_charged = true;
-        new_account_spilled = sg.spilled;
-        new_account_reservoir = create_msg.state_gas - sg.left;
-        create_msg.state_gas = sg.left;
-    }
-
     const bytes_view initcode{msg.input_data, msg.input_size};
     auto result = m_vm.execute(*this, m_rev, create_msg, initcode.data(), initcode.size());
     if (result.status_code != EVMC_SUCCESS)
-    {
-        // No account created: refund the NEW_ACCOUNT charge. The reservoir portion is always
-        // restored (no state persisted); the spilled portion returns to gas only on a revert — an
-        // exceptional halt consumes it as regular gas (matches EELS refill_frame_state_gas then
-        // gas_left = 0). The initcode frame already refilled its own state gas at its boundary.
-        if (new_account_charged)
-        {
-            result.state_gas.left += new_account_reservoir;
-            if (result.status_code == EVMC_REVERT)
-                result.gas_left += new_account_spilled;
-        }
         return result;
-    }
 
     auto gas_left = result.gas_left;
     //assert(gas_left >= 0);
@@ -323,148 +262,79 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
     const size_t max_code_size = m_rev >= EVMC_AMSTERDAM ? MAX_CODE_SIZE_AMSTERDAM : MAX_CODE_SIZE;
     if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > max_code_size)
-    {
-        auto r = evmc::Result{EVMC_FAILURE};
-        r.state_gas.left = msg.state_gas;  // refill the full reservoir (nothing persists)
-        return r;
-    }
+        return evmc::Result{EVMC_FAILURE, {.left = msg.state_gas}};
 
     // Reject new contract code starting with the 0xEF byte (EIP-3541).
     if (m_rev >= EVMC_LONDON && code.starts_with(0xEF))
-    {
-        auto r = evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE};
-        r.state_gas.left = msg.state_gas;  // refill the full reservoir (nothing persists)
-        return r;
-    }
+        return evmc::Result{EVMC_CONTRACT_VALIDATION_FAILURE, {.left = msg.state_gas}};
 
-    // Code deployment cost. Continue the init frame's state gas (left + spill), carrying the
-    // NEW_ACCOUNT charge's spill so the created account's state gas is reported on success.
-    StateGas state_gas{{.left = result.state_gas.left,
-        .spilled = new_account_spilled + result.state_gas.spilled}};
+    StateGas state_gas{result.state_gas};  // The initcode's state-gas for code deposit.
     if (m_rev >= EVMC_AMSTERDAM)
     {
-        // EIP-8037: split code deposit into regular and state components.
+        // The code deposit splits into an execution-gas and a state-gas component (EIP-8037).
         // Unsigned: Airbender's v3 machine has no signed multiply, which a signed widening product
         // of the code size compiles to on rv32.
-        const auto regular_cost = static_cast<int64_t>(6 * ((uint64_t{code.size()} + 31) / 32));
+        const auto execution_cost = static_cast<int64_t>(6 * ((uint64_t{code.size()} + 31) / 32));
         const auto state_cost = static_cast<int64_t>(uint64_t{code.size()} * COST_PER_STATE_BYTE);
-        gas_left -= regular_cost;
+        gas_left -= execution_cost;
         if (gas_left < 0 || !state_gas.charge(gas_left, state_cost))
-        {
-            auto r = evmc::Result{EVMC_FAILURE};
-            r.state_gas.left = msg.state_gas;  // refill the full reservoir (nothing persists)
-            return r;
-        }
+            return evmc::Result{EVMC_FAILURE, {.left = msg.state_gas}};
     }
     else
     {
+        // Code deployment cost.
         const auto cost = std::ssize(code) * 200;
         gas_left -= cost;
         if (gas_left < 0)
         {
-            if (m_rev == EVMC_FRONTIER)
-            {
-                auto r = evmc::Result{EVMC_SUCCESS, result.gas_left, result.gas_refund};
-                set_state_gas(r, state_gas.left, state_gas.spilled);
-                return r;
-            }
-            auto r = evmc::Result{EVMC_FAILURE};
-            r.state_gas.left = msg.state_gas;  // refill on failure
-            return r;
+            return (m_rev == EVMC_FRONTIER) ?
+                       evmc::Result{EVMC_SUCCESS, result.gas_left, result.gas_refund} :
+                       evmc::Result{EVMC_FAILURE, {.left = msg.state_gas}};
         }
     }
 
     if (!code.empty())
     {
-        new_acc->code_hash = keccak256(code);
-        new_acc->code = code;
-        new_acc->code_changed = true;
-        m_state.add_changed_code_address(new_acc->code_hash, msg.recipient);
+        new_acc.code_hash = keccak256(code);
+        new_acc.code = code;
+        new_acc.code_changed = true;
+        m_state.add_changed_code_address(new_acc.code_hash, msg.recipient);
     }
 
-    auto r = evmc::Result{result.status_code, gas_left, result.gas_refund};
-    set_state_gas(r, state_gas.left, state_gas.spilled);
-    return r;
+    return evmc::Result{result.status_code, gas_left, result.gas_refund, state_gas};
 }
 
-evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
+evmc::Result Host::execute_message(const evmc_message& msg) noexcept
 {
-    if (msg_in.kind == EVMC_CREATE || msg_in.kind == EVMC_CREATE2)
-        return create(msg_in);
+    if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2)
+        return create(msg);
 
-    // The message is read-only here except that the depth-0 state-gas charge below can spill
-    // into its gas; only then is it copied (144 bytes, per call frame otherwise).
-    const evmc_message* msg_ptr = &msg_in;
-    evmc_message msg_copy;
-
-    // EIP-8037: the top-level (depth 0) NEW_ACCOUNT state charge, which EIP-2780 makes a
-    // top-level value transfer pay, applied after the EIP-7702 authorizations and before the
-    // value transfer or any opcode, evaluated against the pre-transfer recipient state.
-    // Charged here, not in the interpreter, because a value transfer to a new account runs no code
-    // and so never enters the VM. An OOG returns failure; the value transfer performed below is
-    // then rolled back at Host::call's revert boundary.
-    // EIP-8037: `msg.state_gas` stays the entry reservoir; `top_level_sg` holds the post-charge
-    // pools (left/spilled) so a consuming path can commit the NEW_ACCOUNT charge on success or
-    // refund it on failure. `used` is always derived as `msg.state_gas - left + spilled`.
-    StateGas top_level_sg{{.left = msg_in.state_gas}};
-    // Builds the failure result for a pre-execution charge OOG: all regular gas
-    // is consumed and the entry reservoir is returned intact.
-    const auto out_of_gas_result = [&msg_in] {
-        evmc::Result r{EVMC_OUT_OF_GAS, 0};
-        r.state_gas.left = msg_in.state_gas;
-        return r;
-    };
-    if (m_rev >= EVMC_AMSTERDAM && msg_in.depth == 0)
-    {
-        const auto* const recipient_acc = m_state.find(msg_in.recipient);
-        const auto recipient_alive = recipient_acc != nullptr && !recipient_acc->is_empty();
-        if (!evmc::is_zero(msg_in.value) && !recipient_alive)
-        {
-            msg_copy = msg_in;
-            msg_ptr = &msg_copy;
-            // A new account is materialized by the value transfer: pay NEW_ACCOUNT state gas.
-            // This includes a previously-zero-balance precompile (EIP-161): funding it
-            // creates a state account just like any other recipient. transition() has pre-checked
-            // that the reservoir plus regular gas cover this, rolling authorizations back
-            // otherwise.
-            if (!top_level_sg.charge(msg_copy.gas, NEW_ACCOUNT_STATE_GAS))
-                return out_of_gas_result();  // Reservoir untouched (atomic charge failure).
-        }
-        // The EIP-7702 delegated-recipient code-read access is charged at the top frame in
-        // transition() (WARM_ACCESS or COLD_ACCOUNT_ACCESS by the target's warmth).
-    }
-    const evmc_message& msg = *msg_ptr;
-
-    // The recipient's account of a call, which exists from here on: both branches insert it.
-    Account* recipient_acc = nullptr;
+    // The recipient's account of a call: both branches get it.
+    Account* recipient_acc_ptr = nullptr;
     if (msg.kind == EVMC_CALL)
     {
-        recipient_acc = m_state.find(msg.recipient);
-        if (recipient_acc == nullptr)
-            m_state.journal_new_account(msg.recipient);
-        // TODO: Both branches will insert new account so better to do it in common path.
-
         if (evmc::is_zero(msg.value))
         {
-            recipient_acc = &m_state.touch(msg.recipient);
+            recipient_acc_ptr = &m_state.touch(msg.recipient);
         }
         else
         {
             // We skip touching if we send value, because account cannot end up empty.
             // It will either have value, or code that transfers this value out, or will be
             // selfdestructed anyway.
-            if (recipient_acc == nullptr)
-                recipient_acc = &m_state.insert(msg.recipient);
+            auto& recipient_acc = m_state.get_or_create(msg.recipient).first;
+            recipient_acc_ptr = &recipient_acc;
 
             // Transfer value: sender → recipient.
             // The sender's balance is already checked therefore the sender account must exist.
             const auto value = intx::be::load<intx::uint256>(msg.value);
             auto& sender_acc = m_state.get(msg.sender);
+            assert(!sender_acc.nonexistent);
             assert(sender_acc.balance >= value);
-            m_state.journal_balance_change(msg.sender, sender_acc.balance);
-            m_state.journal_balance_change(msg.recipient, recipient_acc->balance);
+            m_state.journal_balance_change(sender_acc);
+            m_state.journal_balance_change(recipient_acc);
             sender_acc.balance -= value;
-            recipient_acc->balance += value;
+            recipient_acc.balance += value;
 
             if (m_rev >= EVMC_AMSTERDAM)
                 emit_transfer_log(m_logs, msg.sender, msg.recipient, value);
@@ -473,62 +343,29 @@ evmc::Result Host::execute_message(const evmc_message& msg_in) noexcept
 
     // Calls to precompile address via EIP-7702 delegation execute empty code instead of precompile.
     if ((msg.flags & EVMC_DELEGATED) == 0 && is_precompile(m_rev, msg.code_address))
-    {
-        auto r = call_precompile(m_rev, msg);
-        // EIP-8037/2780: precompiles consume no execution state gas, but a value transfer funding a
-        // zero-balance precompile paid NEW_ACCOUNT state gas above (top_level_sg). On success the
-        // account persists, so commit the charge (it lands in the block state dimension). On an
-        // exceptional-halt failure nothing persists, so refund it by restoring the entry reservoir,
-        // exactly as a normal frame does on halt — the derived net state used is then 0. Any
-        // spilled portion was taken from msg.gas and is burned with the failed call's gas.
-        if (r.status_code == EVMC_SUCCESS)
-            set_state_gas(r, top_level_sg.left, top_level_sg.spilled);
-        else
-            r.state_gas.left = msg.state_gas;
-        return r;
-    }
+        return call_precompile(m_rev, msg);
 
-    // A call that runs the recipient's own code (not a delegated one) has its account already:
-    // find() would return the same entry, loaded as touch() and insert() leave it, and the node
-    // stays where it is through the inserts since.
-    const auto code_acc = (msg.kind == EVMC_CALL && runs_recipient_code(msg)) ?
-                              recipient_acc :
-                              m_state.find(msg.code_address);
-    if (code_acc == nullptr || code_acc->code_hash == Account::EMPTY_CODE_HASH)
-    {
-        auto r = evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
-        // EIP-8037: like the empty-code path below, commit the depth-0 NEW_ACCOUNT
-        // state-gas pools charged above (no-op when nothing was charged) - else the
-        // charge is lost and the EIP-7778 block state dimension comes out short.
-        set_state_gas(r, top_level_sg.left, top_level_sg.spilled);
-        return r;
-    }
+    // A call that runs the recipient's own code (not a delegated one) has its account already,
+    // and the node stays where it is through the inserts since.
+    const auto& code_acc = (msg.kind == EVMC_CALL && runs_recipient_code(msg)) ?
+                               *recipient_acc_ptr :
+                               m_state.get(msg.code_address);
+    // A nonexistent account has the empty code hash, so it needs no separate check.
+    if (code_acc.code_hash == Account::EMPTY_CODE_HASH)  // Skip trivial execution.
+        return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     if (my_vm->has_cached_execution())
     {
-        return my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
+        return my_vm->execute_cached_code(*this, m_rev, msg, code_acc.code_hash,
             [this](const address& addr) { return m_state.get_code(addr); });
     }
 
     // TODO: get_code() performs the account lookup. Add a way to get an account with code?
     const auto code = m_state.get_code(msg.code_address);
-    if (code.empty())
-    {
-        auto r = evmc::Result{EVMC_SUCCESS, msg.gas};  // Skip trivial execution.
-        // EIP-8037: an empty-code call consumes no execution state gas, but a depth-0 value
-        // transfer to a new account runs no code and still paid NEW_ACCOUNT above — commit
-        // those pools (a no-op when nothing was charged); the caller derives the net used.
-        set_state_gas(r, top_level_sg.left, top_level_sg.spilled);
-        return r;
-    }
+    if (code.empty())  // Skip trivial execution.
+        return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
-    // EIP-8037: the depth-0 charge cannot reach here — it implies a non-alive recipient, which
-    // has empty code and returns above. Assert that instead of guessing the carry-out: EELS
-    // refills this charge when the frame fails (it is charged after commit_state_gas), while the
-    // EIP-7702 authorization charges EIP-2780 adds alongside it must survive a failure, so the
-    // two need to be told apart deliberately rather than both carried out.
-    assert(top_level_sg.left == msg.state_gas && top_level_sg.spilled == 0);
     return m_vm.execute(*this, m_rev, msg, code.data(), code.size());
 }
 
@@ -538,8 +375,9 @@ evmc::Result Host::call(const evmc_message& msg) noexcept
     {
         // Bump the creator's nonce (already done for depth 0). Not reverted if creation fails.
         auto& sender_acc = m_state.get(msg.sender);
+        assert(!sender_acc.nonexistent);
         assert(sender_acc.nonce != MAX_NONCE);
-        m_state.journal_bump_nonce(msg.sender);
+        m_state.journal_bump_nonce(sender_acc);
         ++sender_acc.nonce;
     }
 
@@ -550,28 +388,21 @@ evmc::Result Host::call(const evmc_message& msg) noexcept
 
     if (result.status_code != EVMC_SUCCESS)
     {
+        assert(result.state_gas.left == msg.state_gas);
+        assert(result.state_gas.spilled == 0);
+
         // The 0x03 (RIPEMD-160) touch quirk: a touch on this address is
         // never reverted. It only matters when the account is empty, so gate it by rev range.
         static constexpr auto ADDR_03 = 0x03_address;
-        bool is_03_touched = false;
-        if (m_rev < EVMC_PARIS && m_rev >= EVMC_SPURIOUS_DRAGON) [[unlikely]]
-        {
-            // Check only the in-tx modified set — a cold fetch would surface the
-            // address to access hooks (e.g. EIP-7928 BAL trackers) even though the
-            // probe is purely an implementation detail of the revert logic.
-            const auto* const acc_03 = m_state.find_modified(ADDR_03);
-            is_03_touched = acc_03 != nullptr && acc_03->erase_if_empty;
-        }
+        const bool is_03_touched = m_rev < EVMC_PARIS && m_rev >= EVMC_SPURIOUS_DRAGON &&
+                                   m_state.get(ADDR_03).erase_if_empty;
 
         // Revert.
         m_state.rollback(state_checkpoint);
         m_logs.resize(logs_checkpoint);
 
-        // Use the access-list insertion path so the re-touch doesn't surface
-        // the address to BAL trackers (EIP-7928) — the probe is evmone-internal
-        // and does not represent a genuine state access.
         if (is_03_touched) [[unlikely]]
-            m_state.get_or_insert_for_access(ADDR_03).erase_if_empty = true;
+            m_state.touch(ADDR_03);
     }
     return result;
 }
@@ -588,19 +419,19 @@ evmc_tx_context Host::get_tx_context() const noexcept
     const auto effective_gas_price = m_block.base_fee + priority_gas_price;
 
     m_tx_context = evmc_tx_context{
-        intx::be::store<uint256be>(effective_gas_price),  // By EIP-1559.
-        m_tx.sender,
-        m_block.coinbase,
-        m_block.number,
-        m_block.timestamp,
-        m_block.gas_limit,
-        m_block.prev_randao,
-        uint256be{m_block.chain_id},
-        uint256be{m_block.base_fee},
-        intx::be::store<uint256be>(m_block.blob_base_fee.value_or(0)),
-        m_tx.blob_hashes.data(),
-        m_tx.blob_hashes.size(),
-        m_block.slot_number.value_or(0),
+        .tx_gas_price = intx::be::store<uint256be>(effective_gas_price),  // By EIP-1559.
+        .tx_origin = m_tx.sender,
+        .block_coinbase = m_block.coinbase,
+        .block_number = m_block.number,
+        .block_timestamp = m_block.timestamp,
+        .block_gas_limit = m_block.gas_limit,
+        .block_prev_randao = m_block.prev_randao,
+        .chain_id = uint256be{m_block.chain_id},
+        .block_base_fee = uint256be{m_block.base_fee},
+        .blob_base_fee = intx::be::store<uint256be>(m_block.blob_base_fee.value_or(0)),
+        .blob_hashes = m_tx.blob_hashes.data(),
+        .blob_hashes_count = m_tx.blob_hashes.size(),
+        .block_slot_number = m_block.slot_number.value_or(0),
     };
     m_tx_context_set = true;
     return m_tx_context;
@@ -630,39 +461,22 @@ evmc_access_status Host::access_account(const address& addr) noexcept
     if (is_precompile(m_rev, addr))  // Precompiles are always warm. Don't insert to state.
         return EVMC_ACCESS_WARM;
 
-    // Use the "for access" insertion variant: lazy placeholder without a
-    // StateView fetch (keeps trackers from observing accesses that may end up
-    // reverted, per EIP-7928 BAL semantics).
-    auto& acc = m_state.get_or_insert_for_access(addr);
+    auto& acc = m_state.access(addr);
     if (acc.access_status == EVMC_ACCESS_WARM)
         return EVMC_ACCESS_WARM;
 
-    m_state.journal_account_flags(addr, acc);
+    m_state.journal_account_flags(acc);
     acc.access_status = EVMC_ACCESS_WARM;
     return EVMC_ACCESS_COLD;
 }
 
 evmc_access_status Host::access_storage(const address& addr, const bytes32& key) noexcept
 {
-    // Warm the slot without fetching its value from the underlying StateView.
-    // Deferring the fetch to State::get_storage() (which runs after the SLOAD
-    // gas check) keeps the cold-read observable only when the read actually
-    // commits, which matches EIP-7928 BAL semantics. The journal only captures
-    // the access-status change — the value itself (current/original) is managed
-    // by subsequent get_storage()/set_storage() calls and their own journaling.
-    //
-    // Invariant: `m_state.get(addr)` asserts the account is already loaded.
-    // SLOAD/SSTORE always operate on `state.msg->recipient`, whose code was
-    // already loaded by execute_message() before the opcode dispatch, so
-    // `find(addr)` is guaranteed to have succeeded. Any future opcode that
-    // calls `access_storage` on a non-recipient address must lazy-load first
-    // (e.g. via `m_state.find(addr)` and the placeholder upgrade path).
-    auto& acc = m_state.get(addr);
-    const auto [it, fresh] = acc.storage.try_emplace(key);
-    if (it->second.access_status == EVMC_ACCESS_WARM)
+    auto& storage_slot = m_state.access_storage(addr, key);
+    if (storage_slot.access_status == EVMC_ACCESS_WARM)
         return EVMC_ACCESS_WARM;  // Nothing changes, skip journaling.
-    it->second.access_status = EVMC_ACCESS_WARM;
-    m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
+    m_state.journal_storage_change(storage_slot);
+    storage_slot.access_status = EVMC_ACCESS_WARM;
     return EVMC_ACCESS_COLD;
 }
 
@@ -671,14 +485,14 @@ const evmc_bytes32* Host::sload(const address& addr, const bytes32& key, int64_t
 {
     // access_storage() and get_storage() on one lookup of the account and of the slot (node
     // references are stable and nothing inserts between the two parts).
-    auto& acc = m_state.get(addr);
-    const auto [it, fresh] = acc.storage.try_emplace(key);
-    auto& slot = it->second;
+    auto& acc = m_state.access(addr);
+    assert(acc.loaded);  // The storage of the executing account, loaded to run its code.
+    auto& slot = acc.storage[key];
     if (slot.access_status != EVMC_ACCESS_WARM)
     {
+        m_state.journal_storage_change(slot);
         slot.access_status = EVMC_ACCESS_WARM;
-        m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
-        // Out of gas returns before the fetch: a witness may omit a slot that is never read.
+        // Out of gas returns before the load: a witness may omit a slot that is never read.
         if ((gas_left -= cold_cost) < 0)
             return nullptr;
     }
@@ -691,16 +505,14 @@ evmc_storage_status Host::sstore(const address& addr, const bytes32& key, const 
     evmc_access_status& access) noexcept
 {
     // access_storage() and set_storage() on one lookup of the account and of the slot, see sload().
-    auto& acc = m_state.get(addr);
-    const auto [it, fresh] = acc.storage.try_emplace(key);
-    auto& slot = it->second;
-    access = slot.access_status == EVMC_ACCESS_WARM ? EVMC_ACCESS_WARM : EVMC_ACCESS_COLD;
+    auto& acc = m_state.access(addr);
+    assert(acc.loaded && !acc.nonexistent);
+    auto& slot = acc.storage[key];
+    access = slot.access_status;
     if (access == EVMC_ACCESS_COLD)
     {
+        m_state.journal_storage_change(slot);
         slot.access_status = EVMC_ACCESS_WARM;
-        // The access entry goes first: reverting it erases a fresh slot, which the change entry
-        // journaled below points to.
-        m_state.journal_storage_access(addr, key, EVMC_ACCESS_COLD, fresh);
     }
     if (!slot.loaded)
         m_state.load_storage(addr, acc.view_handle, key, slot);
@@ -718,7 +530,9 @@ evmc::bytes32 Host::get_transient_storage(const address& addr, const bytes32& ke
 void Host::set_transient_storage(
     const address& addr, const bytes32& key, const bytes32& value) noexcept
 {
-    auto& slot = m_state.get(addr).transient_storage[key];
+    auto& acc = m_state.get(addr);
+    assert(!acc.nonexistent);
+    auto& slot = acc.transient_storage[key];
     m_state.journal_transient_storage_change(slot);
     slot = value;
 }

@@ -115,18 +115,10 @@ void t8n(evmc::VM& vm, const T8NArgs& args)
             }
         }
 
-        // PoS forks have no mining reward; fill always passes `--state.reward=0`
-        // for Paris+ because `fork.get_reward()` returns 0. Translate that to
-        // nullopt to mirror evmone-blockchaintest's `mining_reward(rev)` — passing
-        // `optional{0}` would otherwise let `state::finalize` touch the coinbase
-        // with a +0 delta and leak it into the BAL (EIP-7928 spec: coinbase must
-        // not appear in an empty block's BAL).
-        const auto reward_for_finalize = (rev >= EVMC_PARIS && args.block_reward.value_or(0) == 0) ?
-                                             std::optional<uint64_t>{} :
-                                             args.block_reward;
-
+        // No block reward from Paris (EIP-3675). A reward of 0 would still touch the coinbase,
+        // which would then be read (EIP-7928).
         auto res = apply_block(state, vm, block, block_hashes, txs, rev, blob_gas_limit,
-            {.block_reward = reward_for_finalize,
+            {.block_reward = rev < EVMC_PARIS ? args.block_reward : std::nullopt,
                 .skip_system_calls = args.pre_state_only,
                 .open_trace = args.open_trace});
 
@@ -179,13 +171,7 @@ void t8n(evmc::VM& vm, const T8NArgs& args)
             requests = std::move(res.requests);
 
         receipts = std::move(res.receipts);
-        // EIP-8037/7778: header gasUsed = max(sum_regular, sum_state) for Amsterdam+
-        // (`res.gas_used` carries that block-level value). Pre-Amsterdam, preserve the
-        // legacy cumulative transaction gas (refunds excluded).
-        if (rev >= EVMC_AMSTERDAM)
-            gas_used = res.gas_used;
-        else if (!receipts.empty())
-            gas_used = receipts.back().cumulative_gas_used;
+        gas_used = res.gas_used;
         bloom = res.bloom;
         blob_gas_left = res.blob_gas_left;
         post_state = std::move(res.block_state);
@@ -195,15 +181,12 @@ void t8n(evmc::VM& vm, const T8NArgs& args)
 
         if (!args.pre_state_only && rev >= EVMC_AMSTERDAM)
         {
-            // EIP-7928: emit RLP-encoded BlockAccessList plus its hash. The test
-            // framework recomputes the hash from `blockAccessList` and cross-checks
-            // it against `blockAccessListHash` (copied into the fixture header).
             j_result["blockAccessList"] = hex0x(res.block_access_list.rlp_encode());
             j_result["blockAccessListHash"] = hex0x(res.block_access_list.hash());
-            // EIP-7928 consensus rule: `bal_items <= block_gas_limit / 2000`. Signal
-            // the block as invalid for fill so it can match the expected exception.
-            if (res.block_access_list.exceeds_gas_limit(static_cast<uint64_t>(block.gas_limit)))
-                j_result["blockException"] = "block access list exceeds gas limit";
+            // The requests are processed first, so their failure takes precedence.
+            if (!res.requests_error &&
+                res.block_access_list.exceeds_gas_limit(static_cast<uint64_t>(block.gas_limit)))
+                j_result["blockException"] = "BlockException.BLOCK_ACCESS_LIST_GAS_LIMIT_EXCEEDED";
         }
     }
     else

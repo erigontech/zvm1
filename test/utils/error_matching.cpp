@@ -44,9 +44,6 @@ constexpr AlternativeExceptions ALTERNATIVE_TX_EXCEPTIONS[]{
     // than the v rule; narrowing it needs the decoder to report the v domain separately.
     {state::INVALID_ENCODING, "TransactionException.INVALID_SIGNATURE_VRS"},
 
-    // A transaction whose gas limit exceeds the block's remaining gas is a transaction rule to
-    // evmone and a block rule to the specs, which count it into the header's gas used.
-    {state::GAS_ALLOWANCE_EXCEEDED, "BlockException.GAS_USED_OVERFLOW"},
 };
 
 /// The same, for the rules evmone checks on the block rather than the transaction.

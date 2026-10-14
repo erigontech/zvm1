@@ -65,9 +65,6 @@ constexpr std::array REQUESTS_SYSTEM_CONTRACTS{
         CONSOLIDATION_REQUEST_ADDRESS,
         Requests::Type::consolidation,
     },
-    // EIP-8282: builder execution requests. Run at block end after the EIP-7002/7251 contracts;
-    // accessed every block (so they appear in the EIP-7928 block access list) and produce
-    // type-0x03 / type-0x04 requests when their return data is non-empty.
     RequestsSystemContract{
         EVMC_AMSTERDAM,
         BUILDER_DEPOSIT_CONTRACT_ADDRESS,
@@ -87,28 +84,14 @@ static_assert(std::ranges::is_sorted(REQUESTS_SYSTEM_CONTRACTS, by_rev),
     "system contract entries must be ordered by revision");
 
 
-/// Cap on the number of SSTOREs a system contract may need to fund out of its
-/// state-gas budget under EIP-8037. The bal-720 `system_contract_reaches_gas_limit`
-/// tests deliberately replace the canonical contract with one sized exactly to
-/// `30M + SYSTEM_MAX_SSTORES_PER_CALL × STORAGE_SET_STATE_GAS`, so this constant
-/// is observable.
-constexpr int64_t SYSTEM_MAX_SSTORES_PER_CALL = 16;
-
 evmc::Result execute_system_call(State& state, const BlockInfo& block,
     const BlockHashes& block_hashes, evmc_revision rev, evmc::VM& vm, const address& addr,
     bytes_view code, bytes_view input)
 {
-    // EIP-8037: place enough state-gas headroom to cover up to
-    // `SYSTEM_MAX_SSTORES_PER_CALL` zero→non-zero SSTOREs in a separate state
-    // reservoir, so that the new state-gas component cannot OOG a system call.
-    // Per the EIP ("System contracts and system transactions") the reservoir is
-    // separate from the 30M regular gas_left — observable via the GAS opcode,
-    // the 63/64 forwarding base, and a >30M pure regular-gas burn.
     const evmc_message msg{
         .kind = EVMC_CALL,
         .gas = 30'000'000,
-        .state_gas =
-            (rev >= EVMC_AMSTERDAM) ? SYSTEM_MAX_SSTORES_PER_CALL * STORAGE_SET_STATE_GAS : 0,
+        .state_gas = 16 * STORAGE_SET_STATE_GAS,  // Additional state-gas (EIP-8037).
         .recipient = addr,
         .sender = SYSTEM_ADDRESS,
         .input_data = input.data(),
@@ -130,25 +113,18 @@ StateDiff system_call_block_start(const StateView& state_view, const BlockInfo& 
         if (rev < since)
             break;  // Because entries are ordered, there are no other contracts for this revision.
 
-        // EIP-7928: the system contract's address is observed by the BAL tracker
-        // even if the contract is absent or its body makes no state access —
-        // EELS process_unchecked_system_transaction reads the account (and so
-        // records it) unconditionally, before probing the code.
-        (void)state_view.get_account(addr);
-
         // Skip the call if the target account doesn't exist. This is by EIP-4788 spec.
         // > if no code exists at [address], the call must fail silently.
-        const auto code = state_view.get_account_code(addr);
+        const auto code = state.get_code(addr);
         if (code.empty())
             continue;
 
-        // Snapshot before the system call so that an exceptional halt doesn't leave
-        // partial state changes visible to subsequent system calls or user txs.
-        const auto checkpoint = state.checkpoint();
+        // The call is unchecked: a failure only reverts its state changes for testing.
         const auto input32 = get_input(block, block_hashes);
+        const auto checkpoint = state.checkpoint();
         const auto res =
             execute_system_call(state, block, block_hashes, rev, vm, addr, code, input32);
-        if (res.status_code != EVMC_SUCCESS)
+        if (res.status_code != EVMC_SUCCESS) [[unlikely]]
             state.rollback(checkpoint);
     }
     // TODO: Should we return empty diff if no system contracts?
@@ -166,13 +142,9 @@ std::variant<RequestsResult, std::error_code> system_call_block_end(const StateV
             break;  // Because entries are ordered, there are no other contracts for this revision.
 
         // Fail if the target account doesn't exist. This is by EIP-7002 and EIP-7251 spec.
-        const auto code = state_view.get_account_code(addr);
+        const auto code = state.get_code(addr);
         if (code.empty())
             return make_error_code(SYSTEM_CONTRACT_EMPTY);
-
-        // EIP-7928: ensure the executed system contract's address is observed
-        // by the BAL tracker even if the contract body makes no state access.
-        (void)state_view.get_account(addr);
 
         const auto res = execute_system_call(state, block, block_hashes, rev, vm, addr, code, {});
         if (res.status_code != EVMC_SUCCESS)

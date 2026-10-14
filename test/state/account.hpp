@@ -27,10 +27,8 @@ struct StorageValue
 
     evmc_access_status access_status = EVMC_ACCESS_COLD;
 
-    /// Whether @a current / @a original have been fetched from the cold StateView.
-    /// Set to false when the slot is created by access_storage() (to mark warm
-    /// without performing the StateView read). Set to true after the first
-    /// fetch via State::get_storage().
+    /// The value has been loaded from the initial state.
+    /// A slot may be warmed (EIP-2929) but not read (EIP-7928).
     bool loaded = false;
 };
 
@@ -67,8 +65,14 @@ struct Account
     /// Revertible.
     evmc_access_status access_status = EVMC_ACCESS_COLD;
 
-    /// The account does not exist in the state.
-    /// Revertible, usually false→true.
+    /// The account has been loaded from the initial state by its first read.
+    /// Warming (EIP-2929) is not a read (EIP-7928).
+    /// Not revertible: a read stays a read.
+    bool loaded = false;
+
+    /// The account does not exist in the state: it is missing from the initial state or its
+    /// creation has been reverted. Meaningful only for a loaded account.
+    /// Revertible, cleared when the account is created.
     bool nonexistent = false;
 
     /// The account has been destructed and should be erased at the end of a transaction.
@@ -86,26 +90,13 @@ struct Account
     bool erase_if_empty = false;
 
     /// The account has been created in the current transaction.
-    ///
-    /// FIXME: Not reverted on CREATE rollback; a leaked value suppresses the
-    /// EIP-161 touch-delete of the now-empty account (state-root divergence).
     bool just_created = false;
 
     /// This account's code has been modified.
-    ///
-    /// FIXME: Not reverted on CREATE rollback; a leaked value adds a
-    /// false-positive code entry to the state diff.
     bool code_changed = false;
 
-    /// If the account has non-empty initial storage (when accessing the cold account).
+    /// If the account has non-empty initial storage (set when the account is loaded).
     bool has_initial_storage = false;
-
-    /// Whether the balance/nonce/code_hash/has_initial_storage fields have been
-    /// populated from the underlying StateView. Entries created purely for
-    /// access-list warming (via access_account) are initialized with loaded=false;
-    /// State::find() performs the StateView fetch on first real access and then
-    /// records the outcome in @a nonexistent.
-    bool loaded = true;
 
     /// The StateView's handle for this account (StateView::Account::handle), null if none.
     const void* view_handle = nullptr;

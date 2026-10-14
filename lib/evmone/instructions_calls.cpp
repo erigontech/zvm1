@@ -45,12 +45,11 @@ inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& co
     if ((gas_left -= delegate_account_access_cost) < 0)
         return Delegation::out_of_gas;
 
-    // EIP-7928: once the access cost is committed (no OOG), the delegate
-    // address must appear in the block access list even if the CALL itself
-    // light-fails (e.g. insufficient funds) without doing any other state
-    // touch on it. Force the lazy-load now so the BAL StateView decorator
-    // observes the read.
-    (void)state.host.account_exists(*delegate_addr);
+    // From Amsterdam the delegate is read even if the call then fails on the balance (EIP-7928).
+    // TODO: Avoid looking the delegate up a second time, e.g. read it only when the call fails
+    //   before loading its code, or extend EVMC to read the account warmed by access_account().
+    if (state.rev >= EVMC_AMSTERDAM)
+        (void)state.host.account_exists(*delegate_addr);
     // The delegate's code is read here, before a value transfer can light-fail, as in
     // execution-specs; a stateless witness must therefore carry it.
     (void)state.host.get_code_size(*delegate_addr);
@@ -96,8 +95,8 @@ inline void absorb_child_state_gas(
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
     defined(EVMONE_RV32_DISPATCH_TEST)
 /// Whether the call family runs with the state Host only, as on rv32 (EVMONE_RV32_DISPATCH_TEST
-/// builds that configuration on the host for testing), where no frame has state gas before
-/// Amsterdam (see call_impl).
+/// builds that configuration on the host for testing), where no state gas is charged or refilled
+/// before Amsterdam (see call_impl).
 constexpr bool STATE_HOST_ONLY = true;
 #else
 constexpr bool STATE_HOST_ONLY = false;
@@ -337,9 +336,10 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     const auto gas_used = msg.gas - result.gas_left;
     gas_left -= gas_used;
     state.gas_refund += result.gas_refund;
-    // Before Amsterdam no frame has state gas: a transaction's message starts with none, and every
-    // charge and refill is an Amsterdam rule, so the child returns none and absorbing it changes
-    // nothing. Only the state Host is held to that; a test host may return state gas anyway.
+    // Before Amsterdam no state gas is charged or refilled: every charge and refill is an Amsterdam
+    // rule, so the child returns the state gas it was given (only a system call has any) and
+    // absorbing it changes nothing. Only the state Host is held to that; a test host may return
+    // state gas anyway.
     if (!STATE_HOST_ONLY || state.rev >= EVMC_AMSTERDAM)
         absorb_child_state_gas(gas_left, state, result);
 

@@ -45,33 +45,24 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
 
     TestState block_state(state);
 
-    // EIP-7928 BAL wiring: a BalStateView decorator forwards StateView calls to
-    // `block_state` while capturing every cold storage-slot read. The builder
-    // accumulates per-tx state diffs alongside those reads.
+    // The block access list (EIP-7928) records the reads and the state changes at their block
+    // access index.
     state::BalBuilder bal_builder;
-    state::BalStateView bal_view{block_state, bal_builder};
-    constexpr auto tx_idx_pre = state::bal_tx_index::PRE_BLOCK;
-    const auto tx_idx_post = state::bal_tx_index::post_block(txs.size());
+    const auto apply = [&](size_t index, const state::StateDiff& diff) {
+        if (rev >= EVMC_AMSTERDAM)
+            bal_builder.record_diff(static_cast<uint32_t>(index), diff, state);
+        block_state.apply(diff);
+    };
 
     if (!opts.skip_system_calls)
-    {
-        auto diff = state::system_call_block_start(bal_view, block, block_hashes, rev, vm);
-        bal_builder.record_diff(tx_idx_pre, diff, block_state);
-        block_state.apply(diff);
-    }
+        apply(0, state::system_call_block_start(block_state, block, block_hashes, rev, vm));
 
     std::vector<RejectedTransaction> rejected_txs;
     std::vector<state::TransactionReceipt> receipts;
 
     int64_t block_gas_left = block.gas_limit;
-    // EIP-8037: separate state-gas budget tracker; only consulted by
-    // validate_transaction for Amsterdam+.
-    int64_t state_block_gas_left = block.gas_limit;
+    int64_t block_state_gas_left = block.gas_limit;
     int64_t cumulative_gas_used = 0;
-    // EIP-8037: track regular and state gas separately for the block-level
-    // max(sum_regular, sum_state) formula.
-    int64_t sum_regular_gas = 0;
-    int64_t sum_state_gas = 0;
     auto blob_gas_left = blob_gas_limit;
 
     for (size_t i = 0; i < txs.size(); ++i)
@@ -83,11 +74,8 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
         if (trace_enabled)
             trace_guard.emplace(std::clog, opts.open_trace(i, computed_tx_hash).rdbuf());
 
-        // EIP-7928: validate against the bare block_state, not bal_view. A tx
-        // rejected at validation MUST NOT appear in the BAL, but bal_view's
-        // get_account(sender) would otherwise record the sender unconditionally.
         const auto tx_props_or_err = state::validate_transaction(
-            block_state, block, tx, rev, block_gas_left, blob_gas_left, state_block_gas_left);
+            block_state, block, tx, rev, block_gas_left, block_state_gas_left, blob_gas_left);
         if (std::holds_alternative<std::error_code>(tx_props_or_err))
         {
             rejected_txs.push_back(
@@ -95,32 +83,27 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
         }
         else
         {
-            // EIP-7928: run the tx through the BAL-recording state view and capture
-            // its diff into the block access list.
-            auto receipt = state::transition(bal_view, block, block_hashes, tx, rev, vm,
+            auto receipt = state::transition(block_state, block, block_hashes, tx, rev, vm,
                 std::get<state::TransactionProperties>(tx_props_or_err));
-
-            const auto tx_idx = state::bal_tx_index::tx(i);
-            bal_builder.record_diff(tx_idx, receipt.state_diff, block_state);
-            block_state.apply(receipt.state_diff);
+            apply(i + 1, receipt.state_diff);
 
             cumulative_gas_used += receipt.gas_used;
             receipt.cumulative_gas_used = cumulative_gas_used;
             if (rev < EVMC_BYZANTIUM)
                 receipt.post_state = state::mpt_hash(block_state);
 
-            // EIP-8037: accumulate the 2D components for the Amsterdam block-level
-            // max(sum_regular, sum_state) formula. Pre-Amsterdam these components are
-            // 0; the block then tracks the single gas dimension via receipt.gas_used.
-            sum_regular_gas += receipt.regular_block_gas;
-            sum_state_gas += receipt.state_block_gas;
-            block_gas_left -=
-                (rev >= EVMC_AMSTERDAM) ? receipt.regular_block_gas : receipt.gas_used;
-            state_block_gas_left -= receipt.state_block_gas;
+            // Block gas accounting, with EIP-7778 applied in transition(). The execution
+            // dimension is the block gas less the state one (EIP-8037).
+            block_gas_left -= receipt.block_gas_used - receipt.state_gas_used;
+            block_state_gas_left -= receipt.state_gas_used;
             blob_gas_left -= static_cast<int64_t>(tx.blob_gas_used());
             receipts.emplace_back(std::move(receipt));
         }
     }
+
+    // The withdrawals share the last index with the block-end system calls (EIP-7928).
+    apply(txs.size() + 1, state::finalize(block_state, rev, block.coinbase, opts.block_reward,
+                              block.ommers, block.withdrawals));
 
     std::vector<state::Requests> requests;
     std::error_code requests_error;
@@ -135,31 +118,24 @@ TransitionResult apply_block(const TestState& state, evmc::VM& vm, const state::
         }
         if (!requests_error)
         {
-            auto block_end = state::system_call_block_end(bal_view, block, block_hashes, rev, vm);
+            auto block_end =
+                state::system_call_block_end(block_state, block, block_hashes, rev, vm);
             if (const auto* ec = std::get_if<std::error_code>(&block_end))
                 requests_error = *ec;
             else
             {
                 auto& rr = std::get<state::RequestsResult>(block_end);
-                bal_builder.record_diff(tx_idx_post, rr.state_diff, block_state);
-                block_state.apply(rr.state_diff);
+                apply(txs.size() + 1, rr.state_diff);
                 std::ranges::move(rr.requests, std::back_inserter(requests));
             }
         }
     }
 
-    {
-        auto fin_diff = state::finalize(
-            bal_view, rev, block.coinbase, opts.block_reward, block.ommers, block.withdrawals);
-        bal_builder.record_diff(tx_idx_post, fin_diff, block_state);
-        block_state.apply(fin_diff);
-    }
-
+    // Both counters start at block.gas_limit, so this is max(execution used, state used):
+    // the block's gas used is its bottleneck dimension (EIP-8037).
+    const auto block_gas_used = block.gas_limit - std::min(block_gas_left, block_state_gas_left);
     const auto bloom = compute_bloom_filter(receipts);
 
-    // EIP-8037/7778: block-level 2D gas formula: max(sum_regular, sum_state).
-    const auto block_gas_used =
-        rev >= EVMC_AMSTERDAM ? std::max(sum_regular_gas, sum_state_gas) : cumulative_gas_used;
     return {std::move(receipts), std::move(rejected_txs), std::move(requests), requests_error,
         block_gas_used, bloom, blob_gas_left, std::move(block_state), bal_builder.build()};
 }

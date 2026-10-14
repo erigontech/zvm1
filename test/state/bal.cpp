@@ -3,206 +3,114 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "bal.hpp"
+#include "../utils/rlp.hpp"
 #include "account.hpp"
-#include <evmc/hex.hpp>
-#include <test/utils/rlp.hpp>
-#include <algorithm>
-#include <sstream>
 
 namespace evmone::state
 {
-// ADL-discoverable RLP encoders for BAL sub-structs.
-// `rlp::encode(std::vector<T>)` finds these in the `evmone::state` namespace
-// (where the types live) via argument-dependent lookup.
+// The RLP encoders of the BlockAccessList parts. They are static, not in an unnamed namespace,
+// because rlp::encode() finds them through ADL.
 
-inline bytes rlp_encode(const BlockAccessList::StorageWrite& w)
+template <typename T>
+static bytes rlp_encode(const BlockAccessList::Change<T>& c)
 {
-    return rlp::encode_tuple(uint64_t{w.tx_index}, intx::be::load<uint256>(w.value_after));
+    return rlp::encode_tuple(uint64_t{c.index}, c.value);
 }
 
-inline bytes rlp_encode(const BlockAccessList::SlotWrites& sw)
+static bytes rlp_encode(const BlockAccessList::SlotChanges& s)
 {
-    return rlp::encode_tuple(intx::be::load<uint256>(sw.slot), sw.accesses);
+    return rlp::encode_tuple(s.slot, s.changes);
 }
 
-inline bytes rlp_encode(const BlockAccessList::BalanceChange& b)
+static bytes rlp_encode(const BlockAccessList::AccountChanges& a)
 {
-    return rlp::encode_tuple(uint64_t{b.tx_index}, b.balance);
-}
-
-inline bytes rlp_encode(const BlockAccessList::NonceChange& n)
-{
-    return rlp::encode_tuple(uint64_t{n.tx_index}, n.nonce);
-}
-
-inline bytes rlp_encode(const BlockAccessList::CodeChange& c)
-{
-    return rlp::encode_tuple(uint64_t{c.tx_index}, bytes_view{c.code.data(), c.code.size()});
-}
-
-inline bytes rlp_encode(const BlockAccessList::AccountAccess& a)
-{
-    // Storage reads encode as a list of trimmed uint256 (per geth's
-    // EncodedStorage), not fixed-width bytes32. Materialize the list as
-    // a vector<uint256> so encode_tuple's encode(vector<T>) finds the
-    // right encoder via rlp::encode(intx::uint256) (which trims).
-    std::vector<uint256> reads;
-    reads.reserve(a.storage_reads.size());
-    for (const auto& r : a.storage_reads)
-        reads.push_back(intx::be::load<uint256>(r));
-
-    return rlp::encode_tuple(bytes_view{a.addr.bytes, sizeof(a.addr.bytes)}, a.storage_changes,
-        reads, a.balance_changes, a.nonce_changes, a.code_changes);
+    return rlp::encode_tuple(a.addr, a.storage_changes, a.storage_reads, a.balance_changes,
+        a.nonce_changes, a.code_changes);
 }
 
 bytes BlockAccessList::rlp_encode() const
 {
+    // TODO: rlp::encode() asserts lengths below 16 MiB (3 length bytes). The storage reads exceed
+    //   it from a block gas limit of about 1.1G (one item per GAS_PER_ITEM gas).
     return rlp::encode(accounts);
 }
 
 hash256 BlockAccessList::hash() const
 {
-    const auto enc = rlp_encode();
-    return keccak256(bytes_view{enc.data(), enc.size()});
+    return keccak256(rlp_encode());
 }
-
-#ifndef NDEBUG
-std::string BlockAccessList::dump() const
-{
-    std::ostringstream os;
-    os << "[\n";
-    for (const auto& a : accounts)
-    {
-        os << "  addr=" << evmc::hex({a.addr.bytes, sizeof(a.addr.bytes)}) << "\n";
-        if (!a.storage_changes.empty())
-        {
-            os << "    storage_changes:\n";
-            for (const auto& sw : a.storage_changes)
-            {
-                os << "      slot=" << evmc::hex({sw.slot.bytes, sizeof(sw.slot.bytes)})
-                   << " writes:";
-                for (const auto& w : sw.accesses)
-                    os << " [tx=" << w.tx_index
-                       << " val=" << evmc::hex({w.value_after.bytes, sizeof(w.value_after.bytes)})
-                       << "]";
-                os << "\n";
-            }
-        }
-        if (!a.storage_reads.empty())
-        {
-            os << "    storage_reads:";
-            for (const auto& r : a.storage_reads)
-                os << " " << evmc::hex({r.bytes, sizeof(r.bytes)});
-            os << "\n";
-        }
-        if (!a.balance_changes.empty())
-        {
-            os << "    balance:";
-            for (const auto& b : a.balance_changes)
-                os << " [tx=" << b.tx_index << " " << intx::hex(b.balance) << "]";
-            os << "\n";
-        }
-        if (!a.nonce_changes.empty())
-        {
-            os << "    nonce:";
-            for (const auto& n : a.nonce_changes)
-                os << " [tx=" << n.tx_index << " " << n.nonce << "]";
-            os << "\n";
-        }
-        if (!a.code_changes.empty())
-        {
-            os << "    code:";
-            for (const auto& c : a.code_changes)
-                os << " [tx=" << c.tx_index << " " << evmc::hex({c.code.data(), c.code.size()})
-                   << "]";
-            os << "\n";
-        }
-    }
-    os << "]";
-    return os.str();
-}
-#endif  // NDEBUG
 
 bool BlockAccessList::exceeds_gas_limit(uint64_t block_gas_limit) const noexcept
 {
     uint64_t items = 0;
-    for (const auto& acc : accounts)
-    {
-        // BalBuilder::build() guarantees storage_changes and storage_reads
-        // are disjoint, so they can be summed directly with no dedup.
+    for (const auto& acc : accounts)  // The reads are disjoint from the writes.
         items += 1 + acc.storage_changes.size() + acc.storage_reads.size();
-    }
     return items > block_gas_limit / GAS_PER_ITEM;
 }
 
-void BalBuilder::on_account_read(const address& addr)
+namespace
 {
-    m_accounts[addr];  // Ensure the account appears in the final BAL.
+/// Records the value at the index unless it is the one the index started with: the last recorded
+/// or the initial one. The last index gets two diffs (the withdrawals and the block-end system
+/// calls), so a change already recorded at the index is replaced.
+template <typename T>
+void record(std::vector<BlockAccessList::Change<T>>& changes, uint32_t index, const T& value,
+    const T& initial)
+{
+    if (!changes.empty() && changes.back().index == index)
+        changes.pop_back();
+    assert(changes.empty() || changes.back().index < index);
+    if (value != (changes.empty() ? initial : changes.back().value))
+        changes.push_back({index, value});
 }
+}  // namespace
 
-void BalBuilder::on_storage_read(const address& addr, const bytes32& key)
+void BalBuilder::record_diff(
+    uint32_t index, const StateDiff& diff, const StateView& pre_block_state)
 {
-    m_accounts[addr].storage_reads.insert(key);
-}
+    for (const auto& [addr, keys] : diff.reads)
+    {
+        // A read account is in the BAL even without changes.
+        auto& reads = m_accounts[addr].storage_reads;
+        reads.insert(reads.end(), keys.begin(), keys.end());
+    }
 
-/// Append a change entry. EIP-7928 requires each BlockAccessIndex to appear at
-/// most once per change list. `record_diff` is called twice at `tx_idx_post`
-/// (system_call_block_end + finalize), but current Amsterdam system contracts
-/// (EIP-7002, EIP-7251) only modify their own storage and never `CALL` or
-/// transfer value, while finalize only modifies withdrawal recipient balances —
-/// disjoint `(account, list)` pairs, so no collision occurs. The assertion
-/// catches any future contract that breaks this invariant.
-template <typename V, typename T>
-static void append_unique(V& list, uint32_t tx_index, T&& value)
-{
-    assert(list.empty() || list.back().tx_index != tx_index);
-    list.push_back({tx_index, std::forward<T>(value)});
-}
+    const auto listed = [&](const address& addr) -> AccountData& {
+        auto& ad = m_accounts[addr];
+        if (!ad.initial.has_value())  // A missing account reads as an empty one.
+        {
+            ad.initial = pre_block_state.get_account(addr).value_or(
+                StateView::Account{.code_hash = Account::EMPTY_CODE_HASH});
+        }
+        return ad;
+    };
 
-void BalBuilder::record_diff(uint32_t tx_index, const StateDiff& diff, const StateView& pre_state)
-{
     for (const auto& entry : diff.modified_accounts)
     {
-        auto& ad = m_accounts[entry.addr];
-        const auto pre = pre_state.get_account(entry.addr);
-        const auto pre_nonce = pre ? pre->nonce : uint64_t{0};
-        const auto pre_balance = pre ? pre->balance : uint256{0};
-
-        if (entry.nonce != pre_nonce)
-            append_unique(ad.nonce_changes, tx_index, entry.nonce);
-        if (entry.balance != pre_balance)
-            append_unique(ad.balance_changes, tx_index, entry.balance);
+        auto& ad = listed(entry.addr);
+        record(ad.nonce_changes, index, entry.nonce, ad.initial->nonce);
+        record(ad.balance_changes, index, entry.balance, ad.initial->balance);
+        // The code may be set to the same bytes, e.g. by a pair of self-cancelling
+        // authorizations in a transaction (EIP-7702).
         if (entry.code.has_value())
         {
-            // Record only an actual code change: EIP-7702 authorizations can
-            // leave code_changed==true with the same final bytes (e.g. a pair
-            // of self-canceling auths in the same tx).
-            const auto pre_code = pre_state.get_account_code(entry.addr);
-            if (*entry.code != pre_code)
-                append_unique(ad.code_changes, tx_index, *entry.code);
+            record(ad.code_changes, index, *entry.code,
+                bytes{pre_block_state.get_account_code(entry.addr)});
         }
-
-        for (const auto& [slot, new_val] : entry.modified_storage)
-            append_unique(ad.storage_writes[slot], tx_index, new_val);
+        for (const auto& [slot, value] : entry.modified_storage)
+        {
+            auto& writes = ad.storage_writes[slot];  // A diff lists only the changed slots.
+            assert(writes.empty() || writes.back().index < index);
+            writes.push_back({index, intx::be::load<uint256>(value)});
+        }
     }
 
     for (const auto& addr : diff.deleted_accounts)
     {
-        auto& ad = m_accounts[addr];
-        const auto pre = pre_state.get_account(addr);
-        if (!pre)
-            continue;  // Nothing to record if the account didn't exist pre-diff.
-        // The nonce/code comparisons are structurally dead at Amsterdam
-        // (post-EIP-6780 only same-tx-created accounts self-destruct, and their
-        // pre-state is absent; EIP-158-cleared accounts are empty by definition;
-        // EIP-8246 keeps destructed-with-balance accounts as modified). Kept for
-        // shape parity with EELS, which carries the same dead branches.
-        if (pre->nonce != 0)
-            append_unique(ad.nonce_changes, tx_index, uint64_t{0});
-        if (pre->balance != 0)
-            append_unique(ad.balance_changes, tx_index, uint256{0});
-        if (pre->code_hash != Account::EMPTY_CODE_HASH)
-            append_unique(ad.code_changes, tx_index, bytes{});
+        auto& ad = listed(addr);
+        // Only a created or an empty account is deleted (EIP-161, EIP-6780).
+        assert(ad.initial->nonce == 0 && ad.initial->code_hash == Account::EMPTY_CODE_HASH);
+        record(ad.balance_changes, index, uint256{0}, ad.initial->balance);
     }
 }
 
@@ -210,39 +118,31 @@ BlockAccessList BalBuilder::build()
 {
     BlockAccessList bal;
     bal.accounts.reserve(m_accounts.size());
-
     for (auto& [addr, data] : m_accounts)
     {
-        BlockAccessList::AccountAccess acc;
+        auto& acc = bal.accounts.emplace_back();
         acc.addr = addr;
 
-        // Storage writes: flatten the slot map and sort by slot.
         acc.storage_changes.reserve(data.storage_writes.size());
         for (auto& [slot, writes] : data.storage_writes)
-            acc.storage_changes.push_back({slot, std::move(writes)});
-        std::sort(acc.storage_changes.begin(), acc.storage_changes.end(),
-            [](const auto& a, const auto& b) { return a.slot < b.slot; });
+            acc.storage_changes.push_back({intx::be::load<uint256>(slot), std::move(writes)});
+        std::ranges::sort(acc.storage_changes, {}, &BlockAccessList::SlotChanges::slot);
 
-        // Storage reads: drop any slot also present in writes, then sort.
-        acc.storage_reads.reserve(data.storage_reads.size());
         for (const auto& slot : data.storage_reads)
         {
-            if (data.storage_writes.find(slot) == data.storage_writes.end())
-                acc.storage_reads.push_back(slot);
+            if (!data.storage_writes.contains(slot))  // A written slot is not a read.
+                acc.storage_reads.push_back(intx::be::load<uint256>(slot));
         }
-        std::sort(acc.storage_reads.begin(), acc.storage_reads.end());
+        std::ranges::sort(acc.storage_reads);
+        acc.storage_reads.erase(
+            std::ranges::unique(acc.storage_reads).begin(), acc.storage_reads.end());
 
-        // Per-tx changes are already appended in ascending tx order.
         acc.balance_changes = std::move(data.balance_changes);
         acc.nonce_changes = std::move(data.nonce_changes);
         acc.code_changes = std::move(data.code_changes);
-
-        bal.accounts.push_back(std::move(acc));
     }
-
-    std::sort(bal.accounts.begin(), bal.accounts.end(),
-        [](const auto& a, const auto& b) { return a.addr < b.addr; });
-
+    std::ranges::sort(bal.accounts, {}, &BlockAccessList::AccountChanges::addr);
+    m_accounts.clear();
     return bal;
 }
 }  // namespace evmone::state

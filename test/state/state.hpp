@@ -21,7 +21,7 @@ class State
 {
     struct JournalBase
     {
-        address addr;
+        Account* acc = nullptr;  ///< Account in a node-based container (stable refs).
     };
 
     struct JournalBalanceChange : JournalBase
@@ -32,7 +32,6 @@ class State
     struct JournalAccountFlags : JournalBase
     {
         evmc_access_status access_status;
-        bool loaded;
         bool nonexistent;
         bool destructed;
         bool erase_if_empty;
@@ -43,18 +42,7 @@ class State
         StorageValue* slot = nullptr;  ///< Storage slot in a node-based container (stable refs).
         bytes32 prev_value;
         evmc_access_status prev_access_status;
-    };
-
-    /// EIP-2929 warm/cold transition on a storage slot. Separate from
-    /// JournalStorageChange so that reverting a cold-access hook doesn't
-    /// accidentally overwrite a value loaded by a later SLOAD/SSTORE.
-    struct JournalStorageAccess : JournalBase
-    {
-        bytes32 key;
-        evmc_access_status prev_access_status;
-        /// The slot entry was newly inserted by access_storage — on revert the
-        /// entry itself should be removed (keeps the storage map pristine).
-        bool was_fresh;
+        bool prev_loaded;  ///< A slot warmed before loading has no value to restore.
     };
 
     struct JournalTransientStorageChange
@@ -66,26 +54,16 @@ class State
     struct JournalNonceBump : JournalBase
     {};
 
-    /// EIP-7702: a delegation code change on an authority. Recorded so a top-frame
-    /// authorization-charge out-of-gas can roll the applied delegation back.
-    struct JournalCodeChange : JournalBase
-    {
-        bytes prev_code;
-        bytes32 prev_code_hash;
-        bool prev_code_changed;
-    };
-
     struct JournalCreate : JournalBase
     {};
 
     using JournalEntry = std::variant<JournalBalanceChange, JournalAccountFlags,
-        JournalStorageChange, JournalStorageAccess, JournalNonceBump, JournalCodeChange,
-        JournalCreate, JournalTransientStorageChange>;
+        JournalStorageChange, JournalNonceBump, JournalCreate, JournalTransientStorageChange>;
 
     /// The read-only view of the initial (cold) state.
     const StateView& m_initial;
 
-    /// The accounts loaded from the initial state and potentially modified.
+    /// The accounts warmed, loaded from the initial state or modified.
     std::unordered_map<address, Account> m_modified;
 
     /// The state journal: the list of changes made to the state
@@ -107,37 +85,20 @@ public:
     State(State&&) = delete;
     State& operator=(State&&) = delete;
 
-    /// Inserts the new account at the address.
-    /// There must not exist any account under this address before.
-    Account& insert(const address& addr, Account account = {});
+    // TODO: [[gnu::flatten]] on get(), get_storage() and access_storage() makes GCC inline the
+    //   hash map lookups: up to ~10% fewer instructions on warm storage access. try_emplace() is
+    //   an alternative to operator[] with different inlining hints: GCC 15/16 inline its lookup.
 
-    /// Returns the pointer to the account at the address if the account exists. Null otherwise.
-    Account* find(const address& addr) noexcept;
-    /// The part of find() past a loaded entry in m_modified: the lazy load of an access-list
-    /// placeholder, or the fetch from the initial state. Out of line so that find() itself,
-    /// 3.4M calls per 200 mainnet blocks, carries no frame for the Account it may build.
-    [[gnu::noinline]] Account* find_slow(
-        const address& addr, std::unordered_map<address, Account>::iterator it) noexcept;
+    /// Returns the account at the address without loading it from the initial state.
+    Account& access(const address& addr) noexcept { return m_modified[addr]; }
 
-    /// Looks up an account only in the locally modified set. Does NOT query the
-    /// underlying StateView, so it won't surface a cold read to trackers/hooks.
-    /// Returns nullptr if the account hasn't been touched in this State yet.
-    Account* find_modified(const address& addr) noexcept
-    {
-        const auto it = m_modified.find(addr);
-        return it != m_modified.end() ? &it->second : nullptr;
-    }
-
-    /// Gets the account at the address (the account must exist).
+    /// Returns the account at the address. An account absent from the state is returned as a
+    /// node flagged nonexistent, so the reference is always valid and the flag is the answer to
+    /// "does this account exist?".
     Account& get(const address& addr) noexcept;
 
-    /// Gets an existing account or inserts new account.
-    Account& get_or_insert(const address& addr, Account account = {});
-
-    /// Gets an existing account or inserts a lightweight placeholder for access-list
-    /// warming. Does NOT query the underlying StateView — deferring the fetch keeps
-    /// cold-reads observable only when the account is actually loaded (see find()).
-    Account& get_or_insert_for_access(const address& addr);
+    /// Gets an existing account or creates new erasable account without journaling.
+    Account& get_or_insert(const address& addr);
 
     bytes_view get_code(const address& addr);
 
@@ -146,9 +107,12 @@ public:
         m_changed_code_addresses.emplace(code_hash, addr);
     }
 
+    /// Returns the storage slot without loading its value from the initial state.
+    StorageValue& access_storage(const address& addr, const bytes32& key);
+
     StorageValue& get_storage(const address& addr, const bytes32& key);
 
-    /// Fetches the value of a slot that access_storage() created without a fetch.
+    /// Loads the value of a slot that access_storage() created without loading it.
     /// @p view_handle is Account::view_handle of the account @p addr.
     void load_storage(
         const address& addr, const void* view_handle, const bytes32& key, StorageValue& slot);
@@ -165,33 +129,25 @@ public:
     /// Methods performing changes to the state which can be reverted by rollback().
     /// @{
 
-    /// Touches (as in EIP-161) an existing account or inserts new erasable account.
+    /// Gets the account, creating it if it doesn't exist. The creation is journaled.
+    /// @return The account and whether it has been created.
+    std::pair<Account&, bool> get_or_create(const address& addr);
+
+    /// Touches (as in EIP-161) an existing account or creates new erasable account.
     Account& touch(const address& addr);
 
-    void journal_balance_change(const address& addr, const intx::uint256& prev_balance);
+    void journal_balance_change(Account& acc);
 
     void journal_storage_change(StorageValue& slot);
 
-    /// Journal an access-status transition on a storage slot without capturing
-    /// the slot's value (matches access_storage() semantics).
-    /// @p was_fresh indicates whether the slot was just inserted by the caller
-    /// (on revert the entry should be erased entirely).
-    void journal_storage_access(
-        const address& addr, const bytes32& key, evmc_access_status prev_status, bool was_fresh);
-
     void journal_transient_storage_change(bytes32& slot);
 
-    void journal_bump_nonce(const address& addr);
-
-    void journal_code_change(const address& addr);
+    void journal_bump_nonce(Account& acc);
 
     /// Journals a create over a pre-existing account; revert resets its nonce and code.
-    void journal_create(const address& addr);
+    void journal_create(Account& acc);
 
-    /// Journals a new-account creation; revert un-creates it (restores "does not exist").
-    void journal_new_account(const address& addr);
-
-    void journal_account_flags(const address& addr, const Account& acc);
+    void journal_account_flags(Account& acc);
 
     /// @}
 };
@@ -213,10 +169,9 @@ TransactionReceipt transition(const StateView& state, const BlockInfo& block,
 
 /// Validate a transaction.
 ///
-/// @param state_block_gas_left  Pre-Amsterdam: ignored. Amsterdam+: remaining
-///                              block state-gas budget (EIP-8037).
-/// @return Computed execution gas limit or validation error.
+/// @param block_state_gas_left  Remaining block state-gas (EIP-8037).
+/// @return The transaction's computed gas properties or a validation error.
 [[nodiscard]] std::variant<TransactionProperties, std::error_code> validate_transaction(
     const StateView& state_view, const BlockInfo& block, const Transaction& tx, evmc_revision rev,
-    int64_t block_gas_left, int64_t blob_gas_left, int64_t state_block_gas_left) noexcept;
+    int64_t block_gas_left, int64_t block_state_gas_left, int64_t blob_gas_left) noexcept;
 }  // namespace evmone::state

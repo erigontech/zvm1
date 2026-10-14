@@ -16,11 +16,11 @@ TEST_F(state_transition, eip7778_sstore_clear_refund_amsterdam)
     tx.to = To;
     pre[To] = {.storage = {{0x01_bytes32, 0x42_bytes32}}, .code = sstore(1, 0)};
 
-    // Pre-refund: 15000 intrinsic (EIP-2780: 12000 base + 3000 recipient) + 12100 (EIP-8038
-    // cold SSTORE clear: STORAGE_WRITE 10000 + COLD_STORAGE_ACCESS 2100) + 6 (two PUSHes)
-    // = 27106. The EIP-8038 clear refund is capped at pre-refund/5 = 5421 (EIP-3529).
-    expect.gas_used = 27106 - 5421;
-    expect.gas_refund = 5421;
+    // Intrinsic, two PUSHes and the cold SSTORE clear (EIP-8038). The clear refund (11616) is
+    // capped at a fifth of the pre-refund gas (EIP-3529).
+    constexpr auto PRE_REFUND = 15'000 + 6 + 12'100;
+    expect.gas_used = PRE_REFUND - PRE_REFUND / 5;
+    expect.block_gas_used = PRE_REFUND;
     expect.post[To].exists = true;
     expect.post[To].storage[0x01_bytes32] = 0x00_bytes32;
 }

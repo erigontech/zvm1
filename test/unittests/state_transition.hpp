@@ -67,16 +67,14 @@ protected:
         /// The expected amount of gas used by the transaction.
         std::optional<int64_t> gas_used;
 
-        /// The expected EIP-7778 block-side gas refund stored on the receipt
-        /// (`gas_used + gas_refund` equals `max(pre-refund gas, EIP-7623 floor)`).
-        std::optional<int64_t> gas_refund;
+        /// The expected amount of gas counted against the block gas limit (EIP-7778).
+        std::optional<int64_t> block_gas_used;
 
         /// The expected logs emitted by the transaction. When set, the receipt's logs must match
         /// exactly: count, address, data, topics, and order.
         std::optional<std::vector<Log>> logs;
 
-        /// The expected EIP-8037 state-gas component of the receipt (`state_block_gas`),
-        /// e.g. a NEW_ACCOUNT_STATE_GAS charge that survives a light failure.
+        /// The expected state-gas component of the receipt (EIP-8037).
         std::optional<int64_t> state_gas;
 
         /// The expected post-execution state.
