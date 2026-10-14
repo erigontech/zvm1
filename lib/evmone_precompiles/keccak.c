@@ -1339,9 +1339,10 @@ struct keccak64_memo_slot
     uint32_t unused[8];
 };
 
-/// Direct-mapped memo of the 64-byte KECCAK256 inputs: the mapping slots keccak(key . slot), which
-/// a contract hashes again on every access to the same entry. 65% of the 64-byte hashes in the
-/// 200-block corpus repeat one done before in the block.
+/// Memo of the 64-byte KECCAK256 inputs: the mapping slots keccak(key . slot), which a contract
+/// hashes again on every access to the same entry. 65% of the 64-byte hashes in the 200-block
+/// corpus repeat one done before in the block. It is 2-way set associative: direct-mapped, the
+/// inputs that met in a slot evicted each other, 61 permutations a mainnet block.
 ///
 /// Zero-initialized, so it is .bss, which costs nothing at startup: Airbender RAM starts zeroed.
 /// A slot answers only if its first result word is nonzero, so the zeroed table never answers for
@@ -1405,24 +1406,40 @@ NO_INLINE void ethash_keccak256_64_be(ethash_w32 out[8], const ethash_w32* data)
     // The index mixes the words a mapping key and slot vary in: the last word of each half (the
     // low bytes of a number or an address), the first (a left-aligned bytesN key) and the fourth
     // (the high bytes of an address). On the corpus it hits as often as a mix of all 16 does.
+    // It picks the set: the pair of slots at an even index.
     const uint32_t x = data[0] ^ data[3] ^ data[7] ^ data[15];
-    const uint32_t index = (x * 0x9E3779B1u) >> (32 - KECCAK64_MEMO_BITS);
+    const uint32_t index = ((x * 0x9E3779B1u) >> (32 - KECCAK64_MEMO_BITS)) & ~1u;
     struct keccak64_memo_slot* slot = &keccak64_memo[index];
     __asm__("" : "+r"(slot));  // Kept in a register: GCC would recompute it from the index.
 
-    if (slot->value[0] != 0)
+    size_t way;
+    for (way = 0; way < 2; ++way)
     {
+        struct keccak64_memo_slot* const s = slot + way;
         size_t i;
+        if (s->value[0] == 0)
+            continue;
         for (i = 0; i < 16; ++i)
         {
-            if (slot->key[i] != data[i])
-                goto miss;
+            if (s->key[i] != data[i])
+                break;
         }
-        for (i = 0; i < 8; ++i)
-            out[i] = slot->value[i];
-        return;
+        if (i == 16)
+        {
+            for (i = 0; i < 8; ++i)
+                out[i] = s->value[i];
+            return;
+        }
     }
-miss:
+    // A miss fills an empty slot of the set, or else moves the first slot's input to the second
+    // and takes the first: the one evicted is the older of the two the set holds.
+    if (slot[0].value[0] != 0)
+    {
+        if (slot[1].value[0] == 0)
+            ++slot;
+        else
+            slot[1] = slot[0];
+    }
     keccak64_memo_fill(out, data, slot);
 }
 #if defined(__riscv) && __riscv_xlen == 32
