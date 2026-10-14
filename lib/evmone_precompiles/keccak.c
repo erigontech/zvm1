@@ -80,9 +80,9 @@ void buf_zero_all(void)
 /// Zeroes the state bytes of buf[] from byte offset @p off (a multiple of 4, at most 200) by
 /// jumping into a run of word stores.
 ///
-/// The delegation reads and writes buf[0..30], but only the 25 lanes of the state need a clean
-/// start: every round writes the six scratch lanes buf[25..30] before it reads them (the column
-/// XORs, then the column mix), and buf[31] is never touched. A short input leaves 16 to 43 words
+/// The delegations read and write buf[0..29], but only the 25 lanes of the state need a clean
+/// start: every round's column parity calls write the five parity lanes buf[25..29] before the
+/// theta/rho calls read them, and buf[30..31] are never touched. A short input leaves 16 to 43 words
 /// to clear; 1 store each beats the CSR MEMCOPY zeroing (4 instructions and a delegation per
 /// 32-byte chunk, plus a per-chunk loop and word stores up to the next 32-byte boundary).
 ///
@@ -108,17 +108,24 @@ static inline __attribute__((always_inline)) void buf_zero_state_from(size_t off
         : [off] "r"(off), [b] "r"(buf));
 }
 
-/// Keccak-f[1600] via airbender CSR 0x7CB delegation, permuting the 256-byte-aligned state s in place.
-/// 649 consecutive CSR writes — the transpiler's preprocess_bytecode
-/// scans for exactly 649 contiguous csrrw instructions.
+/// Keccak-f[1600] on Airbender's keccak_f1600 delegations, permuting the 256-byte-aligned state s
+/// in place: 24 rounds of 5 column parity (CSR 0x7CD), 5 theta/rho (0x7CC) and 5 chi5 (0x7CE)
+/// writes, and a last column parity, 361 in all with the control word in x10 starting at 0. The
+/// transpiler recognizes the run by its first CSR and the call count, so the writes stay one
+/// contiguous block, as airbender's common_constants keccak_f1600() emits them. Its circuits take
+/// about half the witness cells of the 649-write KeccakSpecial5 run (CSR 0x7CB) they replace,
+/// which proved the same permutation.
 static inline __attribute__((always_inline)) void keccak_permute_at(uint64_t* s)
 {
     register uint32_t ctrl __asm__("x10") = 0;
     register void*    sptr __asm__("x11") = (void*)s;
     __asm__ __volatile__(
-        ".rept 649\n"
-        "  csrrw x0, 0x7CB, x0\n"
+        ".rept 24\n"
+        "  .rept 5\n  csrrw x0, 0x7CD, x0\n  .endr\n"
+        "  .rept 5\n  csrrw x0, 0x7CC, x0\n  .endr\n"
+        "  .rept 5\n  csrrw x0, 0x7CE, x0\n  .endr\n"
         ".endr\n"
+        "csrrw x0, 0x7CD, x0\n"
         : "+r"(ctrl)
         : "r"(sptr)
         : "memory"
@@ -139,9 +146,7 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     int i;
     if (state != buf)
     {
-        // Zero buf[25..30] before copying state in.
-        for (i = 25; i < 31; i++)
-            buf[i] = 0;
+        // The parity lanes buf[25..29] need no initialization (see buf_zero_state_from()).
         for (i = 0; i < 25; i++)
             buf[i] = state[i];
     }
@@ -1044,8 +1049,8 @@ union ethash_hash256 ethash_keccak256_resume(
     data += blocks * block_words * WORD_SIZE;
     size -= blocks * block_words * WORD_SIZE;
 #if defined(AIRBENDER)
-    // The slot is permuted where it is, and consumed. Lanes 25..30 of it are the delegation's
-    // scratch and need no initialization (see buf_zero_state_from()).
+    // The slot is permuted where it is, and consumed. Lanes 25..29 of it are the delegations'
+    // parity scratch and need no initialization (see buf_zero_state_from()).
     while (size >= block_words * WORD_SIZE)
     {
         struct word_reader reader = {data, 0, 0};
