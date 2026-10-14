@@ -111,8 +111,9 @@ struct EcrecoverInput
 /// (r^-1 mod n; and mod p 1/(2y) of the recovered point, one per round of its affine odd-multiple
 /// table, and the projective Z^-1) are shared by the whole batch with Montgomery's trick: one
 /// Fermat inversion mod n and nine mod p (1/(2y), seven table rounds, the final Z) per batch, plus
-/// 3 multiplications per signature and inversion. Elsewhere this calls ecrecover() for each
-/// signature.
+/// 3 multiplications per signature and inversion. On SP1 the scalar inversions r^-1 of the whole
+/// batch share one inversion the same way, each otherwise costing thousands of instructions.
+/// Elsewhere this calls ecrecover() for each signature.
 void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional<evmc::address>> out,
     RecoveryMode mode = RecoveryMode::malleable) noexcept;
 
