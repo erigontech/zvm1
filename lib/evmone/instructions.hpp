@@ -1459,7 +1459,7 @@ inline void callvalue(StackTop stack, ExecutionState& state) noexcept
 #if defined(__riscv) && !defined(__riscv_zbb)
 // Without a byte-swap instruction an access of unproven alignment is split into byte accesses,
 // and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap,
-// PUSH data is assembled in big-endian order directly.
+// anything else is assembled or split in big-endian order directly.
 
 /// Big-endian value of the Len bytes at p. The empty asm keeps GCC's bswap pass from taking the
 /// bytes for an unaligned load and a byte swap, which it expands back into a longer shift-and-mask
@@ -1476,18 +1476,38 @@ template <size_t Len>
     return v;
 }
 
+/// Stores the big-endian bytes of v at p.
+[[gnu::always_inline]] inline void store_be_bytes(uint8_t* p, uint64_t v) noexcept
+{
+    for (size_t i = 0; i < 8; ++i)
+        p[i] = static_cast<uint8_t>(v >> (56 - 8 * i));
+}
+
 [[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
 {
+    // The words in both branches and one construction: returned from each branch, the value
+    // went through a stack temporary that GCC stored to and never read.
+    uint64_t w[4];
     if (reinterpret_cast<uintptr_t>(p) % 8 == 0) [[likely]]
-        return intx::be::unsafe::load<uint256>(std::assume_aligned<8>(p));
-    return intx::be::unsafe::load<uint256>(p);
+    {
+        const auto* const a = std::assume_aligned<8>(p);
+        for (size_t i = 0; i < 4; ++i)
+            w[i] = intx::be::unsafe::load<uint64_t>(a + 24 - 8 * i);
+    }
+    else
+    {
+        for (size_t i = 0; i < 4; ++i)
+            w[i] = load_be_bytes<8>(p + 24 - 8 * i);
+    }
+    return {w[0], w[1], w[2], w[3]};
 }
 
 [[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& value) noexcept
 {
     if (reinterpret_cast<uintptr_t>(p) % 8 == 0) [[likely]]
         return intx::be::unsafe::store(std::assume_aligned<8>(p), value);
-    intx::be::unsafe::store(p, value);
+    for (size_t i = 0; i < 4; ++i)
+        store_be_bytes(p + 8 * i, value[3 - i]);
 }
 #else
 [[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
@@ -1562,7 +1582,7 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
             intx::be::unsafe::load_into(index, state.msg->input_data + begin);
 #else
-            index = intx::be::unsafe::load<uint256>(state.msg->input_data + begin);
+            index = load_be_word(state.msg->input_data + begin);
 #endif
         }
         else
