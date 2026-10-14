@@ -85,6 +85,11 @@ void buf_zero_all(void)
 /// XORs, then the column mix), and buf[31] is never touched. A short input leaves 16 to 43 words
 /// to clear; 1 store each beats the CSR MEMCOPY zeroing (4 instructions and a delegation per
 /// 32-byte chunk, plus a per-chunk loop and word stores up to the next 32-byte boundary).
+///
+/// Relies on RISCV_MERGE_WINDOW=0 in the Airbender prover, which z6m_prover_airbender sets:
+/// the jump lands inside a run of ascending word stores, and the prover's JIT otherwise fuses
+/// such runs into groups of up to 8 on the assumption that no jump lands inside one. Entering a
+/// group past its head runs it from the head, clearing absorbed input lanes below @p off.
 static inline __attribute__((always_inline)) void buf_zero_state_from(size_t off)
 {
     uintptr_t t;
