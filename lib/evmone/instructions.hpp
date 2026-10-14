@@ -1410,7 +1410,9 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
     // if index overflows 32 bits (any high word non-zero → index > any size_t value).
     if (index_overflows_32bit || state.msg->input_size <= iw[0])
 #else
-    if (state.msg->input_size < index)
+    // An index at the end loads 0 here as well, so that below the input has a byte at begin and
+    // input_data is not null (an empty input may have none, which memcpy must not get).
+    if (state.msg->input_size <= index)
 #endif
         index = 0;
     else
