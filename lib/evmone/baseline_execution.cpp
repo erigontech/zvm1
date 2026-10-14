@@ -37,6 +37,23 @@ namespace evmone::baseline
 {
 namespace
 {
+/// The gas charged for @p Op before its implementation runs: the instruction's own cost, except
+/// where the implementation takes over. JUMP also pays for the JUMPDEST it lands on, which is
+/// unconditional. JUMPI cannot know until the condition is popped, so it charges nothing here --
+/// a const cost of zero compiles the check below away, leaving one check on either path.
+template <Opcode Op>
+inline constexpr int16_t DISPATCH_GAS_COST = instr::gas_costs[EVMC_FRONTIER][Op];
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+template <>
+inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMP> =
+    instr::gas_costs[EVMC_FRONTIER][OP_JUMP] + instr::core::JUMPDEST_GAS;
+template <>
+inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMPI> = 0;
+
+static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP_JUMPI),
+    "the jump instructions must charge a compile-time constant gas cost");
+#endif
+
 /// Checks instruction requirements before execution.
 ///
 /// This checks:
@@ -93,7 +110,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
         "undefined instructions must not be handled by check_requirements()");
 
-    auto gas_cost = instr::gas_costs[EVMC_FRONTIER][Op];  // Init assuming const cost.
+    auto gas_cost = DISPATCH_GAS_COST<Op>;  // Init assuming const cost.
     if constexpr (!instr::has_const_gas_cost(Op))
     {
         gas_cost = cost_table[Op];  // If not, load the cost from the current revision cost table.
@@ -132,7 +149,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
             return EVMC_STACK_UNDERFLOW;
     }
 
-    if constexpr (!instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] > 0)
+    if constexpr (!instr::has_const_gas_cost(Op) || DISPATCH_GAS_COST<Op> > 0)
     {
 #if EVMONE_RV32_DISPATCH
         if (INTX_UNLIKELY(!deduct_gas(gas_left, static_cast<uint32_t>(gas_cost))))
@@ -226,6 +243,13 @@ struct JumpBase
     int64_t& /*gas*/, ExecutionState& state) noexcept
 {
     return instr_fn(pos.stack_end, state, pos.code_it);
+}
+
+[[release_inline]] inline code_iterator invoke(
+    code_iterator (*instr_fn)(StackTop, ExecutionState&, int64_t&, code_iterator) noexcept,
+    Position pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    return instr_fn(pos.stack_end, state, gas, pos.code_it);
 }
 
 [[release_inline]] inline code_iterator invoke(
@@ -1167,6 +1191,7 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
             }
         }
 
+        [[maybe_unused]] const auto* const at = position.code_it;
         const auto op = *position.code_it;
         switch (op)
         {
@@ -1195,6 +1220,19 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
             state.status = EVMC_UNDEFINED_INSTRUCTION;
             return gas;
         }
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+        if constexpr (TracingEnabled)
+        {
+            // A taken jump resumes after the JUMPDEST it lands on, whose gas it paid: the tracer
+            // still sees that instruction, with the gas left before its charge, as if it had run.
+            if ((op == OP_JUMP || op == OP_JUMPI) && position.code_it != at + 1)
+            {
+                tracer->notify_instruction_start(static_cast<uint32_t>(position.code_it - 1 - code),
+                    position.stack_end - 1, static_cast<int>(position.stack_end - stack_bottom),
+                    gas + instr::core::JUMPDEST_GAS, state);
+            }
+        }
+#endif
     }
     intx::unreachable();
 }
