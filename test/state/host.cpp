@@ -578,6 +578,8 @@ evmc::Result Host::call(const evmc_message& msg) noexcept
 
 evmc_tx_context Host::get_tx_context() const noexcept
 {
+    if (m_tx_context_set)
+        return m_tx_context;
     // TODO: The effective gas price is already computed in transaction validation.
     // TODO: The effective gas price calculation is broken for system calls (gas price 0).
     assert(m_tx.max_gas_price >= m_block.base_fee || m_tx.max_gas_price == 0);
@@ -585,7 +587,7 @@ evmc_tx_context Host::get_tx_context() const noexcept
         std::min(m_tx.max_priority_gas_price, m_tx.max_gas_price - m_block.base_fee);
     const auto effective_gas_price = m_block.base_fee + priority_gas_price;
 
-    return evmc_tx_context{
+    m_tx_context = evmc_tx_context{
         intx::be::store<uint256be>(effective_gas_price),  // By EIP-1559.
         m_tx.sender,
         m_block.coinbase,
@@ -600,6 +602,8 @@ evmc_tx_context Host::get_tx_context() const noexcept
         m_tx.blob_hashes.size(),
         m_block.slot_number.value_or(0),
     };
+    m_tx_context_set = true;
+    return m_tx_context;
 }
 
 bytes32 Host::get_block_hash(int64_t block_number) const noexcept

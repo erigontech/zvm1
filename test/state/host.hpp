@@ -21,6 +21,12 @@ class Host : public evmc::Host
     const BlockHashes& m_block_hashes;
     const Transaction& m_tx;
     std::vector<Log> m_logs;
+    /// get_tx_context()'s answer, computed on the first call: the block and the transaction do not
+    /// change while the Host runs them, and each frame of the transaction that reads the context
+    /// (ORIGIN, GASPRICE, TIMESTAMP, ...) asks for it once. Not zeroed (250 bytes a transaction):
+    /// it is read only once set.
+    mutable evmc_tx_context m_tx_context;
+    mutable bool m_tx_context_set = false;
 
 public:
     Host(evmc_revision rev, evmc::VM& vm, State& state, const BlockInfo& block,
