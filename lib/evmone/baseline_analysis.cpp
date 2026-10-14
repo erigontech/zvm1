@@ -109,8 +109,8 @@ struct InPlaceRegion
     uintptr_t begin = UINTPTR_MAX;
     uintptr_t end = 0;
 };
-// The guest runs one thread; a host test build may run VMs on several.
-#if defined(AIRBENDER)
+// The guests run one thread and have no TLS; a host test build may run VMs on several.
+#if defined(AIRBENDER) || defined(SP1)
 constinit InPlaceRegion in_place_region;
 #else
 constinit thread_local InPlaceRegion in_place_region;
@@ -191,7 +191,8 @@ CodeAnalysis analyze_legacy(bytes_view code)
 #if EVMONE_IN_PLACE_CODE
     if (is_padded_in_place(code))
     {
-        // Only the map is stored, zeroed here: host memory is not fresh.
+        // Only the map is stored, zeroed here: this heap reuses memory, and the SP1 prover does
+        // not enforce that memory nobody has written reads zero.
         const auto map_size = code.size() + 8;
         auto storage = std::make_unique_for_overwrite<uint8_t[]>(map_size);
         std::fill_n(storage.get(), map_size, 0);
@@ -202,8 +203,8 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto aligned_code_size =
         (padded_code_size + (BITSET_ALIGNMENT - 1)) / BITSET_ALIGNMENT * BITSET_ALIGNMENT;
 #if EVMONE_JUMPDEST_BYTEMAP
-    // The map follows the padded code in the same storage, as on the guest. Host memory is not
-    // fresh, so the fill below zeroes the map along with the padding.
+    // The map follows the padded code in the same storage, as on the Airbender guest. This memory
+    // is not fresh, so the fill below zeroes the map along with the padding.
     const auto total_size = aligned_code_size + code.size() + 8;
 #else
     const auto total_size = aligned_code_size + bitset_words * sizeof(BitsetSpan::word_type);
