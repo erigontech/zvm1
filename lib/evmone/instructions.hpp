@@ -1176,11 +1176,80 @@ inline void clz(StackTop stack) noexcept
 }
 
 #ifdef EVMONE_WORD_LAYOUT
+namespace keccak_memo
+{
+/// The longest input memoized: one Keccak block less the padding byte, a single permutation.
+inline constexpr size_t MAX_SIZE = 135;
+/// Index bits: 2048 slots on the guest (352 KiB of .bss, which Airbender RAM starts zeroed); a few
+/// on the host, whose tests run VMs on several threads and should see evictions.
+#if defined(AIRBENDER)
+inline constexpr unsigned BITS = 11;
+#else
+inline constexpr unsigned BITS = 3;
+#endif
+
+/// An input of 1..MAX_SIZE bytes and the number KECCAK256 pushes for it.
+struct Slot
+{
+    uint32_t size;  ///< The input size; 0 while the slot is empty (an empty input is never kept).
+    uint32_t value[8];  ///< The words of the result as a uint256.
+    uint32_t key[(MAX_SIZE + 3) / 4];  ///< The input words, the bytes past its end zero.
+};
+
+[[nodiscard]] inline Slot* table() noexcept
+{
+#if defined(AIRBENDER)
+    static Slot slots[size_t{1} << BITS];
+#else
+    thread_local Slot slots[size_t{1} << BITS];
+#endif
+    return slots;
+}
+}  // namespace keccak_memo
+
 /// Stores the hash of the n bytes at the W pointer p, which the hash reads as bytes, in x. Out of
 /// line, to keep both conversions out of the interpreter loop.
+///
+/// Inputs of one block are memoized: the aligned 64-byte ones go to the memo of
+/// ethash_keccak256_64_be() before they get here, the rest (keccak(a . b) of two addresses,
+/// CREATE2 addresses a router derives, ABI-encoded structs, misaligned mapping slots) repeat as
+/// much, 63% of the KECCAK256 hashes of a mainnet block. A hit compares the whole input.
 [[gnu::noinline]] inline void keccak256_w(uint256& x, const uint8_t* p, size_t n) noexcept
 {
-    const auto hash = ethash::keccak256(wl::scratch_copy(p, n), n);
+    // The scratch copy is word-aligned and holds whole words; the bytes after the input in its
+    // last word are not the input's and are masked off.
+    uint8_t* const b = wl::scratch(wl::round_up4(n));
+    wl::copy_w2b(b, p, n);
+    const wl::word_t* const w = reinterpret_cast<const wl::word_t*>(b);
+    keccak_memo::Slot* slot = nullptr;
+    size_t last = 0;  // The index of the last input word.
+    uint32_t last_word = 0;
+    if (n - 1 < keccak_memo::MAX_SIZE)
+    {
+        last = (n - 1) / 4;
+        const auto tail_bits = static_cast<unsigned>(n & 3) * 8;
+        last_word = w[last] & (tail_bits != 0 ? (uint32_t{1} << tail_bits) - 1 : ~uint32_t{0});
+        uint32_t h = static_cast<uint32_t>(n);
+        for (size_t i = 0; i < last; ++i)
+            h = (h ^ w[i]) * 0x9E3779B1u;
+        h = (h ^ last_word) * 0x9E3779B1u;
+        slot = &keccak_memo::table()[h >> (32 - keccak_memo::BITS)];
+        if (slot->size == n && slot->key[last] == last_word)
+        {
+            size_t i = 0;
+            while (i < last && slot->key[i] == w[i])
+                ++i;
+            if (i == last)
+            {
+                wl::word_t* const xw = reinterpret_cast<wl::word_t*>(&x);
+                for (size_t j = 0; j < 8; ++j)
+                    xw[j] = slot->value[j];
+                return;
+            }
+        }
+    }
+
+    const auto hash = ethash::keccak256(b, n);
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // The hash is a local, so its words can be loaded: reversed straight into the stack slot
     // instead of building the value and copying it there.
@@ -1189,6 +1258,16 @@ inline void clz(StackTop stack) noexcept
 #else
     x = intx::be::load<uint256>(hash);
 #endif
+    if (slot != nullptr)
+    {
+        const wl::word_t* const xw = reinterpret_cast<const wl::word_t*>(&x);
+        slot->size = static_cast<uint32_t>(n);
+        for (size_t j = 0; j < 8; ++j)
+            slot->value[j] = xw[j];
+        for (size_t i = 0; i < last; ++i)
+            slot->key[i] = w[i];
+        slot->key[last] = last_word;
+    }
 }
 #endif
 
