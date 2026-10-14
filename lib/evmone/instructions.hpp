@@ -1950,6 +1950,14 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 
 Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept;
 
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+/// The cost of the JUMPDEST a taken jump lands on and therefore never dispatches.
+/// JUMP pays it in its dispatch cost, JUMPI inline once the branch is known taken.
+inline constexpr auto JUMPDEST_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPDEST];
+static_assert(instr::has_const_gas_cost(OP_JUMPDEST),
+    "skipping JUMPDEST assumes its cost is the same in every revision");
+#endif
+
 /// Internal jump implementation for JUMP/JUMPI instructions.
 inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexcept
 {
@@ -1972,6 +1980,10 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
 
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     return &analysis.code()[w[0]];
+#elif EVMONE_JUMP_SKIPS_JUMPDEST
+    // The code padding keeps dst + 1 inside the buffer: a JUMPDEST as the last byte of the code
+    // lands on the padding, which dispatches as STOP.
+    return analysis.code().data() + static_cast<size_t>(dst[0]) + 1;
 #else
     return &analysis.code()[static_cast<size_t>(dst[0])];
 #endif
@@ -1983,6 +1995,36 @@ inline code_iterator jump(StackTop stack, ExecutionState& state, code_iterator /
     return jump_impl(state, stack.pop());
 }
 
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+/// JUMPI instruction implementation using baseline::CodeAnalysis. It charges its own gas once the
+/// branch is known: a taken jump pays for the JUMPDEST it lands on as well (see
+/// DISPATCH_GAS_COST in baseline_execution.cpp).
+inline code_iterator jumpi(
+    StackTop stack, ExecutionState& state, int64_t& gas_left, code_iterator pos) noexcept
+{
+    static constexpr auto BASE_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+
+    const auto& dst = stack.pop();
+    const auto& cond = stack.pop();
+
+    if (!cond)
+    {
+        if ((gas_left -= BASE_GAS) < 0) [[unlikely]]
+        {
+            state.status = EVMC_OUT_OF_GAS;
+            return nullptr;
+        }
+        return pos + 1;
+    }
+
+    if ((gas_left -= BASE_GAS + JUMPDEST_GAS) < 0) [[unlikely]]
+    {
+        state.status = EVMC_OUT_OF_GAS;
+        return nullptr;
+    }
+    return jump_impl(state, dst);
+}
+#else
 /// JUMPI instruction implementation using baseline::CodeAnalysis.
 inline code_iterator jumpi(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
 {
@@ -1990,6 +2032,7 @@ inline code_iterator jumpi(StackTop stack, ExecutionState& state, code_iterator 
     const auto& cond = stack.pop();
     return cond ? jump_impl(state, dst) : pos + 1;
 }
+#endif
 
 inline code_iterator pc(StackTop stack, ExecutionState& state, code_iterator pos) noexcept
 {
