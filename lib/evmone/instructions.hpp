@@ -2019,8 +2019,11 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
     const auto hi_part_is_nonzero = (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0;
     if (hi_part_is_nonzero || !analysis.check_jumpdest(w[0])) [[unlikely]]
 #else
+    // Read once: the lazy scan check_jumpdest() may run writes memory, which could be the stack
+    // item for all GCC knows, so it would read the destination again for the landing address.
+    const auto offset = static_cast<size_t>(dst[0]);
     const auto hi_part_is_nonzero = (dst[3] | dst[2] | dst[1]) != 0;
-    if (hi_part_is_nonzero || !analysis.check_jumpdest(dst[0])) [[unlikely]]
+    if (hi_part_is_nonzero || !analysis.check_jumpdest(offset)) [[unlikely]]
 #endif
     {
         state.status = EVMC_BAD_JUMP_DESTINATION;
@@ -2032,9 +2035,14 @@ inline code_iterator jump_impl(ExecutionState& state, const uint256& dst) noexce
 #elif EVMONE_JUMP_SKIPS_JUMPDEST
     // The code padding keeps dst + 1 inside the buffer: a JUMPDEST as the last byte of the code
     // lands on the padding, which dispatches as STOP.
-    return analysis.code().data() + static_cast<size_t>(dst[0]) + 1;
+    const auto target = analysis.code().data() + offset + 1;
+    // A code position is never null. Unless told, GCC tests the landing address of every jump
+    // against the failure return, as the interpreter loop does with every instruction's.
+    if (target == nullptr)
+        __builtin_unreachable();
+    return target;
 #else
-    return &analysis.code()[static_cast<size_t>(dst[0])];
+    return &analysis.code()[offset];
 #endif
 }
 
