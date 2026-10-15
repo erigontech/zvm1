@@ -1114,6 +1114,73 @@ template <Opcode Op>
 }
 #endif
 
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+/// ISZERO, EQ, LT, GT, SLT or SGT followed by PUSH2 JUMPI, how Solidity branches on a test (10.6M
+/// over 200 mainnet blocks), as one step: the result decides the jump without being written to the
+/// stack and read back. The checks fail with the statuses of the separate instructions: the
+/// comparison's underflow first, then any shortfall of the gas of the three, which is out of gas
+/// as in fused_push2_jump(), then a bad destination. After ISZERO, which pops nothing, PUSH2 could
+/// overflow the stack: there the separate instructions decide between that and out of gas.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
+    const uint256* bottom1, const uint256* stack_limit, Position& pos, int64_t& gas,
+    ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT || Op == OP_SLT ||
+                  Op == OP_SGT);
+    static_assert(instr::has_const_gas_cost(Op) && instr::gas_costs[EVMC_FRONTIER][Op] == 3);
+    static constexpr auto GAS = 3 + instr::gas_costs[EVMC_FRONTIER][OP_PUSH2] +
+                                instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+    constexpr int required = Op == OP_ISZERO ? 1 : 2;
+
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_PUSH2 || c[4] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= (required == 2 ? bottom1 : stack_bottom)))
+        return fail(EVMC_STACK_UNDERFLOW);
+    if constexpr (Op == OP_ISZERO)
+    {
+        if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+            return false;
+    }
+    // The operands: the top item a and, for two, b under it.
+    const auto& a = pos.stack_end[-1];
+    bool taken;
+    if constexpr (Op == OP_ISZERO)
+        taken = a == 0;
+    else
+    {
+        const auto& b = pos.stack_end[-2];
+        if constexpr (Op == OP_EQ)
+            taken = a == b;
+        else if constexpr (Op == OP_LT)
+            taken = a < b;
+        else if constexpr (Op == OP_GT)
+            taken = b < a;
+        else if constexpr (Op == OP_SLT)
+            taken = slt(a, b);
+        else
+            taken = slt(b, a);
+    }
+    pos.stack_end -= required;
+    if (!taken)
+    {
+        if (INTX_UNLIKELY((gas -= GAS) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        pos.code_it += 5;
+        return true;
+    }
+    if (INTX_UNLIKELY((gas -= GAS + instr::core::JUMPDEST_GAS) < 0))
+        return fail(EVMC_OUT_OF_GAS);
+    return jump_to(c + 2, pos, state);
+}
+#endif
+
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
@@ -1125,6 +1192,13 @@ template <Opcode Op, bool TracingEnabled>
     if constexpr (Op == OP_PUSH2 && !TracingEnabled)
     {
         if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+    else if constexpr ((Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT ||
+                           Op == OP_SLT || Op == OP_SGT) &&
+                       !TracingEnabled)
+    {
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state))
             return pos;
     }
 #endif
