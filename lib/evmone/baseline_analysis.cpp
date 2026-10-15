@@ -43,15 +43,22 @@ size_t scan_jumpdests(JumpdestMap map, const uint8_t* code, size_t from, size_t 
     // add forms the address and K folds into the store's offset. The difference is taken between
     // integers: code analyzed in place lies in another allocation than its map.
     const auto map_delta = reinterpret_cast<uintptr_t>(map) - reinterpret_cast<uintptr_t>(code);
+    // The bounds the opcodes are compared with, hidden in registers: a RISC-V branch compares two
+    // registers, and GCC 15 loads 91 again with an li on the paths that find a JUMPDEST past the
+    // first byte, and 95 on those that find a PUSH past the third.
+    std::ptrdiff_t special_min = OP_JUMPDEST;
+    std::ptrdiff_t push_min = OP_PUSH1;
+    std::ptrdiff_t jumpdest = OP_JUMPDEST;
+    asm("" : "+r"(special_min), "+r"(push_min), "+r"(jumpdest));
     // Handle the PUSH or JUMPDEST..PUSH0 opcode op at p + K and step past it (and PUSH data).
     const auto special = [&]<std::ptrdiff_t K>(int8_t op) noexcept {
-        if (op >= OP_PUSH1)
+        if (op >= push_min)
             p += std::ptrdiff_t{op} - OP_PUSH1 + 2 + K;
         else
         {
             // Most of these are JUMPDESTs: laid out inline, the mark shares the step with the
             // other opcodes instead of jumping back to it. Storing op (nonzero) saves a li.
-            if (op == OP_JUMPDEST) [[likely]]
+            if (op == jumpdest) [[likely]]
                 reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(p) + map_delta)[K] =
                     static_cast<uint8_t>(op);
             p += K + 1;
@@ -59,21 +66,21 @@ size_t scan_jumpdests(JumpdestMap map, const uint8_t* code, size_t from, size_t 
     };
     while (p < end)
     {
-        if (const auto op = p[0]; op >= OP_JUMPDEST)
+        if (const auto op = p[0]; op >= special_min)
             special.operator()<0>(op);
-        else if (const auto op1 = p[1]; op1 >= OP_JUMPDEST)
+        else if (const auto op1 = p[1]; op1 >= special_min)
             special.operator()<1>(op1);
-        else if (const auto op2 = p[2]; op2 >= OP_JUMPDEST)
+        else if (const auto op2 = p[2]; op2 >= special_min)
             special.operator()<2>(op2);
-        else if (const auto op3 = p[3]; op3 >= OP_JUMPDEST)
+        else if (const auto op3 = p[3]; op3 >= special_min)
             special.operator()<3>(op3);
-        else if (const auto op4 = p[4]; op4 >= OP_JUMPDEST)
+        else if (const auto op4 = p[4]; op4 >= special_min)
             special.operator()<4>(op4);
-        else if (const auto op5 = p[5]; op5 >= OP_JUMPDEST)
+        else if (const auto op5 = p[5]; op5 >= special_min)
             special.operator()<5>(op5);
-        else if (const auto op6 = p[6]; op6 >= OP_JUMPDEST)
+        else if (const auto op6 = p[6]; op6 >= special_min)
             special.operator()<6>(op6);
-        else if (const auto op7 = p[7]; op7 >= OP_JUMPDEST)
+        else if (const auto op7 = p[7]; op7 >= special_min)
             special.operator()<7>(op7);
         else
             p += 8;
