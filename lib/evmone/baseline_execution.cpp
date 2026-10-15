@@ -1181,6 +1181,56 @@ template <Opcode Op>
 }
 #endif
 
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+/// LT, GT, SLT or SGT followed by ISZERO PUSH2 JUMPI, how Solidity branches on a comparison that
+/// does not hold (3.0M over 200 mainnet blocks, loop conditions and bounds checks), as one step,
+/// with the checks of fused_cmp_push2_jumpi(): the comparison pops one, so nothing can overflow.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* bottom1,
+    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT);
+    static constexpr auto GAS = 3 + 3 + instr::gas_costs[EVMC_FRONTIER][OP_PUSH2] +
+                                instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+    static_assert(instr::gas_costs[EVMC_FRONTIER][Op] == 3 &&
+                  instr::gas_costs[EVMC_FRONTIER][OP_ISZERO] == 3);
+
+    const auto* const c = pos.code_it;
+    if (c[1] != OP_ISZERO || c[2] != OP_PUSH2 || c[5] != OP_JUMPI)
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(pos.stack_end <= bottom1))
+        return fail(EVMC_STACK_UNDERFLOW);
+    const auto& a = pos.stack_end[-1];
+    const auto& b = pos.stack_end[-2];
+    // ISZERO inverts the comparison; JUMPI jumps on non-zero.
+    bool taken;
+    if constexpr (Op == OP_LT)
+        taken = !(a < b);
+    else if constexpr (Op == OP_GT)
+        taken = !(b < a);
+    else if constexpr (Op == OP_SLT)
+        taken = !slt(a, b);
+    else
+        taken = !slt(b, a);
+    pos.stack_end -= 2;
+    if (!taken)
+    {
+        if (INTX_UNLIKELY((gas -= GAS) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        pos.code_it += 6;
+        return true;
+    }
+    if (INTX_UNLIKELY((gas -= GAS + instr::core::JUMPDEST_GAS) < 0))
+        return fail(EVMC_OUT_OF_GAS);
+    return jump_to(c + 3, pos, state);
+}
+#endif
+
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
@@ -1198,6 +1248,12 @@ template <Opcode Op, bool TracingEnabled>
                            Op == OP_SLT || Op == OP_SGT) &&
                        !TracingEnabled)
     {
+        if constexpr (Op != OP_ISZERO && Op != OP_EQ)
+        {
+            // ISZERO first: it follows each of them more often than PUSH2 does.
+            if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state))
+                return pos;
+        }
         if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state))
             return pos;
     }
