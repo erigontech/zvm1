@@ -1521,43 +1521,68 @@ template <size_t Len>
 }
 #endif
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// CALLDATALOAD of an index that calldataload() does not load whole: one at or past cd_lim, or
+/// above 32 bits. That is 0 at or past the end of the input, else the bytes up to its end followed
+/// by zeros: fewer than 32. Out of line, as the loads of the instruction are long: with them all
+/// inline GCC took calldataload() for too large to inline into the dispatch loop, and called it
+/// for every CALLDATALOAD.
+[[gnu::noinline]] inline void calldataload_tail(uint256& index, ExecutionState& state) noexcept
+{
+    const word32* const iw = reinterpret_cast<const word32*>(&index);
+    if ((iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0 ||
+        state.msg->input_size <= iw[0])
+    {
+        index = 0;
+        return;
+    }
+    const auto begin = static_cast<size_t>(iw[0]);
+    const auto len = state.msg->input_size - begin;
+    if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+        wl::load_u256_partial(index, state.msg->input_data + begin, len);
+    else
+    {
+        uint8_t data[32] = {};
+        std::memcpy(data, state.msg->input_data + begin, len);
+        index = intx::be::load<uint256>(data);
+    }
+}
+
+/// The whole word at src of a byte-order input (the calldata of a transaction), out of line for
+/// the same reason.
+[[gnu::noinline]] inline void calldataload_bytes(uint256& index, const uint8_t* src) noexcept
+{
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    intx::be::unsafe::load_into(index, src);
+#else
+    index = intx::be::unsafe::load<uint256>(src);
+#endif
+}
+
+/// CALLDATALOAD on rv32. The whole word lies inside the input when the index is below cd_lim
+/// (input_size - 31, see ExecutionState): one compare, then the full load. The calldata of a
+/// call is the caller's memory, in the word layout: its whole word is 8 word copies, made inline.
+[[gnu::always_inline]] inline void calldataload(StackTop stack, ExecutionState& state) noexcept
+{
+    auto& index = stack.top();
+    const word32* const iw = reinterpret_cast<const word32*>(&index);
+    if ((iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0 || iw[0] >= state.cd_lim)
+        [[unlikely]]
+        return calldataload_tail(index, state);
+    const uint8_t* const src = state.msg->input_data + iw[0];
+    if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+        wl::load_u256(index, src);
+    else
+        calldataload_bytes(index, src);
+}
+#else
 inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
-    // The whole word lies inside the input when the index is below cd_lim (input_size - 31, see
-    // ExecutionState): one compare, then the full load. The rest (a partial word, an index at or
-    // past the end or above 32 bits) takes the general code below.
-    const word32* const iw = reinterpret_cast<const word32*>(&index);
-    const bool index_overflows_32bit =
-        (iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0;
-    if (!index_overflows_32bit && iw[0] < state.cd_lim)
-    {
-        const uint8_t* const src = state.msg->input_data + iw[0];
-#ifdef EVMONE_WORD_LAYOUT
-        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
-            wl::load_u256(index, src);  // The calldata of a call is the caller's memory.
-        else
-#endif
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-            intx::be::unsafe::load_into(index, src);
-#else
-            index = intx::be::unsafe::load<uint256>(src);
-#endif
-        return;
-    }
-#endif
-
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
-    // if index overflows 32 bits (any high word non-zero → index > any size_t value).
-    if (index_overflows_32bit || state.msg->input_size <= iw[0])
-#else
     // An index at the end loads 0 here as well, so that below the input has a byte at begin and
     // input_data is not null (an empty input may have none, which memcpy must not get).
     if (state.msg->input_size <= index)
-#endif
         index = 0;
     else
     {
@@ -1565,25 +1590,10 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         const auto end = std::min(begin + 32, state.msg->input_size);
         const auto len = end - begin;
 
-#ifdef EVMONE_WORD_LAYOUT
-        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
-        {
-            // The calldata of a call is the caller's memory.
-            if (len == 32) [[likely]]
-                wl::load_u256(index, state.msg->input_data + begin);
-            else
-                wl::load_u256_partial(index, state.msg->input_data + begin, len);
-        }
-        else
-#endif
         if (len == 32) [[likely]]
         {
             // Fast path: full 32-byte load, skip temporary buffer.
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-            intx::be::unsafe::load_into(index, state.msg->input_data + begin);
-#else
             index = load_be_word(state.msg->input_data + begin);
-#endif
         }
         else
         {
@@ -1593,6 +1603,7 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         }
     }
 }
+#endif
 
 inline void calldatasize(StackTop stack, ExecutionState& state) noexcept
 {
