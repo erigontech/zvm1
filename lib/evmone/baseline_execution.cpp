@@ -1037,12 +1037,97 @@ template <Opcode Op>
 }
 #endif
 
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+/// The taken jump of a fused sequence to the PUSH2 immediate at imm, its gas paid: resumes after
+/// the JUMPDEST at the destination, as jump_impl() does, or fails on a bad destination. Returns
+/// true, the fused sequence handled.
+[[gnu::always_inline]] inline bool jump_to(
+    const uint8_t* imm, Position& pos, ExecutionState& state) noexcept
+{
+    // Two byte loads, a shift and an or: without the barrier GCC takes the two bytes for a
+    // big-endian halfword and expands its byte swap, 9 instructions without Zbb.
+    auto dst = size_t{imm[0]};
+    asm("" : "+r"(dst));
+    dst = dst << 8 | imm[1];
+    const auto& analysis = *state.analysis.baseline;
+    if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+    {
+        state.status = EVMC_BAD_JUMP_DESTINATION;
+        pos.code_it = nullptr;
+        return true;
+    }
+    pos.code_it = analysis.code().data() + dst + 1;
+    return true;
+}
+
+/// PUSH2 followed by JUMP or JUMPI, how most jumps are written (19.9M of the 25.9M over 200
+/// mainnet blocks), as one step. The destination is the immediate: it is never stored to
+/// the stack and read back, and it has no high words to test. The checks fail with the status the
+/// separate instructions give: PUSH2's overflow comes first, and a jump pays its gas, the landing
+/// JUMPDEST's included, before it checks the destination, so any shortfall of the pair's gas is
+/// out of gas. A JUMPI without its condition is left to the separate instructions, where PUSH2's
+/// gas or JUMPI's underflow fails first depending on the gas left. The rv32 dispatch has its own
+/// form, fused_push2_jump() above.
+[[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static constexpr auto PUSH2_GAS = instr::gas_costs[EVMC_FRONTIER][OP_PUSH2];
+    static constexpr auto JUMP_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMP];
+    static constexpr auto JUMPI_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+    static_assert(instr::has_const_gas_cost(OP_PUSH2));
+
+    const auto* const c = pos.code_it;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+
+    // The successor is tested on the path of every other PUSH2, once: JUMP and JUMPI are adjacent.
+    static_assert(OP_JUMPI == OP_JUMP + 1);
+    const auto k = unsigned{c[3]} - OP_JUMP;
+    if (k > 1)
+        return false;
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (k == 0)
+    {
+        if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMP_GAS + instr::core::JUMPDEST_GAS) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        return jump_to(c + 1, pos, state);
+    }
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return false;
+    // The condition, word 0 first: a nonzero one nearly always has a nonzero low word.
+    const auto& cond = pos.stack_end[-1];
+    pos.stack_end -= 1;  // One pushed, two popped.
+    if (cond[0] != 0 || (cond[1] | cond[2] | cond[3]) != 0)
+    {
+        if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMPI_GAS + instr::core::JUMPDEST_GAS) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        return jump_to(c + 1, pos, state);
+    }
+    if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMPI_GAS) < 0))
+        return fail(EVMC_OUT_OF_GAS);
+    pos.code_it += 4;
+    return true;
+}
+#endif
+
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
     const uint256* bottom1, const uint256* bottom2, const uint256* stack_limit, Position pos,
     int64_t& gas, ExecutionState& state, [[maybe_unused]] JumpBase jb) noexcept
 {
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+    // Not with a tracer attached: it is to see each instruction.
+    if constexpr (Op == OP_PUSH2 && !TracingEnabled)
+    {
+        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+            return pos;
+    }
+#endif
 #if EVMONE_RV32_DISPATCH
     if constexpr (Op == OP_PUSH2)
     {
