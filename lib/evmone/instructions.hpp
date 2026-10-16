@@ -688,6 +688,7 @@ inline void sdiv(StackTop stack) noexcept
     v = v != 0 ? intx::sdivrem(stack[0], v).quot : 0;
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
 inline void mod(StackTop stack) noexcept
 {
     auto& v = stack[1];
@@ -717,6 +718,94 @@ inline void mod(StackTop stack) noexcept
     v = stack[0] % v;
 #endif
 }
+#else
+/// v = x % v for a power-of-two divisor whose top non-zero word T is top: the words of x below
+/// word T and the bits of word T below top. The divisor's words above T are 0 already.
+template <unsigned T>
+[[gnu::always_inline]] inline void mod_pow2(const uint256& x, uint256& v, uint64_t top) noexcept
+{
+    for (size_t i = 0; i < T; ++i)
+        v[i] = x[i];
+    v[T] = x[T] & (top - 1);
+}
+
+/// v = x % v for a divisor d < 2^32 and a dividend of N words (see div_by_u32_n()).
+template <size_t N>
+[[gnu::always_inline]] inline void mod_by_u32_n(const uint256& x, uint256& v, uint64_t d) noexcept
+{
+    uint64_t r = 0;
+    for (size_t i = N; i-- != 0;)
+    {
+        r = ((r << 32) | (x[i] >> 32)) % d;
+        r = ((r << 32) | (x[i] & 0xffffffff)) % d;
+    }
+    v[0] = r;  // The divisor's other words are 0.
+}
+
+/// mod_by_u32_n() for a dividend of 2 to 4 words, stack[0] % stack[1] (see div_by_u32()).
+[[gnu::noinline]] inline void mod_by_u32(StackTop stack, uint64_t d) noexcept
+{
+    const auto& x = stack[0];
+    auto& v = stack[1];
+    if (x[3] != 0)
+        mod_by_u32_n<4>(x, v, d);
+    else if (x[2] != 0)
+        mod_by_u32_n<3>(x, v, d);
+    else
+        mod_by_u32_n<2>(x, v, d);
+}
+
+inline void mod(StackTop stack) noexcept
+{
+    // The cases of div(), with masks for the powers of two.
+    auto& v = stack[1];
+    const auto& x = stack[0];
+    const auto v0 = v[0];
+    const auto v1 = v[1];
+    const auto v2 = v[2];
+    const auto v3 = v[3];
+    if (v3 != 0)
+    {
+        if (((v3 & (v3 - 1)) | v2 | v1 | v0) == 0)
+            return mod_pow2<3>(x, v, v3);
+        // Most four-word moduli are the BN254 group order, with a reduced dividend: the top
+        // words tell, and the dividend is the remainder.
+        if (x[3] < v3)
+        {
+            v = x;
+            return;
+        }
+    }
+    else if (v2 != 0)
+    {
+        if (((v2 & (v2 - 1)) | v1 | v0) == 0)
+            return mod_pow2<2>(x, v, v2);
+    }
+    else if (v1 != 0)
+    {
+        if (((v1 & (v1 - 1)) | v0) == 0)
+            return mod_pow2<1>(x, v, v1);
+    }
+    else if (v0 != 0)
+    {
+        if ((v0 & (v0 - 1)) == 0)
+            return mod_pow2<0>(x, v, v0);
+        const auto x1 = x[1];
+        const auto x2 = x[2];
+        const auto x3 = x[3];
+        if ((x1 | x2 | x3) == 0)
+        {
+            v[0] = x[0] % v0;  // The divisor's other words are 0.
+            return;
+        }
+        if ((v0 >> 32) == 0)
+            return mod_by_u32(stack, v0);
+    }
+    else
+        return;  // The divisor 0 is the result.
+    v = x % v;
+}
+#endif
 
 inline void smod(StackTop stack) noexcept
 {
