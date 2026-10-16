@@ -1018,17 +1018,20 @@ std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> has
     const auto y_sp1 = intx::be::unsafe::load<uint256>(&sp1_Rbytes[32]);
     if (y_sp1 == 0)
         return std::nullopt;
+    sp1_AffinePoint sp1_R;
+    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
 #else
     const auto y = decompress(r_val, parity);
     if (!y.has_value())
         return std::nullopt;
-    uint8_t sp1_Rbytes[64]{};
-    intx::be::unsafe::store(&sp1_Rbytes[0], r_val);
-    intx::be::unsafe::store(&sp1_Rbytes[32], *y);
-#endif
-
+    // The point's words are the little-endian 64-bit limbs of x and y, as uint256 keeps them.
     sp1_AffinePoint sp1_R;
-    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
+    for (size_t i = 0; i < SP1_POINT_SIZE / 2; ++i)
+    {
+        sp1_R[i] = r_val[i];
+        sp1_R[SP1_POINT_SIZE / 2 + i] = (*y)[i];
+    }
+#endif
 
     // Shamir's trick: compute u1*G + u2*R in a single pass
     sp1_AffinePoint sp1_Q;
