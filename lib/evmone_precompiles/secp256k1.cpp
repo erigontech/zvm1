@@ -379,119 +379,78 @@ inline uint256 sp1_submod(const uint256& x, const uint256& y)
 }
 
 
-std::optional<uint256> field_sqrt_sp1(const uint256& field, const uint256& x) noexcept
+/// Products modulo m on the uint256_mulmod syscall, x = x * y mod m, which reads y and then m from
+/// consecutive words. sp1_mulmod() builds that pair for every call, and the syscall's memory clobber
+/// makes the compiler store all of it again each time, the constant m included; this keeps the
+/// pair, so a chain of products stores m once and then only y (a square copies x into it).
+class Sp1MulMod
 {
-    uint256 z;
-    uint256 t0;
-    uint256 t1;
-    uint256 t2;
-    uint256 t3;
+    uint256 ym_[2];
 
-    // Step 1: z = x^0x2
-    sp1_mulmod(z, x, x);
+public:
+    explicit Sp1MulMod(const uint256& m) noexcept { ym_[1] = m; }
 
-    // Step 2: z = x^0x3
-    sp1_mulmod(z, x, z);
+    /// x = x * y mod m.
+    void mul(uint256& x, const uint256& y) noexcept
+    {
+        ym_[0] = y;
+        sp1::mulmod(x, ym_);
+    }
 
-    // Step 4: t0 = x^0xc
-    sp1_mulmod(t0, z, z);
-    for (int i = 1; i < 2; ++i)
-        sp1_mulmod(t0, t0, t0);
+    /// x = x^(2^n) mod m.
+    void sqr(uint256& x, unsigned n = 1) noexcept
+    {
+        for (; n != 0; --n)
+            mul(x, x);
+    }
+};
 
-    // Step 5: t0 = x^0xf
-    sp1_mulmod(t0, z, t0);
-
-    // Step 6: t1 = x^0x1e
-    sp1_mulmod(t1, t0, t0);
-
-    // Step 7: t2 = x^0x1f
-    sp1_mulmod(t2, x, t1);
-
-    // Step 9: t1 = x^0x7c
-    sp1_mulmod(t1, t2, t2);
-    for (int i = 1; i < 2; ++i)
-        sp1_mulmod(t1, t1, t1);
-
-    // Step 10: t1 = x^0x7f
-    sp1_mulmod(t1, z, t1);
-
-    // Step 14: t3 = x^0x7f0
-    sp1_mulmod(t3, t1, t1);
-    for (int i = 1; i < 4; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 15: t0 = x^0x7ff
-    sp1_mulmod(t0, t0, t3);
-
-    // Step 26: t3 = x^0x3ff800
-    sp1_mulmod(t3, t0, t0);
-    for (int i = 1; i < 11; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 27: t0 = x^0x3fffff
-    sp1_mulmod(t0, t0, t3);
-
-    // Step 32: t3 = x^0x7ffffe0
-    sp1_mulmod(t3, t0, t0);
-    for (int i = 1; i < 5; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 33: t2 = x^0x7ffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 60: t3 = x^0x3ffffff8000000
-    sp1_mulmod(t3, t2, t2);
-    for (int i = 1; i < 27; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 61: t2 = x^0x3fffffffffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 115: t3 = x^0xfffffffffffffc0000000000000
-    sp1_mulmod(t3, t2, t2);
-    for (int i = 1; i < 54; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 116: t2 = x^0xfffffffffffffffffffffffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 224: t3 = x^0xfffffffffffffffffffffffffff000000000000000000000000000
-    sp1_mulmod(t3, t2, t2);
-    for (int i = 1; i < 108; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 225: t2 = x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 232: t2 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffff80
-    for (int i = 0; i < 7; ++i)
-        sp1_mulmod(t2, t2, t2);
-
-    // Step 233: t1 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    sp1_mulmod(t1, t1, t2);
-
-    // Step 256: t1 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffff800000
-    for (int i = 0; i < 23; ++i)
-        sp1_mulmod(t1, t1, t1);
-
-    // Step 257: t0 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
-    sp1_mulmod(t0, t0, t1);
-
-    // Step 263: t0 = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc0
-    for (int i = 0; i < 6; ++i)
-        sp1_mulmod(t0, t0, t0);
-
-    // Step 264: z = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
-    sp1_mulmod(z, z, t0);
-
-    // Step 266: z = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
-    for (int i = 0; i < 2; ++i)
-        sp1_mulmod(z, z, z);
+/// The square root of x modulo p, x^((p+1)/4) by the addition chain of field_sqrt() on m, a Sp1MulMod
+/// modulo p; nullopt if x is not a square.
+std::optional<uint256> field_sqrt_sp1(Sp1MulMod& m, const uint256& x) noexcept
+{
+    uint256 z = x;
+    m.mul(z, x);  // x^0x2
+    m.mul(z, x);  // x^0x3
+    uint256 t0 = z;
+    m.sqr(t0, 2);  // x^0xc
+    m.mul(t0, z);  // x^0xf
+    uint256 t1 = t0;
+    m.sqr(t1);  // x^0x1e
+    uint256 t2 = t1;
+    m.mul(t2, x);  // x^0x1f
+    t1 = t2;
+    m.sqr(t1, 2);  // x^0x7c
+    m.mul(t1, z);  // x^0x7f
+    uint256 t3 = t1;
+    m.sqr(t3, 4);   // x^0x7f0
+    m.mul(t0, t3);  // x^0x7ff
+    t3 = t0;
+    m.sqr(t3, 11);  // x^0x3ff800
+    m.mul(t0, t3);  // x^0x3fffff
+    t3 = t0;
+    m.sqr(t3, 5);   // x^0x7ffffe0
+    m.mul(t2, t3);  // x^0x7ffffff
+    t3 = t2;
+    m.sqr(t3, 27);  // x^0x3ffffff8000000
+    m.mul(t2, t3);  // x^0x3fffffffffffff
+    t3 = t2;
+    m.sqr(t3, 54);  // x^0xfffffffffffffc0000000000000
+    m.mul(t2, t3);  // x^0xfffffffffffffffffffffffffff
+    t3 = t2;
+    m.sqr(t3, 108);  // x^0xfffffffffffffffffffffffffff000000000000000000000000000
+    m.mul(t2, t3);   // x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    m.sqr(t2, 7);    // x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffff80
+    m.mul(t1, t2);   // x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    m.sqr(t1, 23);   // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffff800000
+    m.mul(t0, t1);   // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
+    m.sqr(t0, 6);    // x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc0
+    m.mul(z, t0);    // x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
+    m.sqr(z, 2);     // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
 
     // Verify: z^2 == x (mod p)
-    uint256 z_squared;
-    sp1_mulmod(z_squared, z, z);
-
+    uint256 z_squared = z;
+    m.sqr(z_squared);
     if (z_squared != x)
         return std::nullopt;  // Computed value is not the square root.
 
@@ -508,16 +467,15 @@ std::optional<uint256> decompress(const uint256& x, bool y_parity) noexcept
     // Calculate x^3 + 7 (all in regular/non-Montgomery form for SP1 syscalls)
     constexpr uint256 B_regular = 7;
 
-    uint256 x_squared{};
-    sp1_mulmod(x_squared, x, x);  // x_squared = x^2 mod p
-
-    uint256 x_cubed{};
-    sp1_mulmod(x_cubed, x_squared, x);  // x_cubed = x^3 mod p
+    Sp1MulMod m{Curve::FIELD_PRIME};
+    uint256 x_cubed = x;
+    m.mul(x_cubed, x);  // x^2 mod p
+    m.mul(x_cubed, x);  // x^3 mod p
 
     uint256 y_squared = sp1_addmod(x_cubed, B_regular);  // y_squared = x^3 + 7 mod p
 
     // sqrt(x^3 + 7)
-    const auto y = field_sqrt_sp1(Curve::FIELD_PRIME, y_squared);
+    const auto y = field_sqrt_sp1(m, y_squared);
     if (!y.has_value())
         return std::nullopt;
 
