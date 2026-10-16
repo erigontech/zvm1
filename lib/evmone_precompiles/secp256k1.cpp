@@ -1705,8 +1705,10 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
 void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional<evmc::address>> out,
     RecoveryMode mode) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
+#if EVMONE_SECP256K1_MSM_SINGLE
     // The steps of secp256k1_ecdsa_recover() per signature, with its two inversions batched.
+    // EVMONE_RV32_DISPATCH_TEST builds this on the host too, so that it is tested there against
+    // ecrecover().
     using Fr = Curve::Fr;
     using Fp = Curve::Fp;
     const size_t n = in.size();
