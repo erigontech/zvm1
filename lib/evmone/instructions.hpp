@@ -568,32 +568,68 @@ inline void div(StackTop stack) noexcept
         div_top<0>(x, v, w0, 0);
 }
 #else
+/// v = x / v for a power-of-two divisor 2^(64 * T + b), whose top non-zero word T is top = 2^b.
+/// Word i of the quotient is x[i + T] / 2^b plus the low b bits of x[i + T + 1] moved above them,
+/// x[i + T + 1] * 2^(64 - b), where 2^64 wraps to 0 for b = 0. So b itself is never needed:
+/// rv64im has no instruction to count zeros (libgcc's __ctzdi2 loops over the bytes), but
+/// a division and a multiplication are one instruction each in the zkVMs.
+/// x and v are different stack slots.
+template <unsigned T>
+[[gnu::always_inline]] inline void div_pow2(const uint256& x, uint256& v, uint64_t top) noexcept
+{
+    auto m = (uint64_t{1} << 63) / top * 2;
+    asm("" : "+r"(m));  // Or GCC doubles each product by 2^63 / top instead.
+    uint64_t q[4];
+    for (size_t i = 0; i < 4; ++i)
+    {
+        if (i + T > 3)
+            q[i] = 0;
+        else if (i + T == 3)
+            q[i] = x[3] / top;
+        else
+            q[i] = x[i + T] / top | x[i + T + 1] * m;
+    }
+    v[0] = q[0];
+    v[1] = q[1];
+    v[2] = q[2];
+    v[3] = q[3];
+}
+
 inline void div(StackTop stack) noexcept
 {
+    // Powers of two of any width are divisions of the words by a word: 45% of mainnet DIVs,
+    // most of them wider than a word (2^224 extracts a function selector, 2^160 an address).
+    // The top non-zero word of the divisor selects the case. A power of two has a single bit
+    // there and nothing below it: 2^192 + 1 has the single-bit top word 1.
     auto& v = stack[1];
-    if (v == 0) [[unlikely]]
+    const auto& x = stack[0];
+    const auto v0 = v[0];
+    const auto v1 = v[1];
+    const auto v2 = v[2];
+    const auto v3 = v[3];
+    if (v3 != 0)
     {
-        v = 0;
-        return;
+        if (((v3 & (v3 - 1)) | v2 | v1 | v0) == 0)
+            return div_pow2<3>(x, v, v3);
     }
-    // Fast path: if divisor fits in a single 64-bit word (top 3 words are zero),
-    // we can avoid the expensive multi-word Knuth division.
-    if ((v[3] | v[2] | v[1]) == 0)
+    else if (v2 != 0)
     {
-        const auto d = v[0];
-        // Power-of-2 fast path: shift instead of divide.
-        if ((d & (d - 1)) == 0)
-        {
-            const auto shift = static_cast<unsigned>(__builtin_ctzll(d));
-            v = stack[0] >> shift;
-            return;
-        }
-        v = stack[0] / v;
+        if (((v2 & (v2 - 1)) | v1 | v0) == 0)
+            return div_pow2<2>(x, v, v2);
+    }
+    else if (v1 != 0)
+    {
+        if (((v1 & (v1 - 1)) | v0) == 0)
+            return div_pow2<1>(x, v, v1);
+    }
+    else if (v0 != 0)
+    {
+        if ((v0 & (v0 - 1)) == 0)
+            return div_pow2<0>(x, v, v0);
     }
     else
-    {
-        v = stack[0] / v;
-    }
+        return;  // The divisor 0 is the result.
+    v = x / v;
 }
 #endif
 
