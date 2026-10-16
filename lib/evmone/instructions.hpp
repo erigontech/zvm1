@@ -684,8 +684,20 @@ inline void div(StackTop stack) noexcept
 
 inline void sdiv(StackTop stack) noexcept
 {
+    // div() of the absolute values, in place (stack[0] is popped, so its slot is free to change),
+    // with the sign of the quotient, which rounds toward zero. -2^255 / -1 divides 2^255 by 1,
+    // and 2^255 is -2^255 again.
+    auto& x = stack[0];
     auto& v = stack[1];
-    v = v != 0 ? intx::sdivrem(stack[0], v).quot : 0;
+    const bool x_neg = static_cast<int64_t>(x[3]) < 0;
+    const bool v_neg = static_cast<int64_t>(v[3]) < 0;
+    if (x_neg)
+        x = -x;
+    if (v_neg)
+        v = -v;
+    div(stack);
+    if (x_neg != v_neg)
+        v = -v;
 }
 
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
@@ -809,8 +821,17 @@ inline void mod(StackTop stack) noexcept
 
 inline void smod(StackTop stack) noexcept
 {
+    // mod() of the absolute values, in place as in sdiv(), with the sign of the dividend.
+    auto& x = stack[0];
     auto& v = stack[1];
-    v = v != 0 ? intx::sdivrem(stack[0], v).rem : 0;
+    const bool x_neg = static_cast<int64_t>(x[3]) < 0;
+    if (x_neg)
+        x = -x;
+    if (static_cast<int64_t>(v[3]) < 0)
+        v = -v;
+    mod(stack);
+    if (x_neg)
+        v = -v;
 }
 
 #if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
