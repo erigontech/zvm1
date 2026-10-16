@@ -919,34 +919,44 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
 #if defined(SP1TURBO) || defined(SP1)
 namespace
 {
-/// Parses and range-checks the signature scalars as ecrecover() does.
+// The scalars mod n are plain integers here, multiplied on the uint256_mulmod syscall
+// (Sp1MulMod): Curve::Fr would multiply in software, in Montgomery form, which costs hundreds of
+// instructions per product and per conversion (from_bytes(), value()).
+
+/// Parses and range-checks the signature scalars as ecrecover() does: r in [1, n), s in [1, n),
+/// or in [1, n/2] in the strict mode.
 bool parse_signature(std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
-    RecoveryMode mode, Curve::Fr& r, Curve::Fr& s) noexcept
+    RecoveryMode mode, uint256& r, uint256& s) noexcept
 {
-    const auto opt_r = Curve::Fr::from_bytes(r_bytes);
-    if (!opt_r.has_value() || *opt_r == 0)
+    r = intx::be::unsafe::load<uint256>(r_bytes.data());
+    if (r == 0 || r >= Curve::ORDER)
         return false;
-    const auto opt_s = mode == RecoveryMode::strict ?
-                           Curve::Fr::from_bytes<Curve::Fr::Range::half>(s_bytes) :
-                           Curve::Fr::from_bytes<Curve::Fr::Range::full>(s_bytes);
-    if (!opt_s.has_value() || *opt_s == 0)
-        return false;
-    r = *opt_r;
-    s = *opt_s;
-    return true;
+    s = intx::be::unsafe::load<uint256>(s_bytes.data());
+    const auto s_end = mode == RecoveryMode::strict ? Curve::ORDER / 2 + 1 : Curve::ORDER;
+    return s != 0 && s < s_end;
 }
 
-/// ecrecover() after the scalar inversion, given r_inv = 1/r.
-std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> hash,
-    const Curve::Fr& r_fr, const Curve::Fr& s_fr, const Curve::Fr& r_inv, bool parity) noexcept
+/// 1/x mod n for x in [1, n), with Curve::Fr's inversion.
+uint256 scalar_inv(const uint256& x) noexcept
 {
-    // Compute z, u1, u2 using FieldElement arithmetic.
-    const auto z = Curve::Fr{intx::be::unsafe::load<uint256>(hash.data())};
-    const auto u1 = (-z * r_inv).value();
-    const auto u2 = (s_fr * r_inv).value();
-    assert(u2 != 0);
+    return (1 / Curve::Fr{x}).value();
+}
 
-    const auto r_val = r_fr.value();
+/// ecrecover() after the scalar inversion, given r_inv = 1/r mod n.
+std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> hash,
+    const uint256& r_val, const uint256& s, const uint256& r_inv, bool parity) noexcept
+{
+    // u1 = -z/r and u2 = s/r, with z the hash mod n (the hash is below 2n).
+    Sp1MulMod mod_n{Curve::ORDER};
+    auto u1 = intx::be::unsafe::load<uint256>(hash.data());
+    if (u1 >= Curve::ORDER)
+        u1 -= Curve::ORDER;
+    mod_n.mul(u1, r_inv);
+    if (u1 != 0)
+        u1 = Curve::ORDER - u1;
+    auto u2 = s;
+    mod_n.mul(u2, r_inv);
+    assert(u2 != 0);
 
     // Point decompression and SP1 point operations.
 #ifdef SP1TURBO
@@ -991,10 +1001,10 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     RecoveryMode mode) noexcept
 {
 #if defined(SP1TURBO) || defined(SP1)
-    Curve::Fr r_fr, s_fr;
-    if (!parse_signature(r_bytes, s_bytes, mode, r_fr, s_fr))
+    uint256 r, s;
+    if (!parse_signature(r_bytes, s_bytes, mode, r, s))
         return std::nullopt;
-    return ecrecover_inverted(hash, r_fr, s_fr, 1 / r_fr, parity);
+    return ecrecover_inverted(hash, r, s, scalar_inv(r), parity);
 #else
     // TODO(C++23): use std::optional::and_then.
     const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity, mode);
@@ -1847,19 +1857,20 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
     // Montgomery's trick: prefix[i] = product of the valid r before i; invert the full product
     // once and peel each r^-1 off it walking back.
     const auto n = in.size();
-    std::vector<Curve::Fr> r(n), s(n), prefix(n);
+    std::vector<uint256> r(n), s(n), prefix(n);
     std::vector<uint8_t> valid(n);
-    auto prod = Curve::Fr::one();
+    Sp1MulMod mod_n{Curve::ORDER};
+    uint256 prod = 1;
     for (size_t i = 0; i < n; ++i)
     {
         valid[i] = parse_signature(in[i].r, in[i].s, mode, r[i], s[i]);
         if (valid[i])
         {
             prefix[i] = prod;
-            prod = prod * r[i];
+            mod_n.mul(prod, r[i]);
         }
     }
-    auto inv = 1 / prod;  // r in [1, N) and N prime: prod != 0.
+    auto inv = scalar_inv(prod);  // r in [1, n) and n prime: prod != 0.
     for (size_t i = n; i-- > 0;)
     {
         if (!valid[i])
@@ -1867,8 +1878,9 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
             out[i] = std::nullopt;
             continue;
         }
-        const auto r_inv = inv * prefix[i];
-        inv = inv * r[i];
+        auto r_inv = inv;
+        mod_n.mul(r_inv, prefix[i]);
+        mod_n.mul(inv, r[i]);
         out[i] = ecrecover_inverted(in[i].hash, r[i], s[i], r_inv, in[i].parity);
     }
 #else
