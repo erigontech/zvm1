@@ -892,9 +892,58 @@ inline void smod(StackTop stack) noexcept
     }
     return true;
 }
+#else
+/// Sets m = (x + y) % m, in m's slot, when the top words of x and y are below m's (so x < m,
+/// y < m and m != 0); otherwise returns false with m untouched. In SP1 a reduced sum costs 54
+/// instructions here, 65 through the uint256_mulmod syscall, for which the sum, a 1 and the
+/// modulus have to be stored.
+[[gnu::always_inline]] inline bool addmod_reduced(
+    uint256& m, const uint256& x, const uint256& y) noexcept
+{
+    const auto m3 = m[3];
+    if (x[3] >= m3 || y[3] >= m3)
+        return false;
+
+    // x + y < 2m, so one subtraction of m reduces it, when the sum reached 2^256 or m.
+    uint64_t s[4];
+    s[0] = x[0] + y[0];
+    uint64_t carry = s[0] < x[0];
+    for (size_t i = 1; i < 4; ++i)
+    {
+        const auto t = x[i] + y[i];
+        const uint64_t c1 = t < x[i];
+        s[i] = t + carry;
+        carry = c1 | (s[i] < t);
+    }
+    bool sub = carry != 0 || s[3] > m3;
+    if (!sub && s[3] == m3)
+        sub = uint256{s[0], s[1], s[2], s[3]} >= m;
+
+    if (sub)
+    {
+        uint64_t borrow = 0;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            const auto mi = m[i];
+            const auto d = s[i] - mi;
+            const uint64_t b1 = s[i] < mi;
+            m[i] = d - borrow;
+            borrow = b1 | (d < borrow);
+        }
+    }
+    else
+    {
+        m[0] = s[0];
+        m[1] = s[1];
+        m[2] = s[2];
+        m[3] = s[3];
+    }
+    return true;
+}
 #endif
 
-inline void addmod(StackTop stack) noexcept
+/// Inlined into the interpreter loop, which GCC no longer did for SP1 with the reduced sum.
+[[gnu::always_inline]] inline void addmod(StackTop stack) noexcept
 {
     auto& x = stack.pop();
     auto& y = stack.pop();
@@ -906,6 +955,9 @@ inline void addmod(StackTop stack) noexcept
     if (addmod_reduced(
             reinterpret_cast<word32*>(&m), reinterpret_cast<const word32*>(&x),
             reinterpret_cast<const word32*>(&y)))
+        return;
+#else
+    if (addmod_reduced(m, x, y))
         return;
 #endif
 
