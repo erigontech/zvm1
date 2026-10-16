@@ -8,6 +8,7 @@
 #include <memory>
 #include <new>
 #include <type_traits>
+#include <vector>
 
 #if (defined(AIRBENDER) && defined(__riscv)) || defined(EVMONE_RV32_DISPATCH_TEST)
 /// ecrecover_msm_single(): GLV halves, width-12 NAFs of G and width-5 NAFs of R over a table of odd
@@ -83,6 +84,30 @@ constexpr auto make_phi_g() noexcept
     return AffinePoint{beta * G.x, G.y};
 }
 constexpr AffinePoint PHI_G = make_phi_g();
+
+/// The GLV split k = k1 + k2 lambda (mod n) with |k1|, |k2| < 2^128, libsecp256k1's
+/// scalar_split_lambda, over the lattice basis (a1, b1) = (X1, -MINUS_Y1), (a2, b2) = (X2, Y2) of
+/// Curve: c1 = round(b2 k / n) and c2 = round(-b1 k / n) come from 384-bit shifted products with
+/// these g1 = round(2^384 b2 / n) and g2 = round(2^384 (-b1) / n), and then k1 = k - c1 a1 - c2 a2
+/// and k2 = -c1 b1 - c2 b2 are short (|ci - exact| <= 1/2 + 2^-127 bounds them by 0.64 * 2^128),
+/// so computed modulo 2^256 their top bit is the sign. The SP1 and Airbender splits use these.
+constexpr auto GLV_G1 = 0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
+constexpr auto GLV_G2 = 0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+// The rounding constants are tied to the lattice; their top halves are below 2^128 - 1, so
+// c = (h >> 128) + bit 127 of h, with h the top half of the product, does not carry out; and
+// (1/2 + 2^-129)(|a1| + |a2|) and (1/2 + 2^-129)(|b1| + |b2|) stay below 2^128.
+static_assert([] {
+    constexpr auto round_384 = [](const uint256& b) noexcept {
+        return static_cast<uint256>(
+            ((intx::uint<512>{b} << 384) + (Curve::ORDER >> 1)) / intx::uint<512>{Curve::ORDER});
+    };
+    return GLV_G1 == round_384(Curve::Y2) && GLV_G2 == round_384(Curve::MINUS_Y1);
+}());
+static_assert(Curve::X1 * Curve::Y2 + Curve::X2 * Curve::MINUS_Y1 == Curve::ORDER);
+static_assert(Curve::X1 == Curve::Y2);  // a1 == b2
+static_assert((GLV_G1 >> 128) < (uint256{1} << 128) - 1 && (GLV_G2 >> 128) < (uint256{1} << 128) - 1);
+static_assert((Curve::X1 + Curve::X2) / 2 + 1 < (uint256{1} << 128) &&
+              (Curve::MINUS_Y1 + Curve::Y2) / 2 + 1 < (uint256{1} << 128));
 
 /// Precomputed window-8 table: PHI_G_TABLE[i] = (i+1)*phi(G) for i=0..254.
 /// 255 consteval AffinePoints = 16KB in .rodata.
@@ -354,119 +379,78 @@ inline uint256 sp1_submod(const uint256& x, const uint256& y)
 }
 
 
-std::optional<uint256> field_sqrt_sp1(const uint256& field, const uint256& x) noexcept
+/// Products modulo m on the uint256_mulmod syscall, x = x * y mod m, which reads y and then m from
+/// consecutive words. sp1_mulmod() builds that pair for every call, and the syscall's memory clobber
+/// makes the compiler store all of it again each time, the constant m included; this keeps the
+/// pair, so a chain of products stores m once and then only y (a square copies x into it).
+class Sp1MulMod
 {
-    uint256 z;
-    uint256 t0;
-    uint256 t1;
-    uint256 t2;
-    uint256 t3;
+    uint256 ym_[2];
 
-    // Step 1: z = x^0x2
-    sp1_mulmod(z, x, x);
+public:
+    explicit Sp1MulMod(const uint256& m) noexcept { ym_[1] = m; }
 
-    // Step 2: z = x^0x3
-    sp1_mulmod(z, x, z);
+    /// x = x * y mod m.
+    void mul(uint256& x, const uint256& y) noexcept
+    {
+        ym_[0] = y;
+        sp1::mulmod(x, ym_);
+    }
 
-    // Step 4: t0 = x^0xc
-    sp1_mulmod(t0, z, z);
-    for (int i = 1; i < 2; ++i)
-        sp1_mulmod(t0, t0, t0);
+    /// x = x^(2^n) mod m.
+    void sqr(uint256& x, unsigned n = 1) noexcept
+    {
+        for (; n != 0; --n)
+            mul(x, x);
+    }
+};
 
-    // Step 5: t0 = x^0xf
-    sp1_mulmod(t0, z, t0);
-
-    // Step 6: t1 = x^0x1e
-    sp1_mulmod(t1, t0, t0);
-
-    // Step 7: t2 = x^0x1f
-    sp1_mulmod(t2, x, t1);
-
-    // Step 9: t1 = x^0x7c
-    sp1_mulmod(t1, t2, t2);
-    for (int i = 1; i < 2; ++i)
-        sp1_mulmod(t1, t1, t1);
-
-    // Step 10: t1 = x^0x7f
-    sp1_mulmod(t1, z, t1);
-
-    // Step 14: t3 = x^0x7f0
-    sp1_mulmod(t3, t1, t1);
-    for (int i = 1; i < 4; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 15: t0 = x^0x7ff
-    sp1_mulmod(t0, t0, t3);
-
-    // Step 26: t3 = x^0x3ff800
-    sp1_mulmod(t3, t0, t0);
-    for (int i = 1; i < 11; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 27: t0 = x^0x3fffff
-    sp1_mulmod(t0, t0, t3);
-
-    // Step 32: t3 = x^0x7ffffe0
-    sp1_mulmod(t3, t0, t0);
-    for (int i = 1; i < 5; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 33: t2 = x^0x7ffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 60: t3 = x^0x3ffffff8000000
-    sp1_mulmod(t3, t2, t2);
-    for (int i = 1; i < 27; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 61: t2 = x^0x3fffffffffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 115: t3 = x^0xfffffffffffffc0000000000000
-    sp1_mulmod(t3, t2, t2);
-    for (int i = 1; i < 54; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 116: t2 = x^0xfffffffffffffffffffffffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 224: t3 = x^0xfffffffffffffffffffffffffff000000000000000000000000000
-    sp1_mulmod(t3, t2, t2);
-    for (int i = 1; i < 108; ++i)
-        sp1_mulmod(t3, t3, t3);
-
-    // Step 225: t2 = x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    sp1_mulmod(t2, t2, t3);
-
-    // Step 232: t2 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffff80
-    for (int i = 0; i < 7; ++i)
-        sp1_mulmod(t2, t2, t2);
-
-    // Step 233: t1 = x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    sp1_mulmod(t1, t1, t2);
-
-    // Step 256: t1 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffff800000
-    for (int i = 0; i < 23; ++i)
-        sp1_mulmod(t1, t1, t1);
-
-    // Step 257: t0 = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
-    sp1_mulmod(t0, t0, t1);
-
-    // Step 263: t0 = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc0
-    for (int i = 0; i < 6; ++i)
-        sp1_mulmod(t0, t0, t0);
-
-    // Step 264: z = x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
-    sp1_mulmod(z, z, t0);
-
-    // Step 266: z = x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
-    for (int i = 0; i < 2; ++i)
-        sp1_mulmod(z, z, z);
+/// The square root of x modulo p, x^((p+1)/4) by the addition chain of field_sqrt() on m, a Sp1MulMod
+/// modulo p; nullopt if x is not a square.
+std::optional<uint256> field_sqrt_sp1(Sp1MulMod& m, const uint256& x) noexcept
+{
+    uint256 z = x;
+    m.mul(z, x);  // x^0x2
+    m.mul(z, x);  // x^0x3
+    uint256 t0 = z;
+    m.sqr(t0, 2);  // x^0xc
+    m.mul(t0, z);  // x^0xf
+    uint256 t1 = t0;
+    m.sqr(t1);  // x^0x1e
+    uint256 t2 = t1;
+    m.mul(t2, x);  // x^0x1f
+    t1 = t2;
+    m.sqr(t1, 2);  // x^0x7c
+    m.mul(t1, z);  // x^0x7f
+    uint256 t3 = t1;
+    m.sqr(t3, 4);   // x^0x7f0
+    m.mul(t0, t3);  // x^0x7ff
+    t3 = t0;
+    m.sqr(t3, 11);  // x^0x3ff800
+    m.mul(t0, t3);  // x^0x3fffff
+    t3 = t0;
+    m.sqr(t3, 5);   // x^0x7ffffe0
+    m.mul(t2, t3);  // x^0x7ffffff
+    t3 = t2;
+    m.sqr(t3, 27);  // x^0x3ffffff8000000
+    m.mul(t2, t3);  // x^0x3fffffffffffff
+    t3 = t2;
+    m.sqr(t3, 54);  // x^0xfffffffffffffc0000000000000
+    m.mul(t2, t3);  // x^0xfffffffffffffffffffffffffff
+    t3 = t2;
+    m.sqr(t3, 108);  // x^0xfffffffffffffffffffffffffff000000000000000000000000000
+    m.mul(t2, t3);   // x^0xffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    m.sqr(t2, 7);    // x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffff80
+    m.mul(t1, t2);   // x^0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    m.sqr(t1, 23);   // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffff800000
+    m.mul(t0, t1);   // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff
+    m.sqr(t0, 6);    // x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc0
+    m.mul(z, t0);    // x^0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc3
+    m.sqr(z, 2);     // x^0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
 
     // Verify: z^2 == x (mod p)
-    uint256 z_squared;
-    sp1_mulmod(z_squared, z, z);
-
+    uint256 z_squared = z;
+    m.sqr(z_squared);
     if (z_squared != x)
         return std::nullopt;  // Computed value is not the square root.
 
@@ -483,16 +467,15 @@ std::optional<uint256> decompress(const uint256& x, bool y_parity) noexcept
     // Calculate x^3 + 7 (all in regular/non-Montgomery form for SP1 syscalls)
     constexpr uint256 B_regular = 7;
 
-    uint256 x_squared{};
-    sp1_mulmod(x_squared, x, x);  // x_squared = x^2 mod p
-
-    uint256 x_cubed{};
-    sp1_mulmod(x_cubed, x_squared, x);  // x_cubed = x^3 mod p
+    Sp1MulMod m{Curve::FIELD_PRIME};
+    uint256 x_cubed = x;
+    m.mul(x_cubed, x);  // x^2 mod p
+    m.mul(x_cubed, x);  // x^3 mod p
 
     uint256 y_squared = sp1_addmod(x_cubed, B_regular);  // y_squared = x^3 + 7 mod p
 
     // sqrt(x^3 + 7)
-    const auto y = field_sqrt_sp1(Curve::FIELD_PRIME, y_squared);
+    const auto y = field_sqrt_sp1(m, y_squared);
     if (!y.has_value())
         return std::nullopt;
 
@@ -682,6 +665,189 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     }
 }
 
+#ifndef SP1TURBO
+// GLV endomorphism: phi(x, y) = (BETA * x, y) = LAMBDA * (x, y). A scalar splits as
+// k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (see GLV_G1), so u*G + v*Q becomes four
+// half-length scalars sharing one run of 128 doublings.
+
+constexpr auto PhiGx_val = 0xbcace2e99da01887ab0102b696902325872844067f15e98da7bba04400b88fcb_u256;
+constexpr auto GpPhiGx_val = 0xc994b69768832bcbff5e9ab39ae8d1d3763bbf1e531bed98fe51de5ee84f50fb_u256;
+constexpr auto GpPhiGy_val = 0xb7c52588d95c3b9aa25b0403f1eef75702e84bb7597aabe663b82f6f04ef2777_u256;
+constexpr auto GmPhiGx_val = 0x93c4d65b4cc437be9f2b0aa72325ba6ce5015022596e21f2ea6eadae415a87b0_u256;
+constexpr auto GmPhiGy_val = 0xde87653b1778d37f77e9403692bd956f5d419b1b625309ca50730fbc03706352_u256;
+
+constexpr sp1_AffinePoint sp1_PhiG = {PhiGx_val[0], PhiGx_val[1], PhiGx_val[2], PhiGx_val[3],
+    Gy_val[0], Gy_val[1], Gy_val[2], Gy_val[3]};
+constexpr sp1_AffinePoint sp1_GpPhiG = {GpPhiGx_val[0], GpPhiGx_val[1], GpPhiGx_val[2],
+    GpPhiGx_val[3], GpPhiGy_val[0], GpPhiGy_val[1], GpPhiGy_val[2], GpPhiGy_val[3]};
+constexpr sp1_AffinePoint sp1_GmPhiG = {GmPhiGx_val[0], GmPhiGx_val[1], GmPhiGx_val[2],
+    GmPhiGx_val[3], GmPhiGy_val[0], GmPhiGy_val[1], GmPhiGy_val[2], GmPhiGy_val[3]};
+
+/// p + q in affine coordinates, for p != +-q (the table constants above, checked below).
+constexpr AffinePoint affine_add(const AffinePoint& p, const AffinePoint& q) noexcept
+{
+    const auto l = (q.y - p.y) / (q.x - p.x);
+    const auto x = l * l - p.x - q.x;
+    return {x, l * (p.x - x) - p.y};
+}
+static_assert(PhiGx_val == PHI_G.x.value() && Gy_val == PHI_G.y.value());
+static_assert(GpPhiGx_val == affine_add(G, PHI_G).x.value() &&
+              GpPhiGy_val == affine_add(G, PHI_G).y.value());
+static_assert(GmPhiGx_val == affine_add(G, -PHI_G).x.value() &&
+              GmPhiGy_val == affine_add(G, -PHI_G).y.value());
+
+/// A GLV half-scalar: magnitude < 2^128 and sign.
+struct GlvHalf
+{
+    uint64_t lo;
+    uint64_t hi;
+    bool neg;
+};
+
+/// round(k * g / 2^384).
+inline uint256 mul_shift_384(const uint256& k, const uint256& g) noexcept
+{
+    const auto p = intx::umul(k, g);
+    return uint256{p[6], p[7], 0, 0} + (p[5] >> 63);
+}
+
+inline GlvHalf glv_half(const uint256& t) noexcept
+{
+    const bool neg = (t[3] >> 63) != 0;
+    const auto m = neg ? uint256{0} - t : t;
+    return {m[0], m[1], neg};
+}
+
+inline void glv_split(const uint256& k, GlvHalf& k1, GlvHalf& k2) noexcept
+{
+    const auto c1 = mul_shift_384(k, GLV_G1);
+    const auto c2 = mul_shift_384(k, GLV_G2);
+    // Exact small values, computed modulo 2^256: k2 = -c1 b1 - c2 b2, k1 = k - c1 a1 - c2 a2.
+    k2 = glv_half(c1 * Curve::MINUS_Y1 - c2 * Curve::Y2);
+    k1 = glv_half(k - c1 * Curve::X1 - c2 * Curve::X2);
+}
+
+/// r = -r: y = P - y (no point of secp256k1 has y == 0).
+inline void sp1_negate(sp1_AffinePoint r) noexcept
+{
+    auto& y = reinterpret_cast<uint256&>(r[SP1_POINT_SIZE / 2]);
+    y = Curve::FIELD_PRIME - y;
+}
+
+/// Spreads the 16 bits of x to bits 0, 4, 8, ..., 60.
+inline uint64_t spread4(uint64_t x) noexcept
+{
+    x &= 0xffff;
+    x = (x | (x << 24)) & 0x000000ff000000ff;
+    x = (x | (x << 12)) & 0x000f000f000f000f;
+    x = (x | (x << 6)) & 0x0303030303030303;
+    x = (x | (x << 3)) & 0x1111111111111111;
+    return x;
+}
+
+/// SP1 u×G + v×Q with the GLV endomorphism. Falls back to sp1_msm() when a table entry is the
+/// point at infinity, which only an adversarial Q reaches.
+void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp1_AffinePoint q) noexcept
+{
+    GlvHalf k[4];
+    glv_split(u, k[0], k[1]);
+    glv_split(v, k[2], k[3]);
+
+    // t[i] is the sum of the signed bases selected by the bits of i: G, phi(G), Q, phi(Q).
+    sp1_AffinePoint t[16];
+    std::copy_n(sp1_G, SP1_POINT_SIZE, t[1]);
+    std::copy_n(sp1_PhiG, SP1_POINT_SIZE, t[2]);
+    std::copy_n(k[0].neg == k[1].neg ? sp1_GpPhiG : sp1_GmPhiG, SP1_POINT_SIZE, t[3]);
+    if (k[0].neg)
+    {
+        sp1_negate(t[1]);
+        sp1_negate(t[3]);  // -(G + phi(G)) or -(G - phi(G))
+    }
+    if (k[1].neg)
+        sp1_negate(t[2]);
+    std::copy_n(q, SP1_POINT_SIZE, t[4]);
+    if (k[2].neg)
+        sp1_negate(t[4]);
+    sp1_mulmod(reinterpret_cast<uint256&>(t[8][0]), Curve::BETA, reinterpret_cast<const uint256&>(q[0]));
+    std::copy_n(&q[SP1_POINT_SIZE / 2], SP1_POINT_SIZE / 2, &t[8][SP1_POINT_SIZE / 2]);
+    if (k[3].neg)
+        sp1_negate(t[8]);
+    std::copy_n(t[4], SP1_POINT_SIZE, t[12]);
+    sp1_secp256k1_add(t[12], t[8]);
+    for (const unsigned hi : {4u, 8u, 12u})
+    {
+        for (const unsigned lo : {1u, 2u, 3u})
+        {
+            std::copy_n(t[lo], SP1_POINT_SIZE, t[hi | lo]);
+            sp1_secp256k1_add(t[hi | lo], t[hi]);
+        }
+    }
+    for (unsigned i = 4; i < 16; ++i)
+    {
+        if (is_zero(t[i])) [[unlikely]]
+            return sp1_msm(r, u, sp1_G, v, q);
+    }
+
+    // Digits d = bit(k0) | bit(k1) << 1 | bit(k2) << 2 | bit(k3) << 3, 16 per word, bit 16w + j
+    // at nibble j of word w.
+    uint64_t d[8];
+    for (unsigned w = 0; w < 8; ++w)
+    {
+        const unsigned sh = (w % 4) * 16;
+        const bool high = w >= 4;
+        uint64_t x = 0;
+        for (unsigned j = 0; j < 4; ++j)
+            x |= spread4((high ? k[j].hi : k[j].lo) >> sh) << j;
+        d[w] = x;
+    }
+
+    int w = 7;
+    while (w >= 0 && d[w] == 0)
+        --w;
+    if (w < 0)
+    {
+        std::fill_n(r, SP1_POINT_SIZE, 0);
+        return;
+    }
+    uint64_t dw = d[w];
+    unsigned left = 16;
+    while ((dw >> 60) == 0)
+    {
+        dw <<= 4;
+        --left;
+    }
+    std::copy_n(t[dw >> 60], SP1_POINT_SIZE, r);
+    dw <<= 4;
+    --left;
+
+    bool nz = true;
+    for (;;)
+    {
+        for (; left != 0; --left)
+        {
+            const auto idx = static_cast<unsigned>(dw >> 60);
+            dw <<= 4;
+            if (nz) [[likely]]
+            {
+                syscall_secp256k1_double(r);
+                if (idx != 0)
+                    nz = sp1_secp256k1_add_nz(r, t[idx]);
+            }
+            else
+            {
+                // The accumulator hit infinity: identity-safe operations until it leaves it.
+                if (idx != 0)
+                    sp1_secp256k1_add(r, t[idx]);
+                nz = !is_zero(r);
+            }
+        }
+        if (--w < 0)
+            break;
+        dw = d[w];
+        left = 16;
+    }
+}
+#endif
 }  // namespace
 #endif
 
@@ -750,31 +916,99 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     return to_affine(Q);
 }
 
-std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
-    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
-    RecoveryMode mode) noexcept
-{
 #if defined(SP1TURBO) || defined(SP1)
-    // Validate r and s.
-    const auto opt_r = Curve::Fr::from_bytes(r_bytes);
-    if (!opt_r.has_value() || *opt_r == 0)
-        return std::nullopt;
-    const auto opt_s = mode == RecoveryMode::strict ?
-                           Curve::Fr::from_bytes<Curve::Fr::Range::half>(s_bytes) :
-                           Curve::Fr::from_bytes<Curve::Fr::Range::full>(s_bytes);
-    if (!opt_s.has_value() || *opt_s == 0)
-        return std::nullopt;
-    const auto& r_fr = *opt_r;
-    const auto& s_fr = *opt_s;
+namespace
+{
+// The scalars mod n are plain integers here, multiplied on the uint256_mulmod syscall
+// (Sp1MulMod): Curve::Fr would multiply in software, in Montgomery form, which costs hundreds of
+// instructions per product and per conversion (from_bytes(), value()).
 
-    // Compute z, u1, u2 using FieldElement arithmetic.
-    const auto z = Curve::Fr{intx::be::unsafe::load<uint256>(hash.data())};
-    const auto r_inv = 1 / r_fr;
-    const auto u1 = (-z * r_inv).value();
-    const auto u2 = (s_fr * r_inv).value();
+/// Parses and range-checks the signature scalars as ecrecover() does: r in [1, n), s in [1, n),
+/// or in [1, n/2] in the strict mode.
+bool parse_signature(std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
+    RecoveryMode mode, uint256& r, uint256& s) noexcept
+{
+    r = intx::be::unsafe::load<uint256>(r_bytes.data());
+    if (r == 0 || r >= Curve::ORDER)
+        return false;
+    s = intx::be::unsafe::load<uint256>(s_bytes.data());
+    const auto s_end = mode == RecoveryMode::strict ? Curve::ORDER / 2 + 1 : Curve::ORDER;
+    return s != 0 && s < s_end;
+}
+
+/// The windows of n - 2 below its top 125 bits, all ones: square so many times, then multiply by
+/// the odd power x^digit.
+struct InvWindow
+{
+    uint8_t squarings;
+    uint8_t digit;
+};
+constexpr InvWindow N_MINUS_2_WINDOWS[] = {{4, 13}, {6, 29}, {6, 21}, {5, 27}, {4, 7}, {5, 7},
+    {6, 13}, {6, 23}, {3, 5}, {7, 17}, {2, 1}, {12, 29}, {5, 27}, {5, 31}, {3, 5}, {6, 9}, {5, 15},
+    {6, 17}, {5, 19}, {2, 1}, {11, 27}, {3, 1}, {10, 19}, {4, 15}};
+static_assert([] {
+    auto e = (uint256{1} << 125) - 1;
+    for (const auto& [k, d] : N_MINUS_2_WINDOWS)
+        e = (e << k) + d;
+    return e == Curve::ORDER - 2;
+}());
+
+/// 1/x mod n for x in [1, n): x^(n-2) on the uint256_mulmod syscall, with the chain of the
+/// Airbender inversion mod n (ModArith::inv()), 252 squarings and 45 products. This is about 3.6K
+/// instructions; Curve::Fr's inversion, a software safegcd, about 14K.
+uint256 scalar_inv(const uint256& x) noexcept
+{
+    Sp1MulMod m{Curve::ORDER};
+    uint256 odd[16];  // x^(2i+1)
+    odd[0] = x;
+    uint256 x2 = x;
+    m.sqr(x2);
+    for (size_t i = 1; i < std::size(odd); ++i)
+    {
+        odd[i] = odd[i - 1];
+        m.mul(odd[i], x2);
+    }
+    const auto& x5 = odd[15];  // x^(2^5 - 1)
+    uint256 x10 = x5;
+    m.sqr(x10, 5);
+    m.mul(x10, x5);  // x^(2^10 - 1)
+    uint256 x20 = x10;
+    m.sqr(x20, 10);
+    m.mul(x20, x10);  // x^(2^20 - 1)
+    uint256 x25 = x20;
+    m.sqr(x25, 5);
+    m.mul(x25, x5);  // x^(2^25 - 1)
+    uint256 x50 = x25;
+    m.sqr(x50, 25);
+    m.mul(x50, x25);  // x^(2^50 - 1)
+    uint256 r = x50;
+    m.sqr(r, 50);
+    m.mul(r, x50);  // x^(2^100 - 1)
+    m.sqr(r, 25);
+    m.mul(r, x25);  // x^(2^125 - 1)
+    for (const auto& [k, d] : N_MINUS_2_WINDOWS)
+    {
+        m.sqr(r, k);
+        m.mul(r, odd[d / 2]);
+    }
+    return r;
+}
+
+/// ecrecover() after the scalar inversion, given r_inv = 1/r mod n.
+std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> hash,
+    const uint256& r_val, const uint256& s, const uint256& r_inv, bool parity) noexcept
+{
+    // u1 = -z/r and u2 = s/r, with z the hash mod n (the hash is below 2n).
+    Sp1MulMod mod_n{Curve::ORDER};
+    auto u1 = intx::be::unsafe::load<uint256>(hash.data());
+    if (u1 >= Curve::ORDER)
+        u1 -= Curve::ORDER;
+    mod_n.mul(u1, r_inv);
+    if (u1 != 0)
+        u1 = Curve::ORDER - u1;
+    auto u2 = s;
+    mod_n.mul(u2, r_inv);
     assert(u2 != 0);
-
-    const auto r_val = r_fr.value();
 
     // Point decompression and SP1 point operations.
 #ifdef SP1TURBO
@@ -784,21 +1018,28 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     const auto y_sp1 = intx::be::unsafe::load<uint256>(&sp1_Rbytes[32]);
     if (y_sp1 == 0)
         return std::nullopt;
+    sp1_AffinePoint sp1_R;
+    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
 #else
     const auto y = decompress(r_val, parity);
     if (!y.has_value())
         return std::nullopt;
-    uint8_t sp1_Rbytes[64]{};
-    intx::be::unsafe::store(&sp1_Rbytes[0], r_val);
-    intx::be::unsafe::store(&sp1_Rbytes[32], *y);
-#endif
-
+    // The point's words are the little-endian 64-bit limbs of x and y, as uint256 keeps them.
     sp1_AffinePoint sp1_R;
-    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
+    for (size_t i = 0; i < SP1_POINT_SIZE / 2; ++i)
+    {
+        sp1_R[i] = r_val[i];
+        sp1_R[SP1_POINT_SIZE / 2 + i] = (*y)[i];
+    }
+#endif
 
     // Shamir's trick: compute u1*G + u2*R in a single pass
     sp1_AffinePoint sp1_Q;
+#ifdef SP1TURBO
     sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
+#else
+    sp1_msm_glv(sp1_Q, u1, u2, sp1_R);
+#endif
 
     if (is_zero(sp1_Q)) [[unlikely]]
         return std::nullopt;
@@ -806,6 +1047,19 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     uint8_t serialized[64];
     sp1_point_to_bytes(serialized, sp1_Q);
     return to_address(serialized);
+}
+}  // namespace
+#endif
+
+std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
+    std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
+    RecoveryMode mode) noexcept
+{
+#if defined(SP1TURBO) || defined(SP1)
+    uint256 r, s;
+    if (!parse_signature(r_bytes, s_bytes, mode, r, s))
+        return std::nullopt;
+    return ecrecover_inverted(hash, r, s, scalar_inv(r), parity);
 #else
     // TODO(C++23): use std::optional::and_then.
     const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity, mode);
@@ -1036,36 +1290,19 @@ template <typename T>
 constexpr uint32_t BIGINT_SUB = 0x02, BIGINT_SUB_AND_NEGATE = 0x04, BIGINT_MUL_LOW = 0x08,
                    BIGINT_MUL_HIGH = 0x10;
 
-/// The GLV split of ecc::decompose(): k == k1 + k2 lambda (mod n) with |k1|, |k2| < 2^128.
-/// c1 = round(b2 k / n) and c2 = round(-b1 k / n) come from 384-bit shifted products with
-/// libsecp256k1's g1 = round(2^384 b2 / n) and g2 = round(2^384 (-b1) / n), and then
-/// k1 = k - c1 a1 - c2 a2 and k2 = -c1 b1 - c2 b2 are computed modulo 2^256: both are short
-/// (|ci - exact| <= 1/2 + 2^-127 bounds them by 0.64 * 2^128), so the top bit is the sign.
-/// All on the BigInt delegation: 2 MUL_HIGH, 4 MUL_LOW, 3 SUB and the negations.
+/// The GLV split of ecc::decompose() (see GLV_G1) on the BigInt delegation: 2 MUL_HIGH,
+/// 4 MUL_LOW, 3 SUB and the negations.
 std::array<ecc::SignedScalar<uint256>, 2> split_lambda(const uint256& k) noexcept
 {
     typedef uint32_t __attribute__((may_alias)) word;
-    alignas(32) static constexpr uint256 G1 =
-        0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
-    alignas(32) static constexpr uint256 G2 =
-        0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+    // 32-byte aligned copies: the delegation's operands must be.
+    alignas(32) static constexpr uint256 G1 = GLV_G1;
+    alignas(32) static constexpr uint256 G2 = GLV_G2;
     alignas(32) static constexpr uint256 A1 = Curve::X1;
     alignas(32) static constexpr uint256 A2 = Curve::X2;
     alignas(32) static constexpr uint256 MINUS_B1 = Curve::MINUS_Y1;
     alignas(32) static constexpr uint256 B2 = Curve::Y2;
     alignas(32) static constexpr uint256 ZERO = 0;
-    // The rounding constants are tied to the lattice: g = round(2^384 b / n) for b = b2 and -b1;
-    // their top halves are below 2^128 - 1, so c = (h >> 128) + bit 127 of h does not carry out;
-    // and (1/2 + 2^-129)(|a1| + |a2|) and (1/2 + 2^-129)(|b1| + |b2|) stay below 2^128.
-    constexpr auto round_384 = [](const uint256& b) noexcept {
-        return static_cast<uint256>(((intx::uint<512>{b} << 384) + (Curve::ORDER >> 1)) /
-                                    intx::uint<512>{Curve::ORDER});
-    };
-    static_assert(G1 == round_384(Curve::Y2) && G2 == round_384(Curve::MINUS_Y1));
-    static_assert(Curve::X1 * Curve::Y2 + Curve::X2 * Curve::MINUS_Y1 == Curve::ORDER);
-    static_assert((G1 >> 128) < (uint256{1} << 128) - 1 && (G2 >> 128) < (uint256{1} << 128) - 1);
-    static_assert((Curve::X1 + Curve::X2) / 2 + 1 < (uint256{1} << 128) &&
-                  (Curve::MINUS_Y1 + Curve::Y2) / 2 + 1 < (uint256{1} << 128));
 
     alignas(32) word kw[8];
     alignas(32) word h1[8];
@@ -1491,8 +1728,10 @@ ecc::ProjPoint<Curve> ecrecover_msm_single(
 void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional<evmc::address>> out,
     RecoveryMode mode) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
+#if EVMONE_SECP256K1_MSM_SINGLE
     // The steps of secp256k1_ecdsa_recover() per signature, with its two inversions batched.
+    // EVMONE_RV32_DISPATCH_TEST builds this on the host too, so that it is tested there against
+    // ecrecover().
     using Fr = Curve::Fr;
     using Fp = Curve::Fp;
     const size_t n = in.size();
@@ -1668,6 +1907,36 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         auto y = q[i].y;
         y *= zzz_inv;
         out[i] = to_address(AffinePoint{x, y});
+    }
+#elif defined(SP1TURBO) || defined(SP1)
+    // Montgomery's trick: prefix[i] = product of the valid r before i; invert the full product
+    // once and peel each r^-1 off it walking back.
+    const auto n = in.size();
+    std::vector<uint256> r(n), s(n), prefix(n);
+    std::vector<uint8_t> valid(n);
+    Sp1MulMod mod_n{Curve::ORDER};
+    uint256 prod = 1;
+    for (size_t i = 0; i < n; ++i)
+    {
+        valid[i] = parse_signature(in[i].r, in[i].s, mode, r[i], s[i]);
+        if (valid[i])
+        {
+            prefix[i] = prod;
+            mod_n.mul(prod, r[i]);
+        }
+    }
+    auto inv = scalar_inv(prod);  // r in [1, n) and n prime: prod != 0.
+    for (size_t i = n; i-- > 0;)
+    {
+        if (!valid[i])
+        {
+            out[i] = std::nullopt;
+            continue;
+        }
+        auto r_inv = inv;
+        mod_n.mul(r_inv, prefix[i]);
+        mod_n.mul(inv, r[i]);
+        out[i] = ecrecover_inverted(in[i].hash, r[i], s[i], r_inv, in[i].parity);
     }
 #else
     for (size_t i = 0; i < in.size(); ++i)

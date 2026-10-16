@@ -388,3 +388,96 @@ TEST(crypto, ecrecovery_strict)
         }
     }
 }
+
+TEST(crypto, ecrecover_batch)
+{
+    // ecrecover_batch() must give each input what ecrecover() gives it, whatever else the batch
+    // holds: the guests share inversions across the batch (Montgomery's trick), so the inputs that
+    // are rejected (r or s out of range, r not the x of a point, the point at infinity) must
+    // neither take part nor disturb the others. The known answers above, each with both parities,
+    // and random inputs, valid and not, in batches of every size from 0, in both modes.
+    struct Input
+    {
+        bytes hash, r, s;
+        bool parity;
+    };
+    std::vector<Input> inputs;
+    for (const auto& [input_hex, _] : TEST_CASES)
+    {
+        const auto input = from_spaced_hex(input_hex).value();
+        const bool parity = input[63] == 28;
+        for (const bool p : {parity, !parity})
+        {
+            inputs.push_back({bytes{&input[0], 32}, bytes{&input[64], 32}, bytes{&input[96], 32}, p});
+        }
+    }
+    uint64_t seed = 1;
+    const auto random_word = [&seed] {
+        // splitmix64
+        uint64_t z = (seed += 0x9e3779b97f4a7c15);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+        return z ^ (z >> 31);
+    };
+    const auto random_bytes = [&] {
+        bytes b(32, 0);
+        for (size_t i = 0; i < 32; i += 8)
+            intx::be::unsafe::store(&b[i], random_word());
+        return b;
+    };
+    for (int i = 0; i < 40; ++i)
+    {
+        // Random r is the x of a point half of the time; small s and r reach the range checks.
+        auto r = random_bytes();
+        auto s = random_bytes();
+        if (i % 8 == 1)
+            std::fill_n(r.begin(), 31, uint8_t{0});
+        if (i % 8 == 2)
+            std::fill_n(s.begin(), 31, uint8_t{0});
+        inputs.push_back({random_bytes(), r, s, (random_word() & 1) != 0});
+    }
+
+    for (const auto mode : {RecoveryMode::malleable, RecoveryMode::strict})
+    {
+        std::vector<std::optional<evmc::address>> expected;
+        for (const auto& in : inputs)
+        {
+            expected.push_back(ecrecover(std::span<const uint8_t, 32>{in.hash.data(), 32},
+                std::span<const uint8_t, 32>{in.r.data(), 32},
+                std::span<const uint8_t, 32>{in.s.data(), 32}, in.parity, mode));
+        }
+
+        // Every window [begin, begin + size) of the inputs, which mixes the valid and the
+        // rejected ones in every proportion; out starts with a value the batch must overwrite.
+        for (size_t size = 0; size <= 9; ++size)
+        {
+            for (size_t begin = 0; begin + size <= inputs.size(); ++begin)
+            {
+                std::vector<EcrecoverInput> batch;
+                for (size_t i = begin; i < begin + size; ++i)
+                {
+                    const auto& in = inputs[i];
+                    batch.push_back({std::span<const uint8_t, 32>{in.hash.data(), 32},
+                        std::span<const uint8_t, 32>{in.r.data(), 32},
+                        std::span<const uint8_t, 32>{in.s.data(), 32}, in.parity});
+                }
+                std::vector<std::optional<evmc::address>> out(size, evmc::address{0xbad});
+                ecrecover_batch(batch, out, mode);
+                for (size_t i = 0; i < size; ++i)
+                    EXPECT_EQ(out[i], expected[begin + i]) << "begin " << begin << " size " << size;
+            }
+        }
+
+        // And all of them at once.
+        std::vector<EcrecoverInput> batch;
+        for (const auto& in : inputs)
+        {
+            batch.push_back({std::span<const uint8_t, 32>{in.hash.data(), 32},
+                std::span<const uint8_t, 32>{in.r.data(), 32},
+                std::span<const uint8_t, 32>{in.s.data(), 32}, in.parity});
+        }
+        std::vector<std::optional<evmc::address>> out(batch.size(), evmc::address{0xbad});
+        ecrecover_batch(batch, out, mode);
+        EXPECT_EQ(out, expected);
+    }
+}
