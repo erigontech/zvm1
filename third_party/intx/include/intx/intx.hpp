@@ -3261,7 +3261,7 @@ inline void store(uint8_t* dst, const T& x) noexcept
 }  // namespace le
 
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#if defined(__riscv) && !defined(__riscv_zbb)
 namespace internal
 {
 /// Writes the 32 bytes at s in reverse byte order to d: d[k] = bswap32(s[7 - k]) word-wise.
@@ -3592,7 +3592,7 @@ inline IntT load(const uint8_t* src) noexcept
     }
 }
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#if defined(__riscv) && !defined(__riscv_zbb)
 /// Loads 32 big-endian bytes from src into the existing value x, which must not overlap src.
 /// Reversing the bytes straight into x beats building the value in registers when x lives in
 /// memory anyway (an EVM stack slot), see internal::bswap256_bytes. A word-aligned src (most

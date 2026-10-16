@@ -22,7 +22,7 @@ namespace evmone
 {
 using code_iterator = const uint8_t*;
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+#if (defined(__riscv) && !defined(__riscv_zbb)) || defined(EVMONE_RV32_DISPATCH_TEST)
 /// A 32-bit word of a uint256 (stored as 64-bit words): may alias them. Every word access to a
 /// stack item or other uint256 goes through it: through plain uint32_t, GCC's type-based alias
 /// analysis takes the access not to touch the uint64_t words, and may drop stores as dead or move
@@ -58,6 +58,31 @@ public:
 
     /// Assigns the value to the stack top and moves the stack top pointer up.
     void push(const uint256& value) noexcept { *m_end++ = value; }
+
+    /// push() of a value of at most 64 bits (an integral one converts to it, not to uint256):
+    /// each word of the new slot is stored once. Converted to a uint256 first, the value went
+    /// through a temporary on the C stack that GCC stored to before copying it to the slot.
+    void push(uint64_t value) noexcept
+    {
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+        // 32-bit words, so that the zero words are stores of the zero register.
+        word32* const w = reinterpret_cast<word32*>(m_end++);
+        w[0] = static_cast<uint32_t>(value);
+        w[1] = static_cast<uint32_t>(value >> 32);
+        w[2] = 0;
+        w[3] = 0;
+        w[4] = 0;
+        w[5] = 0;
+        w[6] = 0;
+        w[7] = 0;
+#else
+        auto& r = *m_end++;
+        r[0] = value;
+        r[1] = 0;
+        r[2] = 0;
+        r[3] = 0;
+#endif
+    }
 };
 
 
@@ -1371,7 +1396,7 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
     return keccak256_general(index, size, gas_left, state);
 }
 
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#if defined(__riscv) && !defined(__riscv_zbb)
 /// Writes the 20 big-endian bytes at s (an address, at any alignment) to the stack slot at w as a
 /// 256-bit value: byte loads and stores reverse them into the low 5 words, and the 3 high words
 /// are zeroed. intx::be::load() of 20 bytes zeroes a temporary, copies the bytes into it with a
@@ -1456,43 +1481,133 @@ inline void callvalue(StackTop stack, ExecutionState& state) noexcept
 #endif
 }
 
+#if defined(__riscv) && !defined(__riscv_zbb)
+// Without a byte-reverse instruction a word costs more to swap in registers than its bytes cost to
+// move one by one: a 64-bit swap is 13 ALU instructions plus its 4 mask constants. The 32 bytes of
+// a word are reversed with byte loads and stores instead, 2 instructions a byte at any alignment,
+// and from a 4-byte aligned big-endian side a 32-bit word at a time, a leading zero word in 3
+// instructions: the conversions of the rv32 guest (intx::internal::bswap256_bytes() and its
+// word-wise variants), which are the same instructions on rv64. PUSH data shorter than a word
+// is assembled in big-endian order directly.
+
+/// Big-endian value of the Len bytes at p. The empty asm keeps GCC's bswap pass from taking the
+/// bytes for an unaligned load and a byte swap, which it expands back into a longer shift-and-mask
+/// sequence (as in the rv32 push_data_word()): 3 instructions for each byte after the first.
+template <size_t Len>
+[[gnu::always_inline]] inline uint64_t load_be_bytes(const uint8_t* p) noexcept
+{
+    uint64_t v = p[0];
+    for (size_t i = 1; i < Len; ++i)
+    {
+        asm("" : "+r"(v));
+        v = (v << 8) | p[i];
+    }
+    return v;
+}
+
+/// Loads the 32 big-endian bytes at p into x, which must not overlap them.
+[[gnu::always_inline]] inline void load_be_word(uint256& x, const uint8_t* p) noexcept
+{
+    intx::be::unsafe::load_into(x, p);
+}
+
+/// Stores x as 32 big-endian bytes at p, which must not overlap it.
+[[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& x) noexcept
+{
+    if (intx::internal::is_aligned4(p)) [[likely]]
+        intx::internal::bswap256_to_aligned(p, &x);
+    else
+        intx::internal::bswap256_bytes(p, &x);
+}
+#else
+[[gnu::always_inline]] inline void load_be_word(uint256& x, const uint8_t* p) noexcept
+{
+    x = intx::be::unsafe::load<uint256>(p);
+}
+
+[[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& x) noexcept
+{
+    intx::be::unsafe::store(p, x);
+}
+#endif
+
+#if defined(EVMONE_WORD_LAYOUT) || (defined(__riscv) && !defined(__riscv_zbb))
+/// CALLDATALOAD of an index that calldataload() does not load whole: one at or past cd_lim, or
+/// above 32 bits. That is 0 at or past the end of the input, else the bytes up to its end followed
+/// by zeros: fewer than 32. Out of line, as the loads of the instruction are long: with them all
+/// inline GCC took calldataload() for too large to inline into the dispatch loop, and called it
+/// for every CALLDATALOAD.
+[[gnu::noinline]] inline void calldataload_tail(uint256& index, ExecutionState& state) noexcept
+{
+#ifdef EVMONE_WORD_LAYOUT
+    const word32* const iw = reinterpret_cast<const word32*>(&index);
+    if ((iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0 ||
+        state.msg->input_size <= iw[0])
+    {
+        index = 0;
+        return;
+    }
+    const auto begin = static_cast<size_t>(iw[0]);
+#else
+    if (state.msg->input_size <= index)
+    {
+        index = 0;
+        return;
+    }
+    const auto begin = static_cast<size_t>(index);
+#endif
+    const auto len = state.msg->input_size - begin;
+#ifdef EVMONE_WORD_LAYOUT
+    if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+    {
+        wl::load_u256_partial(index, state.msg->input_data + begin, len);
+        return;
+    }
+#endif
+    uint8_t data[32] = {};
+    std::memcpy(data, state.msg->input_data + begin, len);
+    index = intx::be::load<uint256>(data);
+}
+
+#ifdef EVMONE_WORD_LAYOUT
+/// The whole word at src of a byte-order input (the calldata of a transaction), out of line for
+/// the same reason.
+[[gnu::noinline]] inline void calldataload_bytes(uint256& index, const uint8_t* src) noexcept
+{
+    load_be_word(index, src);
+}
+#endif
+
+/// CALLDATALOAD on RISC-V. The whole word lies inside the input when the index is below cd_lim
+/// (input_size - 31, see ExecutionState): one compare, then the full load in place. In the word
+/// layout the calldata of a call is the caller's memory, and its whole word is 8 word copies.
+[[gnu::always_inline]] inline void calldataload(StackTop stack, ExecutionState& state) noexcept
+{
+    auto& index = stack.top();
+#ifdef EVMONE_WORD_LAYOUT
+    const word32* const iw = reinterpret_cast<const word32*>(&index);
+    if ((iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0 || iw[0] >= state.cd_lim)
+        [[unlikely]]
+        return calldataload_tail(index, state);
+    const uint8_t* const src = state.msg->input_data + iw[0];
+    if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
+        wl::load_u256(index, src);
+    else
+        calldataload_bytes(index, src);
+#else
+    if ((index[1] | index[2] | index[3]) != 0 || index[0] >= state.cd_lim) [[unlikely]]
+        return calldataload_tail(index, state);
+    load_be_word(index, state.msg->input_data + index[0]);
+#endif
+}
+#else
 inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
-    // The whole word lies inside the input when the index is below cd_lim (input_size - 31, see
-    // ExecutionState): one compare, then the full load. The rest (a partial word, an index at or
-    // past the end or above 32 bits) takes the general code below.
-    const word32* const iw = reinterpret_cast<const word32*>(&index);
-    const bool index_overflows_32bit =
-        (iw[1] | iw[2] | iw[3] | iw[4] | iw[5] | iw[6] | iw[7]) != 0;
-    if (!index_overflows_32bit && iw[0] < state.cd_lim)
-    {
-        const uint8_t* const src = state.msg->input_data + iw[0];
-#ifdef EVMONE_WORD_LAYOUT
-        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
-            wl::load_u256(index, src);  // The calldata of a call is the caller's memory.
-        else
-#endif
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-            intx::be::unsafe::load_into(index, src);
-#else
-            index = intx::be::unsafe::load<uint256>(src);
-#endif
-        return;
-    }
-#endif
-
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // On rv32im, input_size is size_t (32-bit). Avoid 256-bit comparison by checking
-    // if index overflows 32 bits (any high word non-zero → index > any size_t value).
-    if (index_overflows_32bit || state.msg->input_size <= iw[0])
-#else
     // An index at the end loads 0 here as well, so that below the input has a byte at begin and
     // input_data is not null (an empty input may have none, which memcpy must not get).
     if (state.msg->input_size <= index)
-#endif
         index = 0;
     else
     {
@@ -1500,25 +1615,10 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         const auto end = std::min(begin + 32, state.msg->input_size);
         const auto len = end - begin;
 
-#ifdef EVMONE_WORD_LAYOUT
-        if ((state.msg->flags & wl::FLAG_WORD_INPUT) != 0) [[likely]]
-        {
-            // The calldata of a call is the caller's memory.
-            if (len == 32) [[likely]]
-                wl::load_u256(index, state.msg->input_data + begin);
-            else
-                wl::load_u256_partial(index, state.msg->input_data + begin, len);
-        }
-        else
-#endif
         if (len == 32) [[likely]]
         {
             // Fast path: full 32-byte load, skip temporary buffer.
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-            intx::be::unsafe::load_into(index, state.msg->input_data + begin);
-#else
-            index = intx::be::unsafe::load<uint256>(state.msg->input_data + begin);
-#endif
+            load_be_word(index, state.msg->input_data + begin);
         }
         else
         {
@@ -1528,6 +1628,7 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
         }
     }
 }
+#endif
 
 inline void calldatasize(StackTop stack, ExecutionState& state) noexcept
 {
@@ -1846,11 +1947,8 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
 
 #ifdef EVMONE_WORD_LAYOUT
     wl::load_u256(index, &state.memory[at]);
-#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
-    // Reverse the bytes straight into the stack slot.
-    intx::be::unsafe::load_into(index, &state.memory[at]);
 #else
-    index = intx::be::unsafe::load<uint256>(&state.memory[at]);
+    load_be_word(index, &state.memory[at]);  // Straight into the stack slot.
 #endif
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1875,7 +1973,7 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
 #ifdef EVMONE_WORD_LAYOUT
     wl::store_u256(&state.memory[at], value);
 #else
-    intx::be::unsafe::store(&state.memory[at], value);
+    store_be_word(&state.memory[at], value);
 #endif
     return {EVMC_SUCCESS, gas_left};
 }
@@ -1955,7 +2053,7 @@ inline void msize(StackTop stack, ExecutionState& state) noexcept
 
 inline Result gas(StackTop stack, int64_t gas_left, ExecutionState& /*state*/) noexcept
 {
-    stack.push(gas_left);
+    stack.push(static_cast<uint64_t>(gas_left));
     return {EVMC_SUCCESS, gas_left};
 }
 
@@ -2090,6 +2188,50 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
             w[k] = 0;
     }
     return d + Len;
+}
+#elif defined(__riscv) && !defined(__riscv_zbb)
+/// PUSH instruction implementation for RISC-V without a byte-swap instruction: each word of the
+/// immediate is assembled in big-endian order straight from its bytes.
+/// @tparam Len The number of push data bytes, e.g. PUSH3 is push<3>.
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    using word_type = uint256::word_type;
+    static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
+    static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
+    static constexpr auto NUM_DATA_WORDS = NUM_FULL_WORDS + (NUM_PARTIAL_BYTES != 0 ? 1 : 0);
+
+    // The two common long pushes (constants and masks, addresses) as the rv32 guest makes them:
+    // byte loads and stores reverse the immediate straight into the new slot, 2 instructions a
+    // byte where assembling a word takes 3.
+    if constexpr (Len == 32)
+    {
+        intx::internal::bswap256_bytes(stack.end(), pos + 1);
+        return pos + 33;
+    }
+    else if constexpr (Len == 20)
+    {
+        load_address_into(reinterpret_cast<word32*>(stack.end()), pos + 1);
+        return pos + 21;
+    }
+
+    // Each word of the new slot is stored once: pushing zero first leaves dead stores, and a
+    // uint256 built first GCC keeps in a stack temporary for some lengths.
+    auto& r = *stack.end();
+    pos += 1;  // Skip the opcode.
+    if constexpr (NUM_PARTIAL_BYTES != 0)
+    {
+        r[NUM_FULL_WORDS] = load_be_bytes<NUM_PARTIAL_BYTES>(pos);
+        pos += NUM_PARTIAL_BYTES;
+    }
+    for (size_t i = 0; i < NUM_FULL_WORDS; ++i)
+    {
+        r[NUM_FULL_WORDS - 1 - i] = load_be_bytes<sizeof(word_type)>(pos);
+        pos += sizeof(word_type);
+    }
+    for (size_t i = NUM_DATA_WORDS; i < 4; ++i)
+        r[i] = 0;
+    return pos;
 }
 #else
 /// PUSH instruction implementation.
