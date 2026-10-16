@@ -19,7 +19,8 @@
 #define EVMONE_CGOTO_SUPPORTED 1
 #endif
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
+    (defined(SP1) && defined(__riscv)) || defined(EVMONE_RV32_DISPATCH_TEST)
 /// The code cache holds the analyses by value in the map, without LRU eviction: a guest runs one
 /// block on a fresh VM, so the LRU eviction never fires on mainnet blocks and the LRU list, the
 /// shared_ptr and the per-hit splice are pure overhead. EVMONE_RV32_DISPATCH_TEST builds it on

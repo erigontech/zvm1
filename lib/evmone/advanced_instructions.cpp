@@ -73,6 +73,16 @@ inline code_iterator impl(AdvancedExecutionState& state, code_iterator pos) noex
     state.adjust_stack_size(instr::traits[Op].stack_height_change);
     return new_pos;
 }
+
+template <Opcode Op,
+    code_iterator CoreFn(StackTop, ExecutionState&, int64_t&, code_iterator) noexcept =
+        core::impl<Op>>
+inline code_iterator impl(AdvancedExecutionState& state, code_iterator pos) noexcept
+{
+    const auto new_pos = CoreFn(state.stack, state, state.gas_left, pos);
+    state.adjust_stack_size(instr::traits[Op].stack_height_change);
+    return new_pos;
+}
 /// @}
 }  // namespace instr
 

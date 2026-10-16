@@ -10,7 +10,8 @@
 #include <cstdlib>
 #include <memory>
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
+    (defined(SP1) && defined(__riscv)) || defined(EVMONE_RV32_DISPATCH_TEST)
 /// JUMPDEST analysis on demand: the scan runs up to the highest jump target checked so far
 /// instead of over the whole code up front (10.7% of the analyzed bytes on mainnet lie past
 /// every target). EVMONE_RV32_DISPATCH_TEST builds it on the host for testing.
@@ -24,6 +25,16 @@
 #define EVMONE_LAZY_JUMPDESTS 0
 #define EVMONE_JUMPDEST_BYTEMAP 0
 #define EVMONE_IN_PLACE_CODE 0
+#endif
+
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+/// The rv32 dispatch steps over the JUMPDEST a jump lands on itself (skip_landing_jumpdest()).
+#define EVMONE_JUMP_SKIPS_JUMPDEST 0
+#else
+/// A taken jump resumes after the JUMPDEST it lands on: the destination is checked to hold one, a
+/// no-op, so it is never dispatched. The jump pays its gas instead, before it checks the
+/// destination.
+#define EVMONE_JUMP_SKIPS_JUMPDEST 1
 #endif
 
 namespace evmone
