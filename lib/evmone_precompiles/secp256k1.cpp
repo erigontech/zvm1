@@ -936,10 +936,62 @@ bool parse_signature(std::span<const uint8_t, 32> r_bytes, std::span<const uint8
     return s != 0 && s < s_end;
 }
 
-/// 1/x mod n for x in [1, n), with Curve::Fr's inversion.
+/// The windows of n - 2 below its top 125 bits, all ones: square so many times, then multiply by
+/// the odd power x^digit.
+struct InvWindow
+{
+    uint8_t squarings;
+    uint8_t digit;
+};
+constexpr InvWindow N_MINUS_2_WINDOWS[] = {{4, 13}, {6, 29}, {6, 21}, {5, 27}, {4, 7}, {5, 7},
+    {6, 13}, {6, 23}, {3, 5}, {7, 17}, {2, 1}, {12, 29}, {5, 27}, {5, 31}, {3, 5}, {6, 9}, {5, 15},
+    {6, 17}, {5, 19}, {2, 1}, {11, 27}, {3, 1}, {10, 19}, {4, 15}};
+static_assert([] {
+    auto e = (uint256{1} << 125) - 1;
+    for (const auto& [k, d] : N_MINUS_2_WINDOWS)
+        e = (e << k) + d;
+    return e == Curve::ORDER - 2;
+}());
+
+/// 1/x mod n for x in [1, n): x^(n-2) on the uint256_mulmod syscall, with the chain of the
+/// Airbender inversion mod n (ModArith::inv()), 252 squarings and 45 products. This is about 3.6K
+/// instructions; Curve::Fr's inversion, a software safegcd, about 14K.
 uint256 scalar_inv(const uint256& x) noexcept
 {
-    return (1 / Curve::Fr{x}).value();
+    Sp1MulMod m{Curve::ORDER};
+    uint256 odd[16];  // x^(2i+1)
+    odd[0] = x;
+    uint256 x2 = x;
+    m.sqr(x2);
+    for (size_t i = 1; i < std::size(odd); ++i)
+    {
+        odd[i] = odd[i - 1];
+        m.mul(odd[i], x2);
+    }
+    const auto& x5 = odd[15];  // x^(2^5 - 1)
+    uint256 x10 = x5;
+    m.sqr(x10, 5);
+    m.mul(x10, x5);  // x^(2^10 - 1)
+    uint256 x20 = x10;
+    m.sqr(x20, 10);
+    m.mul(x20, x10);  // x^(2^20 - 1)
+    uint256 x25 = x20;
+    m.sqr(x25, 5);
+    m.mul(x25, x5);  // x^(2^25 - 1)
+    uint256 x50 = x25;
+    m.sqr(x50, 25);
+    m.mul(x50, x25);  // x^(2^50 - 1)
+    uint256 r = x50;
+    m.sqr(r, 50);
+    m.mul(r, x50);  // x^(2^100 - 1)
+    m.sqr(r, 25);
+    m.mul(r, x25);  // x^(2^125 - 1)
+    for (const auto& [k, d] : N_MINUS_2_WINDOWS)
+    {
+        m.sqr(r, k);
+        m.mul(r, odd[d / 2]);
+    }
+    return r;
 }
 
 /// ecrecover() after the scalar inversion, given r_inv = 1/r mod n.
