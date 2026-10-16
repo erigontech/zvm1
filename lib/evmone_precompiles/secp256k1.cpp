@@ -85,6 +85,30 @@ constexpr auto make_phi_g() noexcept
 }
 constexpr AffinePoint PHI_G = make_phi_g();
 
+/// The GLV split k = k1 + k2 lambda (mod n) with |k1|, |k2| < 2^128, libsecp256k1's
+/// scalar_split_lambda, over the lattice basis (a1, b1) = (X1, -MINUS_Y1), (a2, b2) = (X2, Y2) of
+/// Curve: c1 = round(b2 k / n) and c2 = round(-b1 k / n) come from 384-bit shifted products with
+/// these g1 = round(2^384 b2 / n) and g2 = round(2^384 (-b1) / n), and then k1 = k - c1 a1 - c2 a2
+/// and k2 = -c1 b1 - c2 b2 are short (|ci - exact| <= 1/2 + 2^-127 bounds them by 0.64 * 2^128),
+/// so computed modulo 2^256 their top bit is the sign. The SP1 and Airbender splits use these.
+constexpr auto GLV_G1 = 0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
+constexpr auto GLV_G2 = 0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+// The rounding constants are tied to the lattice; their top halves are below 2^128 - 1, so
+// c = (h >> 128) + bit 127 of h, with h the top half of the product, does not carry out; and
+// (1/2 + 2^-129)(|a1| + |a2|) and (1/2 + 2^-129)(|b1| + |b2|) stay below 2^128.
+static_assert([] {
+    constexpr auto round_384 = [](const uint256& b) noexcept {
+        return static_cast<uint256>(
+            ((intx::uint<512>{b} << 384) + (Curve::ORDER >> 1)) / intx::uint<512>{Curve::ORDER});
+    };
+    return GLV_G1 == round_384(Curve::Y2) && GLV_G2 == round_384(Curve::MINUS_Y1);
+}());
+static_assert(Curve::X1 * Curve::Y2 + Curve::X2 * Curve::MINUS_Y1 == Curve::ORDER);
+static_assert(Curve::X1 == Curve::Y2);  // a1 == b2
+static_assert((GLV_G1 >> 128) < (uint256{1} << 128) - 1 && (GLV_G2 >> 128) < (uint256{1} << 128) - 1);
+static_assert((Curve::X1 + Curve::X2) / 2 + 1 < (uint256{1} << 128) &&
+              (Curve::MINUS_Y1 + Curve::Y2) / 2 + 1 < (uint256{1} << 128));
+
 /// Precomputed window-8 table: PHI_G_TABLE[i] = (i+1)*phi(G) for i=0..254.
 /// 255 consteval AffinePoints = 16KB in .rodata.
 // NOLINTNEXTLINE(*-avoid-c-arrays)
@@ -685,14 +709,8 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
 
 #ifndef SP1TURBO
 // GLV endomorphism: phi(x, y) = (BETA * x, y) = LAMBDA * (x, y). A scalar splits as
-// k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (libsecp256k1 scalar_split_lambda),
-// so u*G + v*Q becomes four half-length scalars sharing one run of 128 doublings.
-constexpr auto GLV_BETA = 0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee_u256;
-constexpr auto GLV_G1 = 0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
-constexpr auto GLV_G2 = 0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
-constexpr auto GLV_MINUS_B1 = 0xe4437ed6010e88286f547fa90abfe4c3_u256;
-constexpr auto GLV_B2 = 0x3086d221a7d46bcde86c90e49284eb15_u256;  // == A1
-constexpr auto GLV_A2 = 0x114ca50f7a8e2f3f657c1108d9d44cfd8_u256;
+// k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (see GLV_G1), so u*G + v*Q becomes four
+// half-length scalars sharing one run of 128 doublings.
 
 constexpr auto PhiGx_val = 0xbcace2e99da01887ab0102b696902325872844067f15e98da7bba04400b88fcb_u256;
 constexpr auto GpPhiGx_val = 0xc994b69768832bcbff5e9ab39ae8d1d3763bbf1e531bed98fe51de5ee84f50fb_u256;
@@ -706,6 +724,19 @@ constexpr sp1_AffinePoint sp1_GpPhiG = {GpPhiGx_val[0], GpPhiGx_val[1], GpPhiGx_
     GpPhiGx_val[3], GpPhiGy_val[0], GpPhiGy_val[1], GpPhiGy_val[2], GpPhiGy_val[3]};
 constexpr sp1_AffinePoint sp1_GmPhiG = {GmPhiGx_val[0], GmPhiGx_val[1], GmPhiGx_val[2],
     GmPhiGx_val[3], GmPhiGy_val[0], GmPhiGy_val[1], GmPhiGy_val[2], GmPhiGy_val[3]};
+
+/// p + q in affine coordinates, for p != +-q (the table constants above, checked below).
+constexpr AffinePoint affine_add(const AffinePoint& p, const AffinePoint& q) noexcept
+{
+    const auto l = (q.y - p.y) / (q.x - p.x);
+    const auto x = l * l - p.x - q.x;
+    return {x, l * (p.x - x) - p.y};
+}
+static_assert(PhiGx_val == PHI_G.x.value() && Gy_val == PHI_G.y.value());
+static_assert(GpPhiGx_val == affine_add(G, PHI_G).x.value() &&
+              GpPhiGy_val == affine_add(G, PHI_G).y.value());
+static_assert(GmPhiGx_val == affine_add(G, -PHI_G).x.value() &&
+              GmPhiGy_val == affine_add(G, -PHI_G).y.value());
 
 /// A GLV half-scalar: magnitude < 2^128 and sign.
 struct GlvHalf
@@ -733,9 +764,9 @@ inline void glv_split(const uint256& k, GlvHalf& k1, GlvHalf& k2) noexcept
 {
     const auto c1 = mul_shift_384(k, GLV_G1);
     const auto c2 = mul_shift_384(k, GLV_G2);
-    // Exact small values, computed modulo 2^256.
-    k2 = glv_half(c1 * GLV_MINUS_B1 - c2 * GLV_B2);
-    k1 = glv_half(k - c1 * GLV_B2 - c2 * GLV_A2);
+    // Exact small values, computed modulo 2^256: k2 = -c1 b1 - c2 b2, k1 = k - c1 a1 - c2 a2.
+    k2 = glv_half(c1 * Curve::MINUS_Y1 - c2 * Curve::Y2);
+    k1 = glv_half(k - c1 * Curve::X1 - c2 * Curve::X2);
 }
 
 /// r = -r: y = P - y (no point of secp256k1 has y == 0).
@@ -779,7 +810,7 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
     std::copy_n(q, SP1_POINT_SIZE, t[4]);
     if (k[2].neg)
         sp1_negate(t[4]);
-    sp1_mulmod(reinterpret_cast<uint256&>(t[8][0]), GLV_BETA, reinterpret_cast<const uint256&>(q[0]));
+    sp1_mulmod(reinterpret_cast<uint256&>(t[8][0]), Curve::BETA, reinterpret_cast<const uint256&>(q[0]));
     std::copy_n(&q[SP1_POINT_SIZE / 2], SP1_POINT_SIZE / 2, &t[8][SP1_POINT_SIZE / 2]);
     if (k[3].neg)
         sp1_negate(t[8]);
@@ -1236,36 +1267,19 @@ template <typename T>
 constexpr uint32_t BIGINT_SUB = 0x02, BIGINT_SUB_AND_NEGATE = 0x04, BIGINT_MUL_LOW = 0x08,
                    BIGINT_MUL_HIGH = 0x10;
 
-/// The GLV split of ecc::decompose(): k == k1 + k2 lambda (mod n) with |k1|, |k2| < 2^128.
-/// c1 = round(b2 k / n) and c2 = round(-b1 k / n) come from 384-bit shifted products with
-/// libsecp256k1's g1 = round(2^384 b2 / n) and g2 = round(2^384 (-b1) / n), and then
-/// k1 = k - c1 a1 - c2 a2 and k2 = -c1 b1 - c2 b2 are computed modulo 2^256: both are short
-/// (|ci - exact| <= 1/2 + 2^-127 bounds them by 0.64 * 2^128), so the top bit is the sign.
-/// All on the BigInt delegation: 2 MUL_HIGH, 4 MUL_LOW, 3 SUB and the negations.
+/// The GLV split of ecc::decompose() (see GLV_G1) on the BigInt delegation: 2 MUL_HIGH,
+/// 4 MUL_LOW, 3 SUB and the negations.
 std::array<ecc::SignedScalar<uint256>, 2> split_lambda(const uint256& k) noexcept
 {
     typedef uint32_t __attribute__((may_alias)) word;
-    alignas(32) static constexpr uint256 G1 =
-        0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031_u256;
-    alignas(32) static constexpr uint256 G2 =
-        0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71_u256;
+    // 32-byte aligned copies: the delegation's operands must be.
+    alignas(32) static constexpr uint256 G1 = GLV_G1;
+    alignas(32) static constexpr uint256 G2 = GLV_G2;
     alignas(32) static constexpr uint256 A1 = Curve::X1;
     alignas(32) static constexpr uint256 A2 = Curve::X2;
     alignas(32) static constexpr uint256 MINUS_B1 = Curve::MINUS_Y1;
     alignas(32) static constexpr uint256 B2 = Curve::Y2;
     alignas(32) static constexpr uint256 ZERO = 0;
-    // The rounding constants are tied to the lattice: g = round(2^384 b / n) for b = b2 and -b1;
-    // their top halves are below 2^128 - 1, so c = (h >> 128) + bit 127 of h does not carry out;
-    // and (1/2 + 2^-129)(|a1| + |a2|) and (1/2 + 2^-129)(|b1| + |b2|) stay below 2^128.
-    constexpr auto round_384 = [](const uint256& b) noexcept {
-        return static_cast<uint256>(((intx::uint<512>{b} << 384) + (Curve::ORDER >> 1)) /
-                                    intx::uint<512>{Curve::ORDER});
-    };
-    static_assert(G1 == round_384(Curve::Y2) && G2 == round_384(Curve::MINUS_Y1));
-    static_assert(Curve::X1 * Curve::Y2 + Curve::X2 * Curve::MINUS_Y1 == Curve::ORDER);
-    static_assert((G1 >> 128) < (uint256{1} << 128) - 1 && (G2 >> 128) < (uint256{1} << 128) - 1);
-    static_assert((Curve::X1 + Curve::X2) / 2 + 1 < (uint256{1} << 128) &&
-                  (Curve::MINUS_Y1 + Curve::Y2) / 2 + 1 < (uint256{1} << 128));
 
     alignas(32) word kw[8];
     alignas(32) word h1[8];
