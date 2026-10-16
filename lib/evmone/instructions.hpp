@@ -568,41 +568,139 @@ inline void div(StackTop stack) noexcept
         div_top<0>(x, v, w0, 0);
 }
 #else
+/// v = x / v for a power-of-two divisor 2^(64 * T + b), whose top non-zero word T is top = 2^b.
+/// Word i of the quotient is x[i + T] / 2^b plus the low b bits of x[i + T + 1] moved above them,
+/// x[i + T + 1] * 2^(64 - b), where 2^64 wraps to 0 for b = 0. So b itself is never needed:
+/// rv64im has no instruction to count zeros (libgcc's __ctzdi2 loops over the bytes), but
+/// a division and a multiplication are one instruction each in the zkVMs.
+/// x and v are different stack slots.
+template <unsigned T>
+[[gnu::always_inline]] inline void div_pow2(const uint256& x, uint256& v, uint64_t top) noexcept
+{
+    auto m = (uint64_t{1} << 63) / top * 2;
+    asm("" : "+r"(m));  // Or GCC doubles each product by 2^63 / top instead.
+    uint64_t q[4];
+    for (size_t i = 0; i < 4; ++i)
+    {
+        if (i + T > 3)
+            q[i] = 0;
+        else if (i + T == 3)
+            q[i] = x[3] / top;
+        else
+            q[i] = x[i + T] / top | x[i + T + 1] * m;
+    }
+    v[0] = q[0];
+    v[1] = q[1];
+    v[2] = q[2];
+    v[3] = q[3];
+}
+
+/// v = x / v for a divisor d < 2^32 and a dividend of N words: long division by 32-bit digits.
+/// The remainder and the next digit make a 64-bit number below d * 2^32, so each quotient digit
+/// is a single 64-bit division, one instruction in the zkVMs (as is the remainder), where intx
+/// normalizes the operands and computes a reciprocal for its 128-bit divisions.
+template <size_t N>
+[[gnu::always_inline]] inline void div_by_u32_n(const uint256& x, uint256& v, uint64_t d) noexcept
+{
+    uint64_t q[4]{};
+    uint64_t r = 0;
+    for (size_t i = N; i-- != 0;)
+    {
+        const auto hi = (r << 32) | (x[i] >> 32);
+        r = hi % d;
+        const auto lo = (r << 32) | (x[i] & 0xffffffff);
+        r = lo % d;
+        q[i] = (hi / d) << 32 | (lo / d);
+    }
+    v[0] = q[0];
+    v[1] = q[1];
+    v[2] = q[2];
+    v[3] = q[3];
+}
+
+/// div_by_u32_n() for a dividend of 2 to 4 words, stack[0] / stack[1]. Out of line: inlined, its
+/// unrolled loops kept GCC from inlining div() into the interpreter loop.
+[[gnu::noinline]] inline void div_by_u32(StackTop stack, uint64_t d) noexcept
+{
+    const auto& x = stack[0];
+    auto& v = stack[1];
+    if (x[3] != 0)
+        div_by_u32_n<4>(x, v, d);
+    else if (x[2] != 0)
+        div_by_u32_n<3>(x, v, d);
+    else
+        div_by_u32_n<2>(x, v, d);
+}
+
 inline void div(StackTop stack) noexcept
 {
+    // Powers of two of any width are divisions of the words by a word: 45% of mainnet DIVs,
+    // most of them wider than a word (2^224 extracts a function selector, 2^160 an address).
+    // The top non-zero word of the divisor selects the case. A power of two has a single bit
+    // there and nothing below it: 2^192 + 1 has the single-bit top word 1.
     auto& v = stack[1];
-    if (v == 0) [[unlikely]]
+    const auto& x = stack[0];
+    const auto v0 = v[0];
+    const auto v1 = v[1];
+    const auto v2 = v[2];
+    const auto v3 = v[3];
+    if (v3 != 0)
     {
-        v = 0;
-        return;
+        if (((v3 & (v3 - 1)) | v2 | v1 | v0) == 0)
+            return div_pow2<3>(x, v, v3);
     }
-    // Fast path: if divisor fits in a single 64-bit word (top 3 words are zero),
-    // we can avoid the expensive multi-word Knuth division.
-    if ((v[3] | v[2] | v[1]) == 0)
+    else if (v2 != 0)
     {
-        const auto d = v[0];
-        // Power-of-2 fast path: shift instead of divide.
-        if ((d & (d - 1)) == 0)
+        if (((v2 & (v2 - 1)) | v1 | v0) == 0)
+            return div_pow2<2>(x, v, v2);
+    }
+    else if (v1 != 0)
+    {
+        if (((v1 & (v1 - 1)) | v0) == 0)
+            return div_pow2<1>(x, v, v1);
+    }
+    else if (v0 != 0)
+    {
+        if ((v0 & (v0 - 1)) == 0)
+            return div_pow2<0>(x, v, v0);
+        // Other one-word divisors: one word division for a one-word dividend, 32-bit digits
+        // for a divisor below 2^32. intx divides by the rest.
+        const auto x1 = x[1];
+        const auto x2 = x[2];
+        const auto x3 = x[3];
+        if ((x1 | x2 | x3) == 0)
         {
-            const auto shift = static_cast<unsigned>(__builtin_ctzll(d));
-            v = stack[0] >> shift;
+            v[0] = x[0] / v0;  // The divisor's other words are 0.
             return;
         }
-        v = stack[0] / v;
+        if ((v0 >> 32) == 0)
+            return div_by_u32(stack, v0);
     }
     else
-    {
-        v = stack[0] / v;
-    }
+        return;  // The divisor 0 is the result.
+    v = x / v;
 }
 #endif
 
 inline void sdiv(StackTop stack) noexcept
 {
+    // div() of the absolute values, in place (stack[0] is popped, so its slot is free to change),
+    // with the sign of the quotient, which rounds toward zero. -2^255 / -1 divides 2^255 by 1,
+    // and 2^255 is -2^255 again.
+    auto& x = stack[0];
     auto& v = stack[1];
-    v = v != 0 ? intx::sdivrem(stack[0], v).quot : 0;
+    const bool x_neg = static_cast<int64_t>(x[3]) < 0;
+    const bool v_neg = static_cast<int64_t>(v[3]) < 0;
+    if (x_neg)
+        x = -x;
+    if (v_neg)
+        v = -v;
+    div(stack);
+    if (x_neg != v_neg)
+        v = -v;
 }
 
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
 inline void mod(StackTop stack) noexcept
 {
     auto& v = stack[1];
@@ -632,11 +730,108 @@ inline void mod(StackTop stack) noexcept
     v = stack[0] % v;
 #endif
 }
+#else
+/// v = x % v for a power-of-two divisor whose top non-zero word T is top: the words of x below
+/// word T and the bits of word T below top. The divisor's words above T are 0 already.
+template <unsigned T>
+[[gnu::always_inline]] inline void mod_pow2(const uint256& x, uint256& v, uint64_t top) noexcept
+{
+    for (size_t i = 0; i < T; ++i)
+        v[i] = x[i];
+    v[T] = x[T] & (top - 1);
+}
+
+/// v = x % v for a divisor d < 2^32 and a dividend of N words (see div_by_u32_n()).
+template <size_t N>
+[[gnu::always_inline]] inline void mod_by_u32_n(const uint256& x, uint256& v, uint64_t d) noexcept
+{
+    uint64_t r = 0;
+    for (size_t i = N; i-- != 0;)
+    {
+        r = ((r << 32) | (x[i] >> 32)) % d;
+        r = ((r << 32) | (x[i] & 0xffffffff)) % d;
+    }
+    v[0] = r;  // The divisor's other words are 0.
+}
+
+/// mod_by_u32_n() for a dividend of 2 to 4 words, stack[0] % stack[1] (see div_by_u32()).
+[[gnu::noinline]] inline void mod_by_u32(StackTop stack, uint64_t d) noexcept
+{
+    const auto& x = stack[0];
+    auto& v = stack[1];
+    if (x[3] != 0)
+        mod_by_u32_n<4>(x, v, d);
+    else if (x[2] != 0)
+        mod_by_u32_n<3>(x, v, d);
+    else
+        mod_by_u32_n<2>(x, v, d);
+}
+
+inline void mod(StackTop stack) noexcept
+{
+    // The cases of div(), with masks for the powers of two.
+    auto& v = stack[1];
+    const auto& x = stack[0];
+    const auto v0 = v[0];
+    const auto v1 = v[1];
+    const auto v2 = v[2];
+    const auto v3 = v[3];
+    if (v3 != 0)
+    {
+        if (((v3 & (v3 - 1)) | v2 | v1 | v0) == 0)
+            return mod_pow2<3>(x, v, v3);
+        // Most four-word moduli are the BN254 group order, with a reduced dividend: the top
+        // words tell, and the dividend is the remainder.
+        if (x[3] < v3)
+        {
+            v = x;
+            return;
+        }
+    }
+    else if (v2 != 0)
+    {
+        if (((v2 & (v2 - 1)) | v1 | v0) == 0)
+            return mod_pow2<2>(x, v, v2);
+    }
+    else if (v1 != 0)
+    {
+        if (((v1 & (v1 - 1)) | v0) == 0)
+            return mod_pow2<1>(x, v, v1);
+    }
+    else if (v0 != 0)
+    {
+        if ((v0 & (v0 - 1)) == 0)
+            return mod_pow2<0>(x, v, v0);
+        const auto x1 = x[1];
+        const auto x2 = x[2];
+        const auto x3 = x[3];
+        if ((x1 | x2 | x3) == 0)
+        {
+            v[0] = x[0] % v0;  // The divisor's other words are 0.
+            return;
+        }
+        if ((v0 >> 32) == 0)
+            return mod_by_u32(stack, v0);
+    }
+    else
+        return;  // The divisor 0 is the result.
+    v = x % v;
+}
+#endif
 
 inline void smod(StackTop stack) noexcept
 {
+    // mod() of the absolute values, in place as in sdiv(), with the sign of the dividend.
+    auto& x = stack[0];
     auto& v = stack[1];
-    v = v != 0 ? intx::sdivrem(stack[0], v).rem : 0;
+    const bool x_neg = static_cast<int64_t>(x[3]) < 0;
+    if (x_neg)
+        x = -x;
+    if (static_cast<int64_t>(v[3]) < 0)
+        v = -v;
+    mod(stack);
+    if (x_neg)
+        v = -v;
 }
 
 #if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
@@ -697,9 +892,58 @@ inline void smod(StackTop stack) noexcept
     }
     return true;
 }
+#else
+/// Sets m = (x + y) % m, in m's slot, when the top words of x and y are below m's (so x < m,
+/// y < m and m != 0); otherwise returns false with m untouched. In SP1 a reduced sum costs 54
+/// instructions here, 65 through the uint256_mulmod syscall, for which the sum, a 1 and the
+/// modulus have to be stored.
+[[gnu::always_inline]] inline bool addmod_reduced(
+    uint256& m, const uint256& x, const uint256& y) noexcept
+{
+    const auto m3 = m[3];
+    if (x[3] >= m3 || y[3] >= m3)
+        return false;
+
+    // x + y < 2m, so one subtraction of m reduces it, when the sum reached 2^256 or m.
+    uint64_t s[4];
+    s[0] = x[0] + y[0];
+    uint64_t carry = s[0] < x[0];
+    for (size_t i = 1; i < 4; ++i)
+    {
+        const auto t = x[i] + y[i];
+        const uint64_t c1 = t < x[i];
+        s[i] = t + carry;
+        carry = c1 | (s[i] < t);
+    }
+    bool sub = carry != 0 || s[3] > m3;
+    if (!sub && s[3] == m3)
+        sub = uint256{s[0], s[1], s[2], s[3]} >= m;
+
+    if (sub)
+    {
+        uint64_t borrow = 0;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            const auto mi = m[i];
+            const auto d = s[i] - mi;
+            const uint64_t b1 = s[i] < mi;
+            m[i] = d - borrow;
+            borrow = b1 | (d < borrow);
+        }
+    }
+    else
+    {
+        m[0] = s[0];
+        m[1] = s[1];
+        m[2] = s[2];
+        m[3] = s[3];
+    }
+    return true;
+}
 #endif
 
-inline void addmod(StackTop stack) noexcept
+/// Inlined into the interpreter loop, which GCC no longer did for SP1 with the reduced sum.
+[[gnu::always_inline]] inline void addmod(StackTop stack) noexcept
 {
     auto& x = stack.pop();
     auto& y = stack.pop();
@@ -711,6 +955,9 @@ inline void addmod(StackTop stack) noexcept
     if (addmod_reduced(
             reinterpret_cast<word32*>(&m), reinterpret_cast<const word32*>(&x),
             reinterpret_cast<const word32*>(&y)))
+        return;
+#else
+    if (addmod_reduced(m, x, y))
         return;
 #endif
 
