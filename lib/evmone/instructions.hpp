@@ -595,6 +595,43 @@ template <unsigned T>
     v[3] = q[3];
 }
 
+/// v = x / v for a divisor d < 2^32 and a dividend of N words: long division by 32-bit digits.
+/// The remainder and the next digit make a 64-bit number below d * 2^32, so each quotient digit
+/// is a single 64-bit division, one instruction in the zkVMs (as is the remainder), where intx
+/// normalizes the operands and computes a reciprocal for its 128-bit divisions.
+template <size_t N>
+[[gnu::always_inline]] inline void div_by_u32_n(const uint256& x, uint256& v, uint64_t d) noexcept
+{
+    uint64_t q[4]{};
+    uint64_t r = 0;
+    for (size_t i = N; i-- != 0;)
+    {
+        const auto hi = (r << 32) | (x[i] >> 32);
+        r = hi % d;
+        const auto lo = (r << 32) | (x[i] & 0xffffffff);
+        r = lo % d;
+        q[i] = (hi / d) << 32 | (lo / d);
+    }
+    v[0] = q[0];
+    v[1] = q[1];
+    v[2] = q[2];
+    v[3] = q[3];
+}
+
+/// div_by_u32_n() for a dividend of 2 to 4 words, stack[0] / stack[1]. Out of line: inlined, its
+/// unrolled loops kept GCC from inlining div() into the interpreter loop.
+[[gnu::noinline]] inline void div_by_u32(StackTop stack, uint64_t d) noexcept
+{
+    const auto& x = stack[0];
+    auto& v = stack[1];
+    if (x[3] != 0)
+        div_by_u32_n<4>(x, v, d);
+    else if (x[2] != 0)
+        div_by_u32_n<3>(x, v, d);
+    else
+        div_by_u32_n<2>(x, v, d);
+}
+
 inline void div(StackTop stack) noexcept
 {
     // Powers of two of any width are divisions of the words by a word: 45% of mainnet DIVs,
@@ -626,6 +663,18 @@ inline void div(StackTop stack) noexcept
     {
         if ((v0 & (v0 - 1)) == 0)
             return div_pow2<0>(x, v, v0);
+        // Other one-word divisors: one word division for a one-word dividend, 32-bit digits
+        // for a divisor below 2^32. intx divides by the rest.
+        const auto x1 = x[1];
+        const auto x2 = x[2];
+        const auto x3 = x[3];
+        if ((x1 | x2 | x3) == 0)
+        {
+            v[0] = x[0] / v0;  // The divisor's other words are 0.
+            return;
+        }
+        if ((v0 >> 32) == 0)
+            return div_by_u32(stack, v0);
     }
     else
         return;  // The divisor 0 is the result.
