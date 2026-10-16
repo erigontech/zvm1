@@ -58,6 +58,31 @@ public:
 
     /// Assigns the value to the stack top and moves the stack top pointer up.
     void push(const uint256& value) noexcept { *m_end++ = value; }
+
+    /// push() of a value of at most 64 bits (an integral one converts to it, not to uint256):
+    /// each word of the new slot is stored once. Converted to a uint256 first, the value went
+    /// through a temporary on the C stack that GCC stored to before copying it to the slot.
+    void push(uint64_t value) noexcept
+    {
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+        // 32-bit words, so that the zero words are stores of the zero register.
+        word32* const w = reinterpret_cast<word32*>(m_end++);
+        w[0] = static_cast<uint32_t>(value);
+        w[1] = static_cast<uint32_t>(value >> 32);
+        w[2] = 0;
+        w[3] = 0;
+        w[4] = 0;
+        w[5] = 0;
+        w[6] = 0;
+        w[7] = 0;
+#else
+        auto& r = *m_end++;
+        r[0] = value;
+        r[1] = 0;
+        r[2] = 0;
+        r[3] = 0;
+#endif
+    }
 };
 
 
@@ -2028,7 +2053,7 @@ inline void msize(StackTop stack, ExecutionState& state) noexcept
 
 inline Result gas(StackTop stack, int64_t gas_left, ExecutionState& /*state*/) noexcept
 {
-    stack.push(gas_left);
+    stack.push(static_cast<uint64_t>(gas_left));
     return {EVMC_SUCCESS, gas_left};
 }
 
