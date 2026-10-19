@@ -236,9 +236,19 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const JumpdestMap jumpdest_map{bitset_storage};
 #endif
 #if !EVMONE_LAZY_JUMPDESTS
+#ifdef ZISK
+    // One alignment check covers code and bitmap.
+    const bool precompile_eligible =
+        code.size() != 0 && (reinterpret_cast<uintptr_t>(storage.get()) % BITSET_ALIGNMENT) == 0;
+    if (precompile_eligible) [[likely]]
+        zisk::jump_dest(bitset_storage, storage.get(), code.size());
+    else
+        scan_jumpdests(jumpdest_map, storage.get(), 0, code.size());
+#else
     // Scan the padded copy: a truncated PUSH at the end advances past the last opcode by up to
     // 32 bytes, which stays inside this allocation but not inside the caller's.
     scan_jumpdests(jumpdest_map, storage.get(), 0, code.size());
+#endif
 #endif
 
     return {std::move(storage), code.size(), jumpdest_map};
