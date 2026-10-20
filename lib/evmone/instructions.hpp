@@ -502,7 +502,9 @@ inline constexpr auto invalid = stop_impl<EVMC_INVALID_INSTRUCTION>;
 
 inline void add(StackTop stack) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
+#if defined(ZISK)
+    zisk::add256(&stack[0][0], &stack[1][0], 0, &stack[1][0]);  // c may alias b.
+#elif defined(AIRBENDER) && defined(__riscv)
     // CSR ADD: *x10 += *x11, result at *x10.
     // stack[0] = top, stack[1] = below. Result goes into stack[1] (new top after dispatch -1).
     register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
@@ -516,7 +518,10 @@ inline void add(StackTop stack) noexcept
 
 inline void mul(StackTop stack) noexcept
 {
-#if defined(AIRBENDER) && defined(__riscv)
+#if defined(ZISK)
+    zisk::arith256(&stack[0][0], &stack[1][0], &zisk::kZero256[0], &stack[1][0],
+        &stack[0][0]);  // dh into popped slot.
+#elif defined(AIRBENDER) && defined(__riscv)
     // CSR MUL_LOW: *x10 = low256(*x10 * *x11), result at *x10.
     // EVM MUL is mod 2^256 = low word. x10 != x11 (adjacent stack slots).
     register uintptr_t r10 asm("x10") = reinterpret_cast<uintptr_t>(&stack[1]);
