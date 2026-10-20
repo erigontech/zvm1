@@ -24,6 +24,24 @@ namespace evmone
 {
 using code_iterator = const uint8_t*;
 
+#if defined(ZISK)
+/// Index of the single set bit, else -1.
+[[gnu::always_inline]] inline int pow2_bit(const uint256& x) noexcept
+{
+    int bit = -1;
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto w = x[i];
+        if (w == 0)
+            continue;
+        if (bit >= 0 || (w & (w - 1)) != 0)
+            return -1;
+        bit = 64 * i + static_cast<int>(std::countr_zero(w));
+    }
+    return bit;
+}
+#endif  // ZISK
+
 #if (defined(__riscv) && !defined(__riscv_zbb)) || defined(EVMONE_RV32_DISPATCH_TEST)
 /// A 32-bit word of a uint256 (stored as 64-bit words): may alias them. Every word access to a
 /// stack item or other uint256 goes through it: through plain uint32_t, GCC's type-based alias
@@ -662,6 +680,11 @@ inline void div(StackTop stack) noexcept
             return;
         }
     }
+    if (const int bit = pow2_bit(v); bit > 0)
+    {
+        v = stack[0] >> bit;
+        return;
+    }
     // Fcall hint, verified guest-side (H1).
     v = zisk::udivrem(stack[0], v).quot;
 }
@@ -974,7 +997,40 @@ inline void mulmod(StackTop stack) noexcept
     }
 #endif
 
-#if defined(AIRBENDER) && defined(__riscv)
+#if defined(ZISK)
+    // (2^j)^e is a shift, or 0.
+    if (const int j = pow2_bit(base); j >= 0)
+    {
+        uint64_t s = 256;
+        if (j == 0)
+            s = 0;
+        else if ((exponent[3] | exponent[2] | exponent[1]) == 0 && exponent[0] < 256)
+            s = static_cast<uint64_t>(j) * exponent[0];
+        exponent = 0;
+        if (s < 256)
+            exponent[s >> 6] = uint64_t{1} << (s & 63);
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    if ((exponent[3] | exponent[2] | exponent[1] | exponent[0]) == 0) [[unlikely]]
+    {
+        exponent = 1;  // Also 0^0.
+        return {EVMC_SUCCESS, gas_left};
+    }
+
+    // Left-to-right square-and-multiply.
+    const auto bw = static_cast<unsigned>(intx::bit_width(exponent));
+    alignas(32) uint256 result = base;
+    alignas(32) uint256 dh;
+    for (unsigned i = bw - 1; i > 0; --i)
+    {
+        zisk::arith256(&result[0], &result[0], &zisk::kZero256[0], &result[0], &dh[0]);
+        if ((exponent[(i - 1) >> 6] >> ((i - 1) & 63)) & 1)
+            zisk::arith256(&result[0], &base[0], &zisk::kZero256[0], &result[0], &dh[0]);
+    }
+    exponent = result;
+    return {EVMC_SUCCESS, gas_left};
+#elif defined(AIRBENDER) && defined(__riscv)
     // CSR-accelerated binary exponentiation.
     // We keep result and tmp as fixed aligned buffers and use CSR MUL_LOW + MEMCOPY
     // to avoid the per-multiply copy overhead of intx::operator*.
