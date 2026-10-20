@@ -1053,7 +1053,11 @@ struct hash<evmc::bytes32>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::bytes32& s) const noexcept
     {
-#if defined(AIRBENDER) || defined(ZISK)
+#if defined(ZISK)
+        // One 8-byte load; buckets need only spread.
+        typedef uint64_t __attribute__((may_alias)) W;
+        return *reinterpret_cast<const W*>(&s.bytes[24]);
+#elif defined(AIRBENDER)
         // Use the last uint32_t word directly: keccak outputs have full entropy in any 32-bit
         // slice, and small storage keys (slots 0, 1, 2, ...) differ in their low bytes, which
         // the first word would map to a single bucket. Saves 7 loads + 8 multiplies per lookup.
