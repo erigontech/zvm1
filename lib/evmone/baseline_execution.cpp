@@ -45,6 +45,17 @@
 #define EVMONE_DEFER_OOG 1
 #endif
 
+#if EVMONE_ZISK_PUSH1_FUSION
+/// Separate switches: measure fusions apart.
+#define EVMONE_ZISK_SWAP_FUSION 1
+#define EVMONE_ZISK_SELECTOR_FUSION 1
+#define EVMONE_ZISK_MASK_FUSION 1
+#else
+#define EVMONE_ZISK_SWAP_FUSION 0
+#define EVMONE_ZISK_SELECTOR_FUSION 0
+#define EVMONE_ZISK_MASK_FUSION 0
+#endif
+
 namespace evmone::baseline
 {
 namespace
@@ -118,6 +129,11 @@ inline constexpr bool kDeferredCheckpoint = Op == Opcode::OP_STOP || Op == Opcod
     Op == Opcode::OP_CHAINID || Op == Opcode::OP_COINBASE || Op == Opcode::OP_TIMESTAMP ||
     Op == Opcode::OP_NUMBER || Op == Opcode::OP_PREVRANDAO || Op == Opcode::OP_GASLIMIT ||
     Op == Opcode::OP_BASEFEE || Op == Opcode::OP_BLOBBASEFEE || Op == Opcode::OP_SLOTNUM;
+#endif
+#if EVMONE_DEFER_OOG
+inline constexpr bool kZiskDeferOOG = true;
+#else
+inline constexpr bool kZiskDeferOOG = false;
 #endif
 
 /// @param [in,out] gas_left      Gas left.
@@ -1276,6 +1292,56 @@ template <Opcode Op>
 }
 #endif
 
+#if EVMONE_ZISK_SELECTOR_FUSION
+/// Solidity dispatcher arm, one step.
+[[gnu::always_inline]] inline bool fused_selector_arm(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static constexpr auto PUSH4_GAS = instr::gas_costs[EVMC_FRONTIER][OP_PUSH4];
+    static constexpr auto EQ_GAS = instr::gas_costs[EVMC_FRONTIER][OP_EQ];
+    static constexpr auto PUSH2_GAS = instr::gas_costs[EVMC_FRONTIER][OP_PUSH2];
+    static constexpr auto JUMPI_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+    static_assert(instr::has_const_gas_cost(OP_PUSH4) && instr::has_const_gas_cost(OP_EQ) &&
+                  instr::has_const_gas_cost(OP_PUSH2) && instr::has_const_gas_cost(OP_JUMPI) &&
+                  instr::has_const_gas_cost(OP_JUMPDEST));
+    static constexpr int64_t GAS =
+        PUSH4_GAS + EQ_GAS + PUSH2_GAS + JUMPI_GAS + instr::core::JUMPDEST_GAS;
+
+    const auto* const c = pos.code_it;
+    if (c[5] != OP_EQ || c[6] != OP_PUSH2 || c[9] != OP_JUMPI) [[likely]]
+        return false;
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        pos.code_it = nullptr;
+        return true;
+    };
+    if (INTX_UNLIKELY(gas < GAS))
+        return false;
+    gas -= GAS;
+    if (INTX_UNLIKELY(pos.stack_end == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    // Barriers stop bytes folding into a word.
+    uint32_t sel = c[1];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[2];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[3];
+    asm("" : "+r"(sel));
+    sel = sel << 8 | c[4];
+    const uint64_t* const w = reinterpret_cast<const uint64_t*>(pos.stack_end - 1);
+    pos.stack_end -= 1;  // Three pushed, four popped.
+    if (((w[0] ^ sel) | w[1] | w[2] | w[3]) != 0)
+    {
+        gas += instr::core::JUMPDEST_GAS;  // Not taken: the landing was not paid for.
+        pos.code_it += 10;
+        return true;
+    }
+    return jump_to(c + 7, pos, state);
+}
+#endif
+
 /// A helper to invoke the instruction implementation of the given opcode Op.
 template <Opcode Op, bool TracingEnabled>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
@@ -1302,6 +1368,15 @@ template <Opcode Op, bool TracingEnabled>
         if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state))
             return pos;
     }
+#if EVMONE_ZISK_SELECTOR_FUSION
+    else if constexpr (Op == OP_PUSH4 && !TracingEnabled)
+    {
+        // One byte first: most PUSH4s mask.
+        if (pos.code_it[5] == OP_EQ) [[unlikely]]
+            if (fused_selector_arm(stack_bottom, stack_limit, pos, gas, state))
+                return pos;
+    }
+#endif
 #endif
 #if EVMONE_RV32_DISPATCH
     if constexpr (Op == OP_PUSH2)
@@ -2110,6 +2185,195 @@ template <Opcode Op>
         return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
     }
 }
+
+#if EVMONE_ZISK_MASK_FUSION
+/// Address-mask idiom: (a << b) - x.
+[[gnu::always_inline]] inline bool zpush1_shl_sub(const uint256* stack_bottom,
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(instr::has_const_gas_cost(OP_AND));
+    static_assert(instr::gas_costs[EVMC_FRONTIER][OP_PUSH1] == 3 &&
+                  instr::gas_costs[EVMC_FRONTIER][OP_SUB] == 3 &&
+                  instr::gas_costs[EVMC_ISTANBUL][OP_SHL] == 3);  // The hook's literal 3 + 3 + 3.
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    // Reference order: push overflow, then SUB.
+    if (INTX_UNLIKELY(pos.stack_end + 1 == stack_limit))
+        return fail(EVMC_STACK_OVERFLOW);
+    if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+        return fail(EVMC_STACK_UNDERFLOW);
+    const uint64_t a = pos.code_it[-1];
+    const uint64_t b = pos.code_it[1];
+    if (pos.code_it[4] == OP_AND && a == 1 && b == 160)
+    {
+        // x == 1: AND only trims y.
+        uint64_t* const x = reinterpret_cast<uint64_t*>(pos.stack_end - 1);
+        if (((x[0] ^ 1) | x[1] | x[2] | x[3]) == 0)
+        {
+            if (INTX_UNLIKELY(pos.stack_end - 1 == stack_bottom))
+                return fail(EVMC_STACK_UNDERFLOW);
+            if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_AND]) < 0))
+                return fail(EVMC_OUT_OF_GAS);
+            uint64_t* const y = reinterpret_cast<uint64_t*>(pos.stack_end - 2);
+            y[2] &= 0xffffffff;
+            y[3] = 0;
+            pos.stack_end -= 1;
+            pos.code_it += 5;
+            return true;
+        }
+    }
+    // b < 256: two adjacent limbs suffice.
+    uint64_t* const k = reinterpret_cast<uint64_t*>(pos.stack_end);
+    k[0] = 0;
+    k[1] = 0;
+    k[2] = 0;
+    k[3] = 0;
+    const unsigned ws = static_cast<unsigned>(b >> 6);
+    const unsigned bs = static_cast<unsigned>(b & 63);
+    uint64_t* const kw = k + ws;
+    kw[0] = a << bs;
+    if (ws < 3)
+        kw[1] = (a >> 1) >> (63 - bs);
+    pos.stack_end[-1] = pos.stack_end[0] - pos.stack_end[-1];  // SUB: the constant less x.
+    pos.code_it += 4;
+    return true;
+}
+#endif
+#endif
+
+#if EVMONE_ZISK_SWAP_FUSION
+/// rv64 swap fusions, 4 64-bit limbs.
+
+/// Successors fused with SWAP1.
+constexpr bool zswap1_fuses(Opcode op) noexcept
+{
+    return op == OP_POP || op == OP_JUMP || op == OP_SWAP2 || op == OP_DUP2;
+}
+
+/// Successors fused with SWAP2.
+constexpr bool zswap2_fuses(Opcode op) noexcept
+{
+    return op == OP_POP || op == OP_SWAP1 || op == OP_ADD;
+}
+
+/// SWAP1 + Op, swap not yet made.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool zswap1_then(const uint256* bottom2, const uint256* stack_limit,
+    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    static_assert(instr::has_const_gas_cost(OP_POP) && instr::has_const_gas_cost(OP_JUMP) &&
+                  instr::has_const_gas_cost(OP_SWAP2) && instr::has_const_gas_cost(OP_DUP2));
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    uint256* const s = pos.stack_end;
+    if constexpr (Op == OP_POP)
+    {
+        // Underflow impossible after SWAP1's items.
+        if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_POP]) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        s[-2] = s[-1];
+        pos.stack_end = s - 1;
+    }
+    else if constexpr (Op == OP_JUMP)
+    {
+        // JUMP charges 8+1 before destination test.
+        static constexpr int64_t GAS =
+            instr::gas_costs[EVMC_FRONTIER][OP_JUMP] + instr::core::JUMPDEST_GAS;
+        if (INTX_UNLIKELY((gas -= GAS) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        const auto& dst = s[-2];
+        const uint64_t offset = dst[0];
+        const auto& analysis = *state.analysis.baseline;
+        if (INTX_UNLIKELY((dst[1] | dst[2] | dst[3]) != 0 || !analysis.check_jumpdest(offset)))
+            return fail(EVMC_BAD_JUMP_DESTINATION);
+        s[-2] = s[-1];
+        pos.stack_end = s - 1;
+        pos.code_it = analysis.code().data() + offset + 1;  // Past the paid-for JUMPDEST.
+        return true;
+    }
+    else if constexpr (Op == OP_SWAP2)
+    {
+        // Three moves do both swaps at once.
+        if (INTX_UNLIKELY(s <= bottom2))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_SWAP2]) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        const uint256 t = s[-3];
+        s[-3] = s[-2];
+        s[-2] = s[-1];
+        s[-1] = t;
+    }
+    else if constexpr (Op == OP_DUP2)
+    {
+        // DUP2 overflows; moves give [Y, X, Y].
+        if (INTX_UNLIKELY(s == stack_limit))
+            return fail(EVMC_STACK_OVERFLOW);
+        if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_DUP2]) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        s[0] = s[-1];
+        s[-1] = s[-2];
+        s[-2] = s[0];
+        pos.stack_end = s + 1;
+    }
+    else
+    {
+        // Missing branch would neither move nor advance.
+        static_assert(!zswap1_fuses(Op));
+        return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
+    }
+    pos.code_it += 1;
+    return true;
+}
+
+/// SWAP2 + Op, swap not yet made.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool zswap2_then(Position& pos, int64_t& gas,
+    ExecutionState& state) noexcept
+{
+    static_assert(instr::has_const_gas_cost(OP_POP) && instr::has_const_gas_cost(OP_SWAP1) &&
+                  instr::has_const_gas_cost(OP_ADD));
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    uint256* const s = pos.stack_end;
+    if constexpr (Op == OP_POP)
+    {
+        if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_POP]) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        s[-3] = s[-1];  // The swap discards the second item: the third keeps the top.
+        pos.stack_end = s - 1;
+    }
+    else if constexpr (Op == OP_SWAP1)
+    {
+        if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_SWAP1]) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        const uint256 t = s[-1];  // The two swaps rotate the three items up by one.
+        s[-1] = s[-2];
+        s[-2] = s[-3];
+        s[-3] = t;
+    }
+    else if constexpr (Op == OP_ADD)
+    {
+        if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_ADD]) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        s[-2] += s[-3];  // The swap brings the addends together: the third keeps the old top.
+        s[-3] = s[-1];
+        pos.stack_end = s - 1;
+    }
+    else
+    {
+        // Missing branch would neither move nor advance.
+        static_assert(!zswap2_fuses(Op));
+        return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
+    }
+    pos.code_it += 1;
+    return true;
+}
 #endif
 
 #if EVMONE_CGOTO_SUPPORTED
@@ -2179,6 +2443,28 @@ int64_t dispatch_cgoto(
 #define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
     };
     static_assert(std::size(push1_then_table) == 256);
+#if EVMONE_ZISK_SWAP_FUSION
+    static constexpr void* swap1_then_table[] = {
+#define ON_OPCODE(OPCODE) &&ZSWAP1_THEN_##OPCODE,
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED(_) &&ZSWAP1_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
+    };
+    static_assert(std::size(swap1_then_table) == 256);
+    static constexpr void* swap2_then_table[] = {
+#define ON_OPCODE(OPCODE) &&ZSWAP2_THEN_##OPCODE,
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED(_) &&ZSWAP2_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
+    };
+    static_assert(std::size(swap2_then_table) == 256);
+#endif
 #endif
 #endif
 
@@ -2253,6 +2539,27 @@ int64_t dispatch_cgoto(
         ON_OPCODE_INVOKE(OPCODE)                                                                 \
     }
 #elif EVMONE_ZISK_PUSH1_FUSION
+#if EVMONE_ZISK_SWAP_FUSION
+#define ZISK_ON_OPCODE_SWAP(OPCODE)                                                              \
+    else if constexpr (OPCODE == OP_SWAP1 || OPCODE == OP_SWAP2)                                 \
+    {                                                                                            \
+        /* The swap's checks; the swap is made by the successor's ZSWAPn_THEN_ entry. */          \
+        if (const auto status = check_requirements<OPCODE, kZiskDeferOOG>(cost_table, gas,                      \
+                position.stack_end, stack_bottom, bottom1, bottom2, stack_limit);                \
+            status != EVMC_SUCCESS)                                                              \
+        {                                                                                        \
+            state.status = status;                                                               \
+            return gas;                                                                          \
+        }                                                                                        \
+        position.code_it += 1;                                                                   \
+        if constexpr (OPCODE == OP_SWAP1)                                                        \
+            goto* swap1_then_table[*position.code_it];                                           \
+        else                                                                                     \
+            goto* swap2_then_table[*position.code_it];                                           \
+    }
+#else
+#define ZISK_ON_OPCODE_SWAP(OPCODE)
+#endif
 #define ON_OPCODE(OPCODE)                                                                        \
     TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
     if constexpr (OPCODE == OP_PUSH1)                                                            \
@@ -2271,6 +2578,7 @@ int64_t dispatch_cgoto(
         position.code_it += 2;                                                                   \
         goto* push1_then_table[*position.code_it];                                               \
     }                                                                                            \
+    ZISK_ON_OPCODE_SWAP(OPCODE)                                                                  \
     else                                                                                         \
     {                                                                                            \
         ON_OPCODE_INVOKE(OPCODE)                                                                 \
@@ -2284,12 +2592,26 @@ int64_t dispatch_cgoto(
     MAP_OPCODES
 #undef ON_OPCODE
 #undef ON_OPCODE_INVOKE
+#undef ZISK_ON_OPCODE_SWAP
 
 TARGET_OP_UNDEFINED:
     state.status = EVMC_UNDEFINED_INSTRUCTION;
     return gas;
 
 #if EVMONE_ZISK_PUSH1_FUSION
+#if EVMONE_ZISK_MASK_FUSION
+#define ZPUSH1_THEN_PUSH1_SPECIAL                                                                \
+    if (position.code_it[2] == OP_SHL && position.code_it[3] == OP_SUB &&                        \
+        cost_table[OP_SHL] >= 0 && gas >= 9)                                                     \
+    {                                                                                            \
+        gas -= 9;                                                                                \
+        if (!zpush1_shl_sub(stack_bottom, stack_limit, position, gas, state))                    \
+            return gas;                                                                          \
+        goto* CGOTO(*position.code_it);                                                          \
+    }
+#else
+#define ZPUSH1_THEN_PUSH1_SPECIAL
+#endif
 #define ON_OPCODE(OPCODE)                                                                        \
     ZPUSH1_THEN_##OPCODE : ASM_COMMENT(ZPUSH1_##OPCODE);                                         \
     if constexpr (zpush1_fuses(OPCODE))                                                          \
@@ -2300,16 +2622,65 @@ TARGET_OP_UNDEFINED:
     }                                                                                            \
     else                                                                                         \
     {                                                                                            \
+        if constexpr (OPCODE == OP_PUSH1)                                                        \
+        {                                                                                        \
+            ZPUSH1_THEN_PUSH1_SPECIAL                                                            \
+        }                                                                                        \
         zpush1_commit(position);                                                                 \
         goto TARGET_##OPCODE;                                                                    \
     }
 
     MAP_OPCODES
 #undef ON_OPCODE
+#undef ZPUSH1_THEN_PUSH1_SPECIAL
 
 ZPUSH1_THEN_UNDEFINED:
     zpush1_commit(position);
     goto TARGET_OP_UNDEFINED;
+
+#if EVMONE_ZISK_SWAP_FUSION
+#define ON_OPCODE(OPCODE)                                                                        \
+    ZSWAP1_THEN_##OPCODE : ASM_COMMENT(ZSWAP1_##OPCODE);                                         \
+    if constexpr (zswap1_fuses(OPCODE))                                                          \
+    {                                                                                            \
+        if (!zswap1_then<OPCODE>(bottom2, stack_limit, position, gas, state))                    \
+            return gas;                                                                          \
+        goto* CGOTO(*position.code_it);                                                          \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        instr::core::swap<1>(position.stack_end);                                                \
+        goto TARGET_##OPCODE;                                                                    \
+    }
+
+    MAP_OPCODES
+#undef ON_OPCODE
+
+ZSWAP1_THEN_UNDEFINED:
+    instr::core::swap<1>(position.stack_end);
+    goto TARGET_OP_UNDEFINED;
+
+#define ON_OPCODE(OPCODE)                                                                        \
+    ZSWAP2_THEN_##OPCODE : ASM_COMMENT(ZSWAP2_##OPCODE);                                         \
+    if constexpr (zswap2_fuses(OPCODE))                                                          \
+    {                                                                                            \
+        if (!zswap2_then<OPCODE>(position, gas, state))                                          \
+            return gas;                                                                          \
+        goto* CGOTO(*position.code_it);                                                          \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        instr::core::swap<2>(position.stack_end);                                                \
+        goto TARGET_##OPCODE;                                                                    \
+    }
+
+    MAP_OPCODES
+#undef ON_OPCODE
+
+ZSWAP2_THEN_UNDEFINED:
+    instr::core::swap<2>(position.stack_end);
+    goto TARGET_OP_UNDEFINED;
+#endif
 #endif
 
 #if EVMONE_RV32_DISPATCH
