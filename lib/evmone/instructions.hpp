@@ -637,6 +637,29 @@ inline void div(StackTop stack) noexcept
     else
         div_top<0>(x, v, w0, 0);
 }
+#elif defined(ZISK)
+inline void div(StackTop stack) noexcept
+{
+    auto& v = stack[1];
+    if (v == 0) [[unlikely]]
+    {
+        v = 0;
+        return;
+    }
+    // Pow2 shift beats the hint fcall.
+    if ((v[3] | v[2] | v[1]) == 0)
+    {
+        const auto d = v[0];
+        if ((d & (d - 1)) == 0)
+        {
+            const auto shift = static_cast<unsigned>(__builtin_ctzll(d));
+            v = stack[0] >> shift;
+            return;
+        }
+    }
+    // Fcall hint, verified guest-side (H1).
+    v = zisk::udivrem(stack[0], v).quot;
+}
 #else
 inline void div(StackTop stack) noexcept
 {
@@ -667,11 +690,19 @@ inline void div(StackTop stack) noexcept
 }
 #endif
 
+#if defined(ZISK)
+inline void sdiv(StackTop stack) noexcept
+{
+    auto& v = stack[1];
+    v = zisk::sdivrem256(stack[0], v).quot;
+}
+#else
 inline void sdiv(StackTop stack) noexcept
 {
     auto& v = stack[1];
     v = v != 0 ? intx::sdivrem(stack[0], v).quot : 0;
 }
+#endif
 
 inline void mod(StackTop stack) noexcept
 {
@@ -695,7 +726,10 @@ inline void mod(StackTop stack) noexcept
             return;
         }
     }
-#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+#if defined(ZISK)
+    // Constrained precompile; no hint verification needed.
+    v = zisk::umod256(stack[0], v);
+#elif defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // The remainder alone, written straight into the divisor's slot.
     intx::internal::div32::urem(stack[0], v, v);
 #else
@@ -703,11 +737,19 @@ inline void mod(StackTop stack) noexcept
 #endif
 }
 
+#if defined(ZISK)
+inline void smod(StackTop stack) noexcept
+{
+    auto& v = stack[1];
+    v = zisk::sdivrem256(stack[0], v).rem;
+}
+#else
 inline void smod(StackTop stack) noexcept
 {
     auto& v = stack[1];
     v = v != 0 ? intx::sdivrem(stack[0], v).rem : 0;
 }
+#endif
 
 #if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
         defined(EVMONE_RV32_DISPATCH_TEST)) && \
