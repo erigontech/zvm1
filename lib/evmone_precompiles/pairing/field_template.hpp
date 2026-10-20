@@ -97,6 +97,41 @@ struct ExtFieldElem
     }
 #endif
 
+#if defined(ZISK)
+    /// Executor reads both operands before writing f1.
+    ExtFieldElem& operator+=(const ExtFieldElem& e) noexcept
+    {
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+            syscall_bn254_fp2_addmod(reinterpret_cast<size_t*>(coeffs.data()),
+                reinterpret_cast<const size_t*>(e.coeffs.data()));
+        else
+            for (size_t i = 0; i < DEGREE; ++i)
+                coeffs[i] += e.coeffs[i];
+        return *this;
+    }
+
+    ExtFieldElem& operator-=(const ExtFieldElem& e) noexcept
+    {
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+            syscall_bn254_fp2_submod(reinterpret_cast<size_t*>(coeffs.data()),
+                reinterpret_cast<const size_t*>(e.coeffs.data()));
+        else
+            for (size_t i = 0; i < DEGREE; ++i)
+                coeffs[i] -= e.coeffs[i];
+        return *this;
+    }
+
+    ExtFieldElem& operator*=(const ExtFieldElem& e) noexcept
+    {
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+            syscall_bn254_fp2_mulmod(reinterpret_cast<size_t*>(coeffs.data()),
+                reinterpret_cast<const size_t*>(e.coeffs.data()));
+        else
+            *this = multiply(*this, e);
+        return *this;
+    }
+#endif
+
     friend constexpr ExtFieldElem operator+(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
     {
 #if defined(SP1) || defined(SP1TURBO) || defined(ZISK)

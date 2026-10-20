@@ -117,6 +117,43 @@ constexpr Fq6 multiply(const Fq6& a, const Fq6& b) noexcept
     const auto t1 = a1 * b1;
     const auto t2 = a2 * b2;
 
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto c0 = a1;
+        c0 += a2;
+        auto u = b1;
+        u += b2;
+        c0 *= u;
+        c0 -= t1;
+        c0 -= t2;
+        c0 *= ksi;
+        c0 += t0;
+
+        auto c1 = a0;
+        c1 += a1;
+        auto v = b0;
+        v += b1;
+        c1 *= v;
+        c1 -= t0;
+        c1 -= t1;
+        auto k = ksi;
+        k *= t2;
+        c1 += k;
+
+        auto c2 = a0;
+        c2 += a2;
+        auto w = b0;
+        w += b2;
+        c2 *= w;
+        c2 -= t0;
+        c2 -= t2;
+        c2 += t1;
+
+        return Fq6({c0, c1, c2});
+    }
+#endif
+
     const auto c0 = ((a1 + a2) * (b1 + b2) - t1 - t2) * ksi + t0;
     const auto c1 = (a0 + a1) * (b0 + b1) - t0 - t1 + ksi * t2;
     const auto c2 = (a0 + a2) * (b0 + b2) - t0 - t2 + t1;
@@ -134,6 +171,26 @@ constexpr Fq12 multiply(const Fq12& a, const Fq12& b) noexcept
     const auto t1 = a1 * b1;
 
     const Fq2& ksi = Fq6Config::ksi;
+
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto c1 = a0;
+        c1 += a1;
+        auto v = b0;
+        v += b1;
+        c1 *= v;
+        c1 -= t0;
+        c1 -= t1;
+
+        auto c0 = t0;
+        c0.coeffs[0] += ksi * t1.coeffs[2];
+        c0.coeffs[1] += t1.coeffs[0];
+        c0.coeffs[2] += t1.coeffs[1];
+
+        return Fq12({c0, c1});
+    }
+#endif
 
     const auto c0 = t0 + Fq6({ksi * t1.coeffs[2], t1.coeffs[0], t1.coeffs[1]});  // gamma is sparse.
     const auto c1 = (a0 + a1) * (b0 + b1) - t0 - t1;

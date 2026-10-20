@@ -22,6 +22,71 @@ constexpr void multiply_by_lin_func_value(
     const auto t1x = t[1] * x;
     const auto t2ksi = t[2] * ksi;
 
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto& g0 = fr.coeffs[0].coeffs;
+        auto& g1 = fr.coeffs[1].coeffs;
+        Fq2 tmp;
+        auto o = f.coeffs[0].coeffs[0];
+        o *= t0y;
+        tmp = f.coeffs[1].coeffs[2];
+        tmp *= t1x;
+        tmp *= ksi;
+        o += tmp;
+        tmp = f.coeffs[1].coeffs[1];
+        tmp *= t2ksi;
+        o += tmp;
+        g0[0] = o;
+        o = f.coeffs[0].coeffs[1];
+        o *= t0y;
+        tmp = f.coeffs[1].coeffs[0];
+        tmp *= t1x;
+        o += tmp;
+        tmp = f.coeffs[1].coeffs[2];
+        tmp *= t2ksi;
+        o += tmp;
+        g0[1] = o;
+        o = f.coeffs[0].coeffs[2];
+        o *= t0y;
+        tmp = f.coeffs[1].coeffs[1];
+        tmp *= t1x;
+        o += tmp;
+        tmp = f.coeffs[1].coeffs[0];
+        tmp *= t[2];
+        o += tmp;
+        g0[2] = o;
+        o = f.coeffs[1].coeffs[0];
+        o *= t0y;
+        tmp = f.coeffs[0].coeffs[0];
+        tmp *= t1x;
+        o += tmp;
+        tmp = f.coeffs[0].coeffs[2];
+        tmp *= t2ksi;
+        o += tmp;
+        g1[0] = o;
+        o = f.coeffs[1].coeffs[1];
+        o *= t0y;
+        tmp = f.coeffs[0].coeffs[1];
+        tmp *= t1x;
+        o += tmp;
+        tmp = f.coeffs[0].coeffs[0];
+        tmp *= t[2];
+        o += tmp;
+        g1[1] = o;
+        o = f.coeffs[1].coeffs[2];
+        o *= t0y;
+        tmp = f.coeffs[0].coeffs[2];
+        tmp *= t1x;
+        o += tmp;
+        tmp = f.coeffs[0].coeffs[1];
+        tmp *= t[2];
+        o += tmp;
+        g1[2] = o;
+        return;
+    }
+#endif
+
     fr.coeffs[0].coeffs[0] = f.coeffs[0].coeffs[0] * t0y + f.coeffs[1].coeffs[2] * t1x * ksi +
                              f.coeffs[1].coeffs[1] * t2ksi;
     fr.coeffs[0].coeffs[1] =

@@ -184,6 +184,28 @@ constexpr ecc::ProjPoint<E2> add(
 
     const auto V = U1 * H_squared;
 
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto vv = V;
+        vv += V;
+        auto X3 = R_squared;
+        X3 -= H_cubed;
+        X3 -= vv;
+        auto d = V;
+        d -= X3;
+        auto Y3 = R;
+        Y3 *= d;
+        auto sh = S1;
+        sh *= H_cubed;
+        Y3 -= sh;
+        auto Z3 = H;
+        Z3 *= z0;
+        Z3 *= z1;
+        return {X3, Y3, Z3};
+    }
+#endif
+
     const auto X3 = R_squared - H_cubed - (V + V);
     const auto Y3 = R * (V - X3) - S1 * H_cubed;
     const auto Z3 = H * z0 * z1;
@@ -274,6 +296,55 @@ constexpr ecc::ProjPoint<E2> lin_func_and_dbl(
     const auto x_squared = x * x;
     const auto z_squared = z * z;
     const auto y_4 = y_squared * y_squared;
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto _4y_4 = y_4;
+        _4y_4 += y_4;
+        _4y_4 += y_4;
+        _4y_4 += y_4;
+
+        auto R = y_squared;
+        R += y_squared;
+        auto A = x;
+        A += R;
+        auto S = A;
+        S *= A;
+        S -= x_squared;
+        S -= _4y_4;  // 2xR = (x+R)^2 - x^2 - R^2
+        auto M = x_squared;
+        M += x_squared;
+        M += x_squared;
+
+        auto N = y;
+        N += z;
+
+        auto Xp = M;
+        Xp *= M;
+        auto ss = S;
+        ss += S;
+        Xp -= ss;
+        auto d = S;
+        d -= Xp;
+        auto Yp = M;
+        Yp *= d;
+        auto _8y_4 = _4y_4;
+        _8y_4 += _4y_4;
+        Yp -= _8y_4;
+        auto Zp = N;
+        Zp *= N;
+        Zp -= y_squared;
+        Zp -= z_squared;  // 2yz = (y+z)^2 - y^2 - z^2
+
+        t[0] = Zp * z_squared;
+        t[1] = M * z_squared;
+        auto mx = M;
+        mx *= x;
+        t[2] = R - mx;
+
+        return ecc::ProjPoint<E2>{Xp, Yp, Zp};
+    }
+#endif
     const auto _4y_4 = y_4 + y_4 + y_4 + y_4;
 
     const auto R = y_squared + y_squared;
@@ -321,6 +392,37 @@ constexpr ecc::ProjPoint<E2> lin_func_and_dbl(
 
     const auto V = x0 * H_squared;
 
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto vv = V;
+        vv += V;
+        auto X3 = R_squared;
+        X3 -= H_cubed;
+        X3 -= vv;
+        auto d = V;
+        d -= X3;
+        auto Y3 = R;
+        Y3 *= d;
+        auto yh = y0;
+        yh *= H_cubed;
+        Y3 -= yh;
+        auto Z3 = H;
+        Z3 *= z0;
+
+        t[0] = -H * z0_cubed;
+        t[1] = R * z0_squared;
+        auto a = y0;
+        a *= U2;
+        auto b = x0;
+        b *= S2;
+        a -= b;
+        t[2] = a;
+
+        return ecc::ProjPoint<E2>{X3, Y3, Z3};
+    }
+#endif
+
     const auto X3 = R_squared - H_cubed - (V + V);
     const auto Y3 = R * (V - X3) - y0 * H_cubed;
     const auto Z3 = H * z0;
@@ -351,6 +453,25 @@ constexpr void lin_func(
     const auto U2 = x1 * z0_squared;
     const auto S2 = y1 * z0_cubed;
 
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        t[0] = x0;
+        t[0] -= U2;
+        t[0] *= z0_cubed;
+        t[1] = S2;
+        t[1] -= y0;
+        t[1] *= z0_squared;
+        auto a = y0;
+        a *= U2;
+        auto b = x0;
+        b *= S2;
+        a -= b;
+        t[2] = a;
+        return;
+    }
+#endif
+
     t[0] = (x0 - U2) * z0_cubed;    // = x0·z0³ − U2·z0³
     t[1] = (S2 - y0) * z0_squared;  // = S2·z0² − y0·z0²
     t[2] = y0 * U2 - x0 * S2;
@@ -363,6 +484,26 @@ constexpr void lin_func(
 
     const auto& a0 = f.coeffs[0];
     const auto& a1 = f.coeffs[1];
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto c2 = a0 * a1;
+        auto c1 = c2;
+        c1 += c2;
+        auto c0 = a0;
+        c0 -= a1;
+        auto c3 = a0;
+        c3.coeffs[0] -= ksi * a1.coeffs[2];
+        c3.coeffs[1] -= a1.coeffs[0];
+        c3.coeffs[2] -= a1.coeffs[1];
+        c0 *= c3;
+        c0 += c2;
+        c0.coeffs[0] += ksi * c2.coeffs[2];
+        c0.coeffs[1] += c2.coeffs[0];
+        c0.coeffs[2] += c2.coeffs[1];
+        return Fq12({c0, c1});
+    }
+#endif
     auto c0 = a0 - a1;
     auto c3 = a0 - Fq6({ksi * a1.coeffs[2], a1.coeffs[0], a1.coeffs[1]});
     auto c2 = a0 * a1;
@@ -383,6 +524,21 @@ constexpr std::pair<Fq2, Fq2> fq4_square(const std::pair<Fq2, Fq2>& a) noexcept
 
     const auto t0 = a0 * a0;
     const auto t1 = a1 * a1;
+
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto c0 = t1;
+        c0 *= Fq6Config::ksi;
+        c0 += t0;
+        auto c1 = a0;
+        c1 += a1;
+        c1 *= c1;
+        c1 -= t0;
+        c1 -= t1;
+        return {c0, c1};
+    }
+#endif
 
     const auto c0 = t1 * Fq6Config::ksi + t0;
     auto c1 = a0 + a1;
@@ -409,6 +565,48 @@ constexpr Fq12 cyclotomic_square(const Fq12& c) noexcept
     const auto [t00, t11] = fq4_square({g0, h1});
     const auto [t01, t12] = fq4_square({h0, g2});  // Typo in paper t01 <-> t12
     const auto [t02, aux] = fq4_square({g1, h2});
+
+#if defined(ZISK)
+    if (!std::is_constant_evaluated())
+    {
+        auto t10 = aux;
+        t10 *= Fq6Config::ksi;
+
+        auto c00 = t00;
+        c00 += t00;
+        c00 += t00;
+        c00 -= g0;
+        c00 -= g0;
+        auto c01 = t01;
+        c01 += t01;
+        c01 += t01;
+        c01 -= g1;
+        c01 -= g1;
+        auto c02 = t02;
+        c02 += t02;
+        c02 += t02;
+        c02 -= g2;
+        c02 -= g2;
+
+        auto c10 = h0;
+        c10 += h0;
+        c10 += t10;
+        c10 += t10;
+        c10 += t10;
+        auto c11 = h1;
+        c11 += h1;
+        c11 += t11;
+        c11 += t11;
+        c11 += t11;
+        auto c12 = h2;
+        c12 += h2;
+        c12 += t12;
+        c12 += t12;
+        c12 += t12;
+
+        return Fq12({Fq6({c00, c01, c02}), Fq6({c10, c11, c12})});
+    }
+#endif
 
     const auto t10 = aux * Fq6Config::ksi;
 
