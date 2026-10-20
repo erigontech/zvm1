@@ -273,6 +273,12 @@ public:
     /// Returns true for the exponent of zero.
     [[nodiscard]] bool empty() const noexcept { return bytes_.empty(); }
 
+    /// Big-endian significant bytes.
+    [[nodiscard]] const uint8_t* data() const noexcept { return bytes_.data(); }
+
+    /// Significant bytes; must not be empty.
+    [[nodiscard]] size_t size() const noexcept { return bytes_.size(); }
+
     /// The number of significant bits of the exponent. Must not be empty.
     [[nodiscard]] size_t bit_width() const noexcept
     {
@@ -684,39 +690,117 @@ void modexp_zisk(std::span<const uint8_t> base_bytes, const Exponent& exp,
         return intx::be::load<uint256>(tmp);
     };
 
+    uint8_t out[32]{};
+
     const auto base = load_u256(base_bytes);
     const auto mod = load_u256(mod_bytes);
 
-    // Precompile outputs must not alias inputs.
-    uint256 r[2];
-    auto* acc = &r[0];
-    auto* tmp = &r[1];
-    const auto mulmod_into = [&mod](const uint256& x, const uint256& y, uint256& out) noexcept {
-        zisk::arith256_mod(&x[0], &y[0], &zisk::kZero256[0], &mod[0], &out[0]);
-    };
+    // Params set once; each call is bare.
+    const uint64_t* m = &mod[0];
+    const uint64_t* z = &zisk::kZero256[0];
+
+    uint256 r[2]{};
+    uint256 t[16];
+    int p = 0;
 
     if (mod > 1) [[likely]]
     {
         if (exp.empty())
-            *acc = 1;
+            r[0] = 1;
         else
         {
-            *acc = zisk::arith256_mod(base, zisk::kOne256, zisk::kZero256, mod);
-            for (auto i = exp.bit_width() - 1; i != 0; --i)
+            const size_t bw = exp.bit_width();
+
+            // Below 57 bits the table costs more.
+            if (bw >= 57)
             {
-                mulmod_into(*acc, *acc, *tmp);
-                std::swap(acc, tmp);
-                if (exp[i - 1])
+                zisk::ArithModParams pt{&base[0], &zisk::kOne256[0], z, m, &t[1][0]};
+                zisk::csrs<0x802>(&pt);
+                for (unsigned k = 2; k < 16; ++k)
                 {
-                    mulmod_into(*acc, base, *tmp);
-                    std::swap(acc, tmp);
+                    pt.a = &t[k - 1][0];
+                    pt.b = &base[0];
+                    pt.d = &t[k][0];
+                    zisk::csrs<0x802>(&pt);
+                }
+
+                const uint8_t* e = exp.data();
+                const size_t n = exp.size();
+                const size_t D = (bw + 3) / 4;
+                const auto nib = [&](size_t d) noexcept {
+                    return (e[n - 1 - (d >> 1)] >> (4 * (d & 1))) & 15u;
+                };
+
+                zisk::ArithModParams psq[2] = {
+                    {&r[0][0], &r[0][0], z, m, &r[1][0]},
+                    {&r[1][0], &r[1][0], z, m, &r[0][0]},
+                };
+                zisk::ArithModParams pmul{&r[0][0], &t[1][0], z, m, &r[1][0]};
+                const auto sq = [&]() noexcept {
+                    zisk::csrs<0x802>(&psq[p]);
+                    p ^= 1;
+                };
+                const auto mul = [&](unsigned g) noexcept {
+                    pmul.a = &r[p][0];
+                    pmul.b = &t[g][0];
+                    pmul.d = &r[p ^ 1][0];
+                    zisk::csrs<0x802>(&pmul);
+                    p ^= 1;
+                };
+
+                psq[0].a = psq[0].b = &t[nib(D - 1)][0];
+                sq();
+                psq[0].a = psq[0].b = &r[0][0];
+                sq();
+                sq();
+                sq();
+                if (const unsigned g = nib(D - 2))
+                    mul(g);
+                for (size_t d = D - 2; d != 0; --d)
+                {
+                    sq();
+                    sq();
+                    sq();
+                    sq();
+                    if (const unsigned g = nib(d - 1))
+                        mul(g);
+                }
+            }
+            else
+            {
+                zisk::ArithModParams pr{&base[0], &zisk::kOne256[0], z, m, &r[0][0]};
+                zisk::csrs<0x802>(&pr);
+
+                zisk::ArithModParams psq[2] = {
+                    {&r[0][0], &r[0][0], z, m, &r[1][0]},
+                    {&r[1][0], &r[1][0], z, m, &r[0][0]},
+                };
+                zisk::ArithModParams pmul{&r[0][0], &base[0], z, m, &r[1][0]};
+                const uint8_t* e = exp.data();
+                const size_t n = exp.size();
+
+                for (size_t i = bw - 1; i != 0;)
+                {
+                    const uint8_t byte = e[n - 1 - ((i - 1) >> 3)];
+                    for (uint8_t mask = uint8_t{1} << ((i - 1) & 7); mask != 0; mask >>= 1)
+                    {
+                        zisk::csrs<0x802>(&psq[p]);
+                        p ^= 1;
+                        if ((byte & mask) != 0)
+                        {
+                            pmul.a = &r[p][0];
+                            pmul.d = &r[p ^ 1][0];
+                            zisk::csrs<0x802>(&pmul);
+                            p ^= 1;
+                        }
+                        --i;
+                    }
                 }
             }
         }
     }
 
-    uint8_t out[32];
-    intx::be::store(out, *acc);
+    intx::be::store(out, r[p]);
     std::copy_n(&out[32 - mod_bytes.size()], mod_bytes.size(), output);
 }
 #endif
