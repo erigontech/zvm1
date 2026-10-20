@@ -38,6 +38,15 @@ union ethash_hash256 ethash_keccak256_snap(
 union ethash_hash256 ethash_keccak256_resume(
     uint64_t* slot, size_t blocks, const uint8_t* data, size_t size) noexcept;
 
+/// ethash_keccak256() of the @p size bytes at @p data, which must be 8-byte aligned and hold at
+/// least one whole 136-byte block. @p init, when not null, holds the Keccak state of the first
+/// @p init_blocks whole blocks (caller-verified identical); a null @p init starts from zero.
+/// The state after capture_at whole blocks, if capture_at != 0 (then init_blocks < capture_at <=
+/// size / 136), is copied to the 25 words at @p out_state. Consumes nothing of @p init, which
+/// may alias @p out_state.
+union ethash_hash256 ethash_keccak256_cap(const uint8_t* data, size_t size,
+    const uint64_t* init, size_t init_blocks, size_t capture_at, uint64_t* out_state) noexcept;
+
 /// ethash_keccak256() of a full trie branch with some of its hash references replaced, read from
 /// the branch itself rather than from a patched copy of it. @p node is the 532-byte branch, 8-byte
 /// aligned: a list header f9 02 11, 16 slots of 0xa0 and a 32-byte hash (slot j's hash at byte

@@ -1156,6 +1156,69 @@ union ethash_hash256 ethash_keccak256_resume(
     return hash;
 }
 
+union ethash_hash256 ethash_keccak256_cap(const uint8_t* data, size_t size,
+    const uint64_t* init, size_t init_blocks, size_t capture_at, uint64_t* out_state)
+{
+    union ethash_hash256 hash;
+    const size_t block_words = (1600 - 256 * 2) / 8 / WORD_SIZE;
+    uint64_t state[25];
+    size_t depth;
+    const uint8_t* d;
+    size_t sz;
+    if (init_blocks == 0)
+    {
+        // Zero state: first block copies, not XORs.
+        __builtin_memcpy(state, data, block_words * WORD_SIZE);
+        __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
+        keccakf1600_best(state);
+        depth = 1;
+        if (depth == capture_at)
+            __builtin_memcpy(out_state, state, 25 * WORD_SIZE);
+        d = data + block_words * WORD_SIZE;
+        sz = size - block_words * WORD_SIZE;
+    }
+    else
+    {
+        __builtin_memcpy(state, init, 25 * WORD_SIZE);
+        depth = init_blocks;
+        d = data + init_blocks * block_words * WORD_SIZE;
+        sz = size - init_blocks * block_words * WORD_SIZE;
+    }
+    struct word_reader reader = init_word_reader(d, sz, 0);
+    // No capture bookkeeping in the hot loop.
+    const size_t nb_total = sz / (block_words * WORD_SIZE);
+    const size_t nb_to_capture =
+        capture_at > depth ? capture_at - depth : nb_total;
+    const size_t nb_a = nb_to_capture < nb_total ? nb_to_capture : nb_total;
+    for (size_t b = 0; b < nb_a; ++b)
+    {
+        absorb_words(state, block_words, &reader);
+        keccakf1600_best(state);
+    }
+    depth += nb_a;
+    if (depth == capture_at)
+        __builtin_memcpy(out_state, state, 25 * WORD_SIZE);
+    for (size_t b = nb_a; b < nb_total; ++b)
+    {
+        absorb_words(state, block_words, &reader);
+        keccakf1600_best(state);
+    }
+    sz -= nb_total * block_words * WORD_SIZE;
+    const size_t last_words = sz / WORD_SIZE;
+    absorb_words(state, last_words, &reader);
+    sz %= WORD_SIZE;
+    const uint8_t* const tail = reader.data;
+    uint64_t last_word = (uint64_t)0x01 << (sz * 8);
+    for (size_t i = 0; i < sz; ++i)
+        last_word |= (uint64_t)tail[i] << (i * 8);
+    state[last_words] ^= last_word;
+    state[block_words - 1] ^= 0x8000000000000000;
+    keccakf1600_best(state);
+    for (size_t i = 0; i < 4; ++i)
+        hash.word64s[i] = to_le64(state[i]);
+    return hash;
+}
+
 /// The size of a full trie branch: a 3-byte list header, 16 slots of 0xa0 and a 32-byte hash, and
 /// the empty value 0x80. Four blocks: three of 136 bytes and a last one of 124.
 #define FULL_BRANCH_SIZE 532
