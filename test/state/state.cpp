@@ -458,74 +458,11 @@ std::pair<Account&, bool> State::get_or_create(const address& addr)
     return {acc, true};
 }
 
-Account& State::get(const address& addr) noexcept
-{
-    auto& acc = access(addr);
-    if (!acc.loaded) [[unlikely]]
-    {
-        // Load the account from the initial state. A miss is cached as a nonexistent account,
-        // so the initial state is queried once per address rather than once per access.
-        assert(acc.is_empty() && !acc.nonexistent && !acc.destructed && !acc.erase_if_empty);
-        acc.loaded = true;
-        if (const auto cacc = m_initial.get_account(addr); cacc)
-        {
-            acc.nonce = cacc->nonce;
-            acc.balance = cacc->balance;
-            acc.code_hash = cacc->code_hash;
-            acc.has_initial_storage = cacc->has_storage;
-            acc.view_handle = cacc->handle;
-        }
-        else
-        {
-            acc.nonexistent = true;
-        }
-    }
-    // A nonexistent account is readable: its zero fields are what a missing account holds.
-    assert(!acc.nonexistent ||
-           (acc.is_empty() && !acc.erase_if_empty && !acc.just_created && !acc.code_changed));
-    return acc;
-}
-
 Account& State::get_or_insert(const address& addr)
 {
     auto& acc = get(addr);
     if (acc.nonexistent)
     {
-        acc.nonexistent = false;
-        acc.erase_if_empty = true;
-    }
-    return acc;
-}
-
-bytes_view State::get_code(const address& addr)
-{
-    // A nonexistent account has the empty code hash, so it needs no separate check.
-    auto& a = get(addr);
-    if (a.code_hash == Account::EMPTY_CODE_HASH)
-        return {};
-    // Non-empty only if this transaction wrote the code; every writer either leaves it
-    // non-empty or sets code_hash to EMPTY_CODE_HASH, which the check above catches.
-    if (!a.code.empty())
-        return a.code;
-    // A stateless witness may omit a body this transaction already wrote (EIP-7928).
-    const auto [first, last] = m_changed_code_addresses.equal_range(a.code_hash);
-    for (auto it = first; it != last; ++it)
-    {
-        const auto m = m_modified.find(it->second);
-        if (m != m_modified.end() && m->second.code_hash == a.code_hash && !m->second.code.empty())
-            return m->second.code;
-    }
-    // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
-    // its 23-byte prefix, so copying the whole contract here would be pure waste.
-    return m_initial.get_account_code_at(a.view_handle, addr);
-}
-
-Account& State::touch(const address& addr)
-{
-    auto& acc = get(addr);
-    if (!acc.erase_if_empty && acc.is_empty())  // Also true for a nonexistent account.
-    {
-        journal_account_flags(acc);
         acc.nonexistent = false;
         acc.erase_if_empty = true;
     }
@@ -587,6 +524,48 @@ void State::journal_account_flags(Account& acc)
 {
     m_journal.emplace_back(JournalAccountFlags{
         {&acc}, acc.access_status, acc.nonexistent, acc.destructed, acc.erase_if_empty});
+}
+
+void State::load_initial(Account& acc, const address& addr) noexcept
+{
+    // Load the account from the initial state. A miss is cached as a nonexistent account,
+    // so the initial state is queried once per address rather than once per access.
+    assert(acc.is_empty() && !acc.nonexistent && !acc.destructed && !acc.erase_if_empty);
+    acc.loaded = true;
+    if (const auto cacc = m_initial.get_account(addr); cacc)
+    {
+        acc.nonce = cacc->nonce;
+        acc.balance = cacc->balance;
+        acc.code_hash = cacc->code_hash;
+        acc.has_initial_storage = cacc->has_storage;
+        acc.view_handle = cacc->handle;
+    }
+    else
+    {
+        acc.nonexistent = true;
+    }
+}
+
+bytes_view State::resolve_code(Account& a, const address& addr)
+{
+    // A stateless witness may omit a body this transaction already wrote (EIP-7928).
+    const auto [first, last] = m_changed_code_addresses.equal_range(a.code_hash);
+    for (auto it = first; it != last; ++it)
+    {
+        const auto m = m_modified.find(it->second);
+        if (m != m_modified.end() && m->second.code_hash == a.code_hash && !m->second.code.empty())
+            return m->second.code;
+    }
+    // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
+    // its 23-byte prefix, so copying the whole contract here would be pure waste.
+    return m_initial.get_account_code_at(a.view_handle, addr);
+}
+
+void State::create_touched(Account& acc)
+{
+    journal_account_flags(acc);
+    acc.nonexistent = false;
+    acc.erase_if_empty = true;
 }
 
 namespace

@@ -448,8 +448,6 @@ inline bool check_memory_for_mstore(
     const uint64_t w0 = w[0];
     if (w0 >= memory.limit32()) [[unlikely]]
     {
-        if (w0 > max_buffer_size)
-            return false;
         const auto size = memory.size();
         if (w0 <= size && size + word_size <= memory.capacity())
         {
@@ -461,6 +459,9 @@ inline bool check_memory_for_mstore(
         }
         else
         {
+            // Only growing can pass the cap.
+            if (w0 > max_buffer_size)
+                return false;
             gas_left = grow_memory(gas_left, memory, w0 + 32);
             if (gas_left < 0) [[unlikely]]
                 return false;
@@ -1481,7 +1482,30 @@ inline void fill(Slot& slot, const W* w, size_t n, W tail, W s, const W* value) 
 
 #if defined(ZISK)
 // Memoized KECCAK256 of 1..135 aligned bytes.
-[[gnu::noinline]] inline void hash(uint256& out, const uint8_t* p, size_t s) noexcept
+[[gnu::noinline]] inline void refill64(uint256& out, const uint8_t* p, Slot& slot) noexcept
+{
+    const auto w = reinterpret_cast<const word_t*>(p);
+    const auto x = intx::be::load<uint256>(ethash::keccak256(p, 64));
+    out = x;
+    slot.size = 64;
+    for (int i = 0; i < 8; ++i)
+        slot.key[i] = w[i];
+    for (int j = 0; j < 4; ++j)
+        slot.value[j] = x[j];
+}
+
+[[gnu::noinline]] inline void refill(uint256& out, const uint8_t* p, Slot& slot, size_t s) noexcept
+{
+    const auto w = reinterpret_cast<const word_t*>(p);
+    const auto x = intx::be::load<uint256>(ethash::keccak256(p, s));
+    out = x;
+    const size_t n = (s + 7) / 8;
+    const unsigned tail_bits = unsigned{s & 7} * 8;
+    const word_t tail = w[n - 1] & (tail_bits != 0 ? (word_t{1} << tail_bits) - 1 : ~word_t{0});
+    fill<word_t>(slot, w, n, tail, word_t{s}, reinterpret_cast<const word_t*>(&out));
+}
+
+[[gnu::always_inline]] inline void hash(uint256& out, const uint8_t* p, size_t s) noexcept
 {
     p = static_cast<const uint8_t*>(__builtin_assume_aligned(p, 8));
     const auto w = reinterpret_cast<const word_t*>(p);
@@ -1492,25 +1516,15 @@ inline void fill(Slot& slot, const W* w, size_t n, W tail, W s, const W* value) 
         for (int i = 0; i < 8; ++i)
             h = (h ^ w[i]) * MULT;
         auto& slot = table()[h >> (8 * sizeof(word_t) - BITS)];
-        if (slot.size == 64) [[likely]]
+        if (slot.size == 64 && slot.key[0] == w[0] && slot.key[1] == w[1] && slot.key[2] == w[2] &&
+            slot.key[3] == w[3] && slot.key[4] == w[4] && slot.key[5] == w[5] &&
+            slot.key[6] == w[6] && slot.key[7] == w[7]) [[likely]]
         {
-            if (slot.key[0] == w[0] && slot.key[1] == w[1] && slot.key[2] == w[2] &&
-                slot.key[3] == w[3] && slot.key[4] == w[4] && slot.key[5] == w[5] &&
-                slot.key[6] == w[6] && slot.key[7] == w[7]) [[likely]]
-            {
-                for (int j = 0; j < 4; ++j)
-                    out[j] = slot.value[j];
-                return;
-            }
+            for (int j = 0; j < 4; ++j)
+                out[j] = slot.value[j];
+            return;
         }
-
-        const auto x = intx::be::load<uint256>(ethash::keccak256(p, 64));
-        out = x;
-        slot.size = 64;
-        for (int i = 0; i < 8; ++i)
-            slot.key[i] = w[i];
-        for (int j = 0; j < 4; ++j)
-            slot.value[j] = x[j];
+        refill64(out, p, slot);
         return;
     }
 
@@ -1518,11 +1532,7 @@ inline void fill(Slot& slot, const W* w, size_t n, W tail, W s, const W* value) 
     const unsigned tail_bits = unsigned{s & 7} * 8;
     const word_t tail = w[n - 1] & (tail_bits != 0 ? (word_t{1} << tail_bits) - 1 : ~word_t{0});
     if (Slot* const miss = lookup_or_reserve<word_t>(w, n, tail, word_t{s}, o)) [[unlikely]]
-    {
-        const auto x = intx::be::load<uint256>(ethash::keccak256(p, s));
-        out = x;
-        fill<word_t>(*miss, w, n, tail, word_t{s}, o);
-    }
+        refill(out, p, *miss, s);
 }
 #endif
 }  // namespace keccak_memo

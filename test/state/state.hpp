@@ -12,6 +12,7 @@
 #include "state_diff.hpp"
 #include "state_view.hpp"
 #include "transaction.hpp"
+#include <cassert>
 #include <variant>
 
 namespace evmone::state
@@ -74,6 +75,10 @@ class State
     /// reverts and overwrites leave stale ones, which get_code() skips by re-checking the hash.
     std::unordered_multimap<bytes32, address> m_changed_code_addresses;
 
+    [[gnu::noinline]] void load_initial(Account& acc, const address& addr) noexcept;
+    [[gnu::noinline]] bytes_view resolve_code(Account& a, const address& addr);
+    [[gnu::noinline]] void create_touched(Account& acc);
+
 public:
     explicit State(const StateView& state_view) noexcept : m_initial{state_view}
     {
@@ -95,12 +100,32 @@ public:
     /// Returns the account at the address. An account absent from the state is returned as a
     /// node flagged nonexistent, so the reference is always valid and the flag is the answer to
     /// "does this account exist?".
-    Account& get(const address& addr) noexcept;
+    Account& get(const address& addr) noexcept
+    {
+        auto& acc = access(addr);
+        if (!acc.loaded) [[unlikely]]
+            load_initial(acc, addr);
+        // A nonexistent account is readable: its zero fields are what a missing account holds.
+        assert(!acc.nonexistent ||
+               (acc.is_empty() && !acc.erase_if_empty && !acc.just_created && !acc.code_changed));
+        return acc;
+    }
 
     /// Gets an existing account or creates new erasable account without journaling.
     Account& get_or_insert(const address& addr);
 
-    bytes_view get_code(const address& addr);
+    bytes_view get_code(const address& addr)
+    {
+        // A nonexistent account has the empty code hash, so it needs no separate check.
+        auto& a = get(addr);
+        if (a.code_hash == Account::EMPTY_CODE_HASH)
+            return {};
+        // Non-empty only if this transaction wrote the code; every writer either leaves it
+        // non-empty or sets code_hash to EMPTY_CODE_HASH, which the check above catches.
+        if (!a.code.empty())
+            return a.code;
+        return resolve_code(a, addr);
+    }
 
     void add_changed_code_address(const bytes32& code_hash, const address& addr)
     {
@@ -134,7 +159,13 @@ public:
     std::pair<Account&, bool> get_or_create(const address& addr);
 
     /// Touches (as in EIP-161) an existing account or creates new erasable account.
-    Account& touch(const address& addr);
+    Account& touch(const address& addr)
+    {
+        auto& acc = get(addr);
+        if (!acc.erase_if_empty && acc.is_empty())  // Also true for a nonexistent account.
+            create_touched(acc);
+        return acc;
+    }
 
     void journal_balance_change(Account& acc);
 
