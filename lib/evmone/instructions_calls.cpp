@@ -93,7 +93,7 @@ inline void absorb_child_state_gas(
 }
 
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
-    defined(EVMONE_RV32_DISPATCH_TEST)
+    defined(EVMONE_RV32_DISPATCH_TEST) || defined(ZISK)
 /// Whether the call family runs with the state Host only, as on rv32 (EVMONE_RV32_DISPATCH_TEST
 /// builds that configuration on the host for testing), where no state gas is charged or refilled
 /// before Amsterdam (see call_impl).
