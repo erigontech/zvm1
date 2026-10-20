@@ -33,6 +33,13 @@
 #define EVMONE_RV32_DISPATCH 0
 #endif
 
+#if defined(ZISK) && !EVMONE_RV32_DISPATCH && EVMONE_JUMP_SKIPS_JUMPDEST
+/// The rv64 PUSH1+successor fusion: 64-bit limbs, no byte-map coupling, plain gas checks.
+#define EVMONE_ZISK_PUSH1_FUSION 1
+#else
+#define EVMONE_ZISK_PUSH1_FUSION 0
+#endif
+
 namespace evmone::baseline
 {
 namespace
@@ -1874,6 +1881,184 @@ template <Opcode Op>
 }
 #endif
 
+#if EVMONE_ZISK_PUSH1_FUSION
+/// PUSH1 and its successor on rv64: the rv32 fusion with 4 64-bit limbs and no byte-map coupling.
+
+/// The push itself: the immediate is the byte before the successor.
+[[gnu::always_inline]] inline void zpush1_commit(Position& pos) noexcept
+{
+    uint64_t* const w = reinterpret_cast<uint64_t*>(pos.stack_end);
+    w[0] = pos.code_it[-1];
+    w[1] = 0;
+    w[2] = 0;
+    w[3] = 0;
+    ++pos.stack_end;
+}
+
+/// The successors that run fused with PUSH1 through zpush1_then().
+constexpr bool zpush1_fuses(Opcode op) noexcept
+{
+    return op == OP_SHL || op == OP_SHR || op == OP_SAR || op == OP_MLOAD || op == OP_MSTORE ||
+           op == OP_ADD || op == OP_AND || op == OP_NOT || op == OP_SWAP1 || op == OP_SIGNEXTEND;
+}
+
+/// The fused PUSH1 + Op, entered after PUSH1's own checks with the push not yet made: the
+/// immediate is pos.code_it[-1] and pos.stack_end is still the slot it would take. On false the
+/// status is set. On true pos is at the next instruction.
+template <Opcode Op>
+[[gnu::always_inline]] inline bool zpush1_then(const CostTable& cost_table,
+    const uint256* stack_bottom, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+{
+    const auto fail = [&](evmc_status_code status) noexcept {
+        state.status = status;
+        return false;
+    };
+    const uint64_t imm = pos.code_it[-1];
+    if constexpr (Op == OP_SHL || Op == OP_SHR || Op == OP_SAR)
+    {
+        // Petersburg instructions: check_requirements() tests the cost table first.
+        if (INTX_UNLIKELY(cost_table[Op] < 0))
+            return fail(EVMC_UNDEFINED_INSTRUCTION);
+        // Two operands: the pushed shift and the value under it, then 3 gas.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY((gas -= 3) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        auto& x = pos.stack_end[-1];
+        if constexpr (Op == OP_SHL)
+            x <<= imm;
+        else if constexpr (Op == OP_SHR)
+            x >>= imm;
+        else
+        {
+            // instr::core::sar()'s logic with the shift known to be below 256.
+            const bool is_neg = static_cast<int64_t>(x[3]) < 0;
+            const auto sign_mask = is_neg ? ~uint256{} : uint256{};
+            x = (x >> imm) | (sign_mask << (256 - imm));
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_MLOAD || Op == OP_MSTORE)
+    {
+        if constexpr (Op == OP_MSTORE)  // The value under the pushed offset.
+        {
+            if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+                return fail(EVMC_STACK_UNDERFLOW);
+        }
+        if (INTX_UNLIKELY((gas -= 3) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        // The same helpers the unfused MLOAD/MSTORE use, so growth and gas match.
+        auto& memory = state.memory;
+        const uint256 off{imm};
+        size_t at = 0;
+        const bool mem_ok = (Op == OP_MSTORE) ? check_memory_for_mstore(gas, memory, off, at) :
+                                                check_memory32(gas, memory, off, at);
+        if (INTX_UNLIKELY(!mem_ok))
+            return fail(EVMC_OUT_OF_GAS);
+        if constexpr (Op == OP_MLOAD)
+        {
+            instr::core::load_be_word(*pos.stack_end, &memory[at]);  // Into the push's slot.
+            pos.stack_end += 1;
+        }
+        else
+        {
+            instr::core::store_be_word(&memory[at], pos.stack_end[-1]);
+            pos.stack_end -= 1;
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_ADD || Op == OP_AND || Op == OP_SWAP1)
+    {
+        // Two operands: the pushed one and x under it, then 3 gas.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY((gas -= 3) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        uint64_t* const x = reinterpret_cast<uint64_t*>(pos.stack_end - 1);
+        if constexpr (Op == OP_ADD)
+        {
+            // The carry runs up through the limbs that wrap to 0, rarely past the first.
+            const uint64_t lo = x[0] + imm;
+            x[0] = lo;
+            if (INTX_UNLIKELY(lo < imm))
+            {
+                if (++x[1] == 0 && ++x[2] == 0)
+                    ++x[3];
+            }
+        }
+        else
+        {
+            // AND keeps only the immediate's bits of x[0]. SWAP1 moves x up into the push's slot
+            // and the immediate takes its place.
+            if constexpr (Op == OP_SWAP1)
+            {
+                *pos.stack_end = pos.stack_end[-1];
+                ++pos.stack_end;
+                x[0] = imm;
+            }
+            else
+                x[0] &= imm;
+            x[1] = 0;
+            x[2] = 0;
+            x[3] = 0;
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_NOT)
+    {
+        // The one operand is the pushed item: no underflow. 3 gas.
+        if (INTX_UNLIKELY((gas -= 3) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        uint64_t* const w = reinterpret_cast<uint64_t*>(pos.stack_end);
+        w[0] = ~imm;
+        w[1] = ~uint64_t{0};
+        w[2] = ~uint64_t{0};
+        w[3] = ~uint64_t{0};
+        pos.stack_end += 1;
+        pos.code_it += 1;
+        return true;
+    }
+    else if constexpr (Op == OP_SIGNEXTEND)
+    {
+        // A Frontier instruction of cost 5 in every revision: no undefined-instruction check.
+        // The value under the pushed byte must exist.
+        if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
+            return fail(EVMC_STACK_UNDERFLOW);
+        if (INTX_UNLIKELY((gas -= 5) < 0))
+            return fail(EVMC_OUT_OF_GAS);
+        if (imm < 31)  // For 31 and above x is unchanged.
+        {
+            // instr::core::signextend()'s generic path with the byte index known small.
+            auto& x = pos.stack_end[-1];
+            const auto sign_word_index = static_cast<size_t>(imm / 8);
+            const auto sign_byte_index = imm % 8;
+            auto& sign_word = x[sign_word_index];
+            const auto sign_byte_offset = sign_byte_index * 8;
+            const auto sign_byte = sign_word >> sign_byte_offset;
+            const auto sext_byte = static_cast<uint64_t>(int64_t{static_cast<int8_t>(sign_byte)});
+            const auto sext = sext_byte << sign_byte_offset;
+            const auto sign_mask = ~uint64_t{0} << sign_byte_offset;
+            const auto value = sign_word & ~sign_mask;
+            sign_word = sext | value;
+            const auto sign_ex = static_cast<uint64_t>(static_cast<int64_t>(sext_byte) >> 8);
+            for (size_t i = 3; i > sign_word_index; --i)
+                x[i] = sign_ex;
+        }
+        pos.code_it += 1;
+        return true;
+    }
+    else
+    {
+        // An opcode in zpush1_fuses() without a branch here would neither push nor advance.
+        static_assert(!zpush1_fuses(Op));
+        return true;  // Not fused; dispatch_cgoto() does not call this for other opcodes.
+    }
+}
+#endif
+
 #if EVMONE_CGOTO_SUPPORTED
 int64_t dispatch_cgoto(
     const CostTable& cost_table, ExecutionState& state, int64_t gas, const uint8_t* code) noexcept
@@ -1930,6 +2115,18 @@ int64_t dispatch_cgoto(
 #define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
     };
 #define CGOTO(OP) cgoto_table[OP]
+#if EVMONE_ZISK_PUSH1_FUSION
+    static constexpr void* push1_then_table[] = {
+#define ON_OPCODE(OPCODE) &&ZPUSH1_THEN_##OPCODE,
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED(_) &&ZPUSH1_THEN_UNDEFINED,
+        MAP_OPCODES
+#undef ON_OPCODE
+#undef ON_OPCODE_UNDEFINED
+#define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
+    };
+    static_assert(std::size(push1_then_table) == 256);
+#endif
 #endif
 
     const auto stack_bottom = state.stack_space.bottom();
@@ -2002,6 +2199,29 @@ int64_t dispatch_cgoto(
     {                                                                                            \
         ON_OPCODE_INVOKE(OPCODE)                                                                 \
     }
+#elif EVMONE_ZISK_PUSH1_FUSION
+#define ON_OPCODE(OPCODE)                                                                        \
+    TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
+    if constexpr (OPCODE == OP_PUSH1)                                                            \
+    {                                                                                            \
+        /* PUSH1's checks; the push is made by the successor's ZPUSH1_THEN_ entry. */             \
+        if (INTX_UNLIKELY(position.stack_end == stack_limit))                                    \
+        {                                                                                        \
+            state.status = EVMC_STACK_OVERFLOW;                                                  \
+            return gas;                                                                          \
+        }                                                                                        \
+        if (INTX_UNLIKELY((gas -= 3) < 0))                                                       \
+        {                                                                                        \
+            state.status = EVMC_OUT_OF_GAS;                                                      \
+            return gas;                                                                          \
+        }                                                                                        \
+        position.code_it += 2;                                                                   \
+        goto* push1_then_table[*position.code_it];                                               \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        ON_OPCODE_INVOKE(OPCODE)                                                                 \
+    }
 #else
 #define ON_OPCODE(OPCODE)                                                                        \
     TARGET_##OPCODE : ASM_COMMENT(OPCODE);                                                       \
@@ -2015,6 +2235,29 @@ int64_t dispatch_cgoto(
 TARGET_OP_UNDEFINED:
     state.status = EVMC_UNDEFINED_INSTRUCTION;
     return gas;
+
+#if EVMONE_ZISK_PUSH1_FUSION
+#define ON_OPCODE(OPCODE)                                                                        \
+    ZPUSH1_THEN_##OPCODE : ASM_COMMENT(ZPUSH1_##OPCODE);                                         \
+    if constexpr (zpush1_fuses(OPCODE))                                                          \
+    {                                                                                            \
+        if (!zpush1_then<OPCODE>(cost_table, stack_bottom, position, gas, state))                 \
+            return gas;                                                                          \
+        goto* CGOTO(*position.code_it);                                                          \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        zpush1_commit(position);                                                                 \
+        goto TARGET_##OPCODE;                                                                    \
+    }
+
+    MAP_OPCODES
+#undef ON_OPCODE
+
+ZPUSH1_THEN_UNDEFINED:
+    zpush1_commit(position);
+    goto TARGET_OP_UNDEFINED;
+#endif
 
 #if EVMONE_RV32_DISPATCH
 #define ON_OPCODE(OPCODE)                                                                        \
