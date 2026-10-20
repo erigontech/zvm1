@@ -679,9 +679,8 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     }
 }
 
-// GLV/SP1-only machinery below: sp1_mulmod (Sp1MulMod) is SP1-only, so exclude ZisK, which
-// reuses the shared sp1_msm point ops but inverts scalars on its own fn_inv fcall.
-#if defined(SP1) && !defined(SP1TURBO)
+// GLV: SP1 Hypercube and ZisK.
+#if (defined(SP1) && !defined(SP1TURBO)) || defined(ZISK)
 // GLV endomorphism: phi(x, y) = (BETA * x, y) = LAMBDA * (x, y). A scalar splits as
 // k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (see GLV_G1), so u*G + v*Q becomes four
 // half-length scalars sharing one run of 128 doublings.
@@ -784,7 +783,12 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
     std::copy_n(q, SP1_POINT_SIZE, t[4]);
     if (k[2].neg)
         sp1_negate(t[4]);
+#if defined(ZISK)
+    reinterpret_cast<uint256&>(t[8][0]) = zisk::mulmod256(Curve::BETA,
+        reinterpret_cast<const uint256&>(q[0]), Curve::FIELD_PRIME);
+#else
     sp1_mulmod(reinterpret_cast<uint256&>(t[8][0]), Curve::BETA, reinterpret_cast<const uint256&>(q[0]));
+#endif
     std::copy_n(&q[SP1_POINT_SIZE / 2], SP1_POINT_SIZE / 2, &t[8][SP1_POINT_SIZE / 2]);
     if (k[3].neg)
         sp1_negate(t[8]);
@@ -1091,15 +1095,13 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     const auto y = decompress(r_val, parity);
     if (!y.has_value())
         return std::nullopt;
-    uint8_t sp1_Rbytes[64]{};
-    intx::be::unsafe::store(&sp1_Rbytes[0], r_val);
-    intx::be::unsafe::store(&sp1_Rbytes[32], *y);
-    sp1_AffinePoint sp1_R;
-    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
+    // Limbs match sp1_point_from_bytes; no BE round trip.
+    const sp1_AffinePoint sp1_R = {r_val[0], r_val[1], r_val[2], r_val[3],
+        (*y)[0], (*y)[1], (*y)[2], (*y)[3]};
 
-    // Shamir's trick: compute u1*G + u2*R in a single pass
+    // GLV: four 128-bit halves, one doubling run.
     sp1_AffinePoint sp1_Q;
-    sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
+    sp1_msm_glv(sp1_Q, u1, u2, sp1_R);
 
     if (is_zero(sp1_Q)) [[unlikely]]
         return std::nullopt;
