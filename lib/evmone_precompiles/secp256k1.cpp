@@ -742,6 +742,15 @@ inline GlvHalf glv_half(const uint256& t) noexcept
 
 inline void glv_split(const uint256& k, GlvHalf& k1, GlvHalf& k2) noexcept
 {
+#if defined(ZISK)
+    uint64_t h[10];
+    if (zisk::secp256k1_glv_decompose(k, h)) [[likely]]
+    {
+        k1 = GlvHalf{h[0], h[1], h[8] != 0};
+        k2 = GlvHalf{h[4], h[5], h[9] != 0};
+        return;
+    }
+#endif
     const auto c1 = mul_shift_384(k, GLV_G1);
     const auto c2 = mul_shift_384(k, GLV_G2);
     // Exact small values, computed modulo 2^256: k2 = -c1 b1 - c2 b2, k1 = k - c1 a1 - c2 a2.
@@ -800,13 +809,13 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
     if (k[3].neg)
         sp1_negate(t[8]);
     std::copy_n(t[4], SP1_POINT_SIZE, t[12]);
-    sp1_secp256k1_add(t[12], t[8]);
+    sp1_secp256k1_add_nz(t[12], t[8]);
     for (const unsigned hi : {4u, 8u, 12u})
     {
         for (const unsigned lo : {1u, 2u, 3u})
         {
             std::copy_n(t[lo], SP1_POINT_SIZE, t[hi | lo]);
-            sp1_secp256k1_add(t[hi | lo], t[hi]);
+            sp1_secp256k1_add_nz(t[hi | lo], t[hi]);
         }
     }
     for (unsigned i = 4; i < 16; ++i)
