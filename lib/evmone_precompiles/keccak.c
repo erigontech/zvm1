@@ -798,6 +798,21 @@ typedef uint64_t __attribute__((may_alias)) keccak_word64;
 typedef uint64_t keccak_word64;
 #endif
 
+#if defined(ZISK)
+/// Short input: stores plus pad, no XOR.
+static inline ALWAYS_INLINE void keccak_build_short(uint64_t* state, const uint8_t* data, size_t size)
+{
+    __builtin_memset(state, 0, 25 * WORD_SIZE);
+    const size_t words = size / WORD_SIZE;
+    const size_t rem = size % WORD_SIZE;
+    const uint64_t bit = (uint64_t)1 << (rem * 8);
+    for (size_t i = 0; i < words; ++i)
+        state[i] = load_le_word(data + i * WORD_SIZE);
+    // Reads past the input; masked out.
+    state[words] = rem != 0 ? (load_le_word(data + words * WORD_SIZE) & (bit - 1)) | bit : bit;
+}
+#endif
+
 static inline ALWAYS_INLINE void keccak(
     keccak_word64* out, size_t bits, const uint8_t* data, size_t size)
 {
@@ -830,6 +845,28 @@ static inline ALWAYS_INLINE void keccak(
     }
     else
         buf_zero_all();
+#elif defined(ZISK)
+    uint64_t state[25];
+    const unsigned misalign = (unsigned)((uintptr_t)data % WORD_SIZE);
+    if (misalign != 0)
+    {
+        // Zero state: one memset, not 25 stores.
+        __builtin_memset(state, 0, 25 * WORD_SIZE);
+        absorb_input_unaligned(state, block_words, data, size, misalign);
+    }
+    else if (size >= block_words * WORD_SIZE)
+    {
+        // Zero state: first block is a copy.
+        __builtin_memcpy(state, data, block_words * WORD_SIZE);
+        __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
+        keccakf1600_best(state);
+        // Blocks are 8-B multiples; alignment kept.
+        data += block_words * WORD_SIZE;
+        size -= block_words * WORD_SIZE;
+        absorb_input(state, block_words, data, size, 0);
+    }
+    else
+        keccak_build_short(state, data, size);
 #elif KECCAK_INLINE_STATE_CLEAR
     uint64_t state[25];
     clear_state(state);
@@ -837,6 +874,7 @@ static inline ALWAYS_INLINE void keccak(
     uint64_t state[25] = {0};
 #endif
 
+#if !defined(ZISK)
     // Off the strict targets this is a constant 0, folding the word reader down to a plain load.
     const unsigned misalign =
         KECCAK_STRICT_ALIGNMENT ? (unsigned)((uintptr_t)data % WORD_SIZE) : 0;
@@ -844,6 +882,7 @@ static inline ALWAYS_INLINE void keccak(
         absorb_input(state, block_words, data, size, 0);
     else
         absorb_input_unaligned(state, block_words, data, size, misalign);
+#endif
 
     state[block_words - 1] ^= 0x8000000000000000;  // Last block bit flip.
 
@@ -852,8 +891,12 @@ static inline ALWAYS_INLINE void keccak(
     // No out: the caller reads the hash where it is (AIRBENDER, state in buf[]).
     if (out)
     {
+#if defined(ZISK)
+        __builtin_memcpy(out, state, hash_size);
+#else
         for (size_t i = 0; i < (hash_size / WORD_SIZE); ++i)
             out[i] = to_le64(state[i]);
+#endif
     }
 }
 
@@ -1028,8 +1071,31 @@ union ethash_hash256 ethash_keccak256_snap(
     for (size_t i = 0; i < 4; ++i)
         hash.word64s[i] = to_le64(buf[i]);
 #else
+#if defined(ZISK)
+    uint64_t state[25];
+#else
     uint64_t state[25] = {0};
+#endif
     struct word_reader reader = {data, 0, 0};
+#if defined(ZISK)
+    if (blocks != 0)
+    {
+        // Zero state: first block is a copy.
+        __builtin_memcpy(state, data, block_words * WORD_SIZE);
+        __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
+        keccakf1600_best(state);
+        reader.data = data + block_words * WORD_SIZE;
+        for (size_t b = 1; b < blocks; ++b)
+        {
+            absorb_words(state, block_words, &reader);
+            keccakf1600_best(state);
+        }
+    }
+    else
+        __builtin_memset(state, 0, 25 * WORD_SIZE);
+    // One delegation, not 25 word pairs.
+    __builtin_memcpy(slot, state, 25 * WORD_SIZE);
+#else
     for (size_t b = 0; b < blocks; ++b)
     {
         absorb_words(state, block_words, &reader);
@@ -1037,6 +1103,7 @@ union ethash_hash256 ethash_keccak256_snap(
     }
     for (size_t i = 0; i < 25; ++i)
         slot[i] = state[i];
+#endif
     absorb_input(state, block_words, reader.data, size - blocks * block_words * WORD_SIZE, 0);
     state[block_words - 1] ^= 0x8000000000000000;
     keccakf1600_best(state);
@@ -1103,6 +1170,15 @@ union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size_t blocks,
 typedef uint32_t __attribute__((may_alias)) branch_word32;
 #else
 typedef uint32_t branch_word32;
+#endif
+
+#if defined(ZISK)
+/// 64-bit lanes for whole-block XORs.
+#if __has_attribute(may_alias)
+typedef uint64_t __attribute__((may_alias)) branch_word64;
+#else
+typedef uint64_t branch_word64;
+#endif
 #endif
 
 /// The new hash of dirty slot @p j as 8 aligned words: the encoder's child_ptr[j] ? child_ptr[j] :
@@ -1181,6 +1257,25 @@ static inline ALWAYS_INLINE void full_branch_slot_delta(branch_word32* s, const 
 /// XORs block @p k (1 to 3) of the node into the state; the last block with its padding.
 static inline ALWAYS_INLINE void full_branch_absorb(branch_word32* s, const branch_word32* n, unsigned k)
 {
+#if defined(ZISK)
+    // Node is 8-aligned (hashes_from_witness()).
+    branch_word64* const s64 = (branch_word64*)s;
+    const branch_word64* const d64 = (const branch_word64*)(n + 34 * k);
+    if (k < 3)
+    {
+#pragma GCC unroll 17
+        for (unsigned i = 0; i < 17; ++i)
+            s64[i] ^= d64[i];
+        return;
+    }
+    // Last block: 124 bytes, pad, bit flip.
+#pragma GCC unroll 15
+    for (unsigned i = 0; i < 15; ++i)
+        s64[i] ^= d64[i];
+    s[30] ^= n[34 * k + 30];
+    s[31] ^= 0x01;
+    s[33] ^= 0x80000000;
+#else
     const branch_word32* const d = n + 34 * k;
     if (k < 3)
     {
@@ -1195,6 +1290,7 @@ static inline ALWAYS_INLINE void full_branch_absorb(branch_word32* s, const bran
         s[i] ^= d[i];
     s[31] ^= 0x01;
     s[33] ^= 0x80000000;
+#endif
 }
 
 #if defined(AIRBENDER)
@@ -1234,6 +1330,10 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
     case 0:
     {
         // The state starts at zero, so block 0 is a copy, and its dirty slots are written over it.
+#if defined(ZISK)
+        __builtin_memcpy(state, node, 136);
+        __builtin_memset(s + 34, 0, 64);
+#else
         unsigned i;
 #pragma GCC unroll 34
         for (i = 0; i < 34; ++i)
@@ -1241,6 +1341,7 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
 #pragma GCC unroll 16
         for (; i < 2 * 25; ++i)
             s[i] = 0;
+#endif
         if (dirty & 0x000fu)
         {
             FULL_BRANCH_BARRIER();
