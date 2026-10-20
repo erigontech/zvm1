@@ -775,6 +775,12 @@ static inline ALWAYS_INLINE void absorb_input(
     // Absorb last 0–7 bytes of input + the padding byte.
     const uint8_t* const tail = reader.data;
     uint64_t last_word = (uint64_t)0x01 << (size * 8);
+#if defined(ZISK)
+    // Masked load beats byte loop; over-read masked.
+    if (misalign == 0 && size != 0)
+        last_word |= load_le_word(tail) & (last_word - 1);
+    else
+#endif
     for (size_t i = 0; i < size; ++i)
         last_word |= (uint64_t)tail[i] << (i * 8);
     state[last_words] ^= last_word;
@@ -799,6 +805,13 @@ typedef uint64_t keccak_word64;
 #endif
 
 #if defined(ZISK)
+/// DMA copy; opaque n stops LTO re-inline.
+static NO_INLINE void* zisk_dma(void* dst, const void* src, size_t n)
+{
+    __asm__("" : "+r"(n));
+    return memcpy(dst, src, n);
+}
+
 /// Short input: stores plus pad, no XOR.
 static inline ALWAYS_INLINE void keccak_build_short(uint64_t* state, const uint8_t* data, size_t size)
 {
@@ -857,7 +870,7 @@ static inline ALWAYS_INLINE void keccak(
     else if (size >= block_words * WORD_SIZE)
     {
         // Zero state: first block is a copy.
-        __builtin_memcpy(state, data, block_words * WORD_SIZE);
+        zisk_dma(state, data, block_words * WORD_SIZE);
         __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
         keccakf1600_best(state);
         // Blocks are 8-B multiples; alignment kept.
@@ -1081,7 +1094,7 @@ union ethash_hash256 ethash_keccak256_snap(
     if (blocks != 0)
     {
         // Zero state: first block is a copy.
-        __builtin_memcpy(state, data, block_words * WORD_SIZE);
+        zisk_dma(state, data, block_words * WORD_SIZE);
         __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
         keccakf1600_best(state);
         reader.data = data + block_words * WORD_SIZE;
@@ -1093,8 +1106,7 @@ union ethash_hash256 ethash_keccak256_snap(
     }
     else
         __builtin_memset(state, 0, 25 * WORD_SIZE);
-    // One delegation, not 25 word pairs.
-    __builtin_memcpy(slot, state, 25 * WORD_SIZE);
+    zisk_dma(slot, state, 25 * WORD_SIZE);
 #else
     for (size_t b = 0; b < blocks; ++b)
     {
@@ -1272,9 +1284,9 @@ static inline ALWAYS_INLINE void full_branch_absorb(branch_word32* s, const bran
 #pragma GCC unroll 15
     for (unsigned i = 0; i < 15; ++i)
         s64[i] ^= d64[i];
-    s[30] ^= n[34 * k + 30];
-    s[31] ^= 0x01;
-    s[33] ^= 0x80000000;
+    // Mask high half; 8-B ops beat lw/sw.
+    s64[15] ^= (d64[15] & 0xffffffffu) ^ UINT64_C(0x100000000);
+    s64[16] ^= UINT64_C(0x8000000000000000);
 #else
     const branch_word32* const d = n + 34 * k;
     if (k < 3)
@@ -1331,7 +1343,7 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
     {
         // The state starts at zero, so block 0 is a copy, and its dirty slots are written over it.
 #if defined(ZISK)
-        __builtin_memcpy(state, node, 136);
+        zisk_dma(state, node, 136);
         __builtin_memset(s + 34, 0, 64);
 #else
         unsigned i;
