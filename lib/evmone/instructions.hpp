@@ -1316,11 +1316,20 @@ inline void clz(StackTop stack) noexcept
     stack.top() = clz(stack.top());
 }
 
-#ifdef EVMONE_WORD_LAYOUT
+#if defined(EVMONE_WORD_LAYOUT) || defined(ZISK)
 namespace keccak_memo
 {
 /// The longest input memoized: one Keccak block less the padding byte, a single permutation.
 inline constexpr size_t MAX_SIZE = 135;
+
+#if defined(ZISK)
+using word_t = uint64_t;
+inline constexpr word_t MULT = 0x9E3779B97F4A7C15;
+// 8192 slots: subset-measured over 4096.
+inline constexpr unsigned BITS = 13;
+#else
+using word_t = uint32_t;
+inline constexpr word_t MULT = 0x9E3779B1u;
 /// Index bits: 2048 slots on the guest (352 KiB of .bss, which Airbender RAM starts zeroed); a few
 /// on the host, whose tests run VMs on several threads and should see evictions.
 #if defined(AIRBENDER)
@@ -1328,25 +1337,138 @@ inline constexpr unsigned BITS = 11;
 #else
 inline constexpr unsigned BITS = 3;
 #endif
+#endif
+
+inline constexpr size_t VALUE_WORDS = 256 / (8 * sizeof(word_t));
+inline constexpr size_t KEY_WORDS = (MAX_SIZE + sizeof(word_t) - 1) / sizeof(word_t);
 
 /// An input of 1..MAX_SIZE bytes and the number KECCAK256 pushes for it.
 struct Slot
 {
-    uint32_t size;  ///< The input size; 0 while the slot is empty (an empty input is never kept).
-    uint32_t value[8];  ///< The words of the result as a uint256.
-    uint32_t key[(MAX_SIZE + 3) / 4];  ///< The input words, the bytes past its end zero.
+    word_t size;  ///< The input size; 0 while the slot is empty (an empty input is never kept).
+    word_t value[VALUE_WORDS];  ///< The words of the result as a uint256.
+    word_t key[KEY_WORDS];  ///< The input words, the bytes past its end zero.
 };
 
 [[nodiscard]] inline Slot* table() noexcept
 {
-#if defined(AIRBENDER)
+#if defined(AIRBENDER) || defined(ZISK)
     static Slot slots[size_t{1} << BITS];
 #else
     thread_local Slot slots[size_t{1} << BITS];
 #endif
     return slots;
 }
+
+template <typename W>
+[[nodiscard]] inline size_t index_of(const W* w, size_t n, W tail, W s) noexcept
+{
+#ifdef ZISK
+    W h = s * MULT;
+#else
+    W h = s;
+#endif
+    for (size_t i = 0; i + 1 < n; ++i)
+        h = (h ^ w[i]) * MULT;
+    h = (h ^ tail) * MULT;
+    return static_cast<size_t>(h >> (8 * sizeof(W) - BITS));
+}
+
+template <typename W>
+[[nodiscard]] inline bool matches(const Slot& slot, const W* w, size_t n, W tail, W s) noexcept
+{
+    if (slot.size == s) [[likely]]
+    {
+        for (size_t i = 0; i + 1 < n; ++i)
+            if (slot.key[i] != w[i]) [[unlikely]]
+                return false;
+        return slot.key[n - 1] == tail;
+    }
+    return false;
+}
+
+template <typename W>
+inline void copy_value(const Slot& slot, W* out) noexcept
+{
+    for (size_t j = 0; j < VALUE_WORDS; ++j)
+        out[j] = slot.value[j];
+}
+
+/// Hit: null. Miss: the slot to fill.
+template <typename W>
+[[nodiscard]] inline Slot* lookup_or_reserve(const W* w, size_t n, W tail, W s, W* out) noexcept
+{
+    Slot& slot = table()[index_of(w, n, tail, s)];
+    if (matches(slot, w, n, tail, s))
+    {
+        copy_value(slot, out);
+        return nullptr;
+    }
+    return &slot;
+}
+
+template <typename W>
+inline void fill(Slot& slot, const W* w, size_t n, W tail, W s, const W* value) noexcept
+{
+    slot.size = s;
+    for (size_t i = 0; i + 1 < n; ++i)
+        slot.key[i] = w[i];
+    slot.key[n - 1] = tail;
+    for (size_t j = 0; j < VALUE_WORDS; ++j)
+        slot.value[j] = value[j];
+}
+
+#if defined(ZISK)
+// Memoized KECCAK256 of 1..135 aligned bytes.
+[[gnu::noinline]] inline void hash(uint256& out, const uint8_t* p, size_t s) noexcept
+{
+    p = static_cast<const uint8_t*>(__builtin_assume_aligned(p, 8));
+    const auto w = reinterpret_cast<const word_t*>(p);
+    const auto o = reinterpret_cast<word_t*>(&out);
+    if (s == 64) [[likely]]
+    {
+        word_t h = word_t{64} * MULT;
+        for (int i = 0; i < 8; ++i)
+            h = (h ^ w[i]) * MULT;
+        auto& slot = table()[h >> (8 * sizeof(word_t) - BITS)];
+        if (slot.size == 64) [[likely]]
+        {
+            if (slot.key[0] == w[0] && slot.key[1] == w[1] && slot.key[2] == w[2] &&
+                slot.key[3] == w[3] && slot.key[4] == w[4] && slot.key[5] == w[5] &&
+                slot.key[6] == w[6] && slot.key[7] == w[7]) [[likely]]
+            {
+                for (int j = 0; j < 4; ++j)
+                    out[j] = slot.value[j];
+                return;
+            }
+        }
+
+        const auto x = intx::be::load<uint256>(ethash::keccak256(p, 64));
+        out = x;
+        slot.size = 64;
+        for (int i = 0; i < 8; ++i)
+            slot.key[i] = w[i];
+        for (int j = 0; j < 4; ++j)
+            slot.value[j] = x[j];
+        return;
+    }
+
+    const size_t n = (s + 7) / 8;
+    const unsigned tail_bits = unsigned{s & 7} * 8;
+    const word_t tail = w[n - 1] & (tail_bits != 0 ? (word_t{1} << tail_bits) - 1 : ~word_t{0});
+    if (Slot* const miss = lookup_or_reserve<word_t>(w, n, tail, word_t{s}, o)) [[unlikely]]
+    {
+        const auto x = intx::be::load<uint256>(ethash::keccak256(p, s));
+        out = x;
+        fill<word_t>(*miss, w, n, tail, word_t{s}, o);
+    }
+}
+#endif
 }  // namespace keccak_memo
+#endif
+
+#ifdef EVMONE_WORD_LAYOUT
+static_assert(sizeof(keccak_memo::Slot) == 4 + 32 + 136);
 
 /// Stores the hash of the n bytes at the W pointer p, which the hash reads as bytes, in x. Out of
 /// line, to keep both conversions out of the interpreter loop.
@@ -1370,24 +1492,10 @@ struct Slot
         last = (n - 1) / 4;
         const auto tail_bits = static_cast<unsigned>(n & 3) * 8;
         last_word = w[last] & (tail_bits != 0 ? (uint32_t{1} << tail_bits) - 1 : ~uint32_t{0});
-        uint32_t h = static_cast<uint32_t>(n);
-        for (size_t i = 0; i < last; ++i)
-            h = (h ^ w[i]) * 0x9E3779B1u;
-        h = (h ^ last_word) * 0x9E3779B1u;
-        slot = &keccak_memo::table()[h >> (32 - keccak_memo::BITS)];
-        if (slot->size == n && slot->key[last] == last_word)
-        {
-            size_t i = 0;
-            while (i < last && slot->key[i] == w[i])
-                ++i;
-            if (i == last)
-            {
-                wl::word_t* const xw = reinterpret_cast<wl::word_t*>(&x);
-                for (size_t j = 0; j < 8; ++j)
-                    xw[j] = slot->value[j];
-                return;
-            }
-        }
+        slot = keccak_memo::lookup_or_reserve<wl::word_t>(
+            w, last + 1, last_word, static_cast<wl::word_t>(n), reinterpret_cast<wl::word_t*>(&x));
+        if (slot == nullptr)
+            return;
     }
 
     const auto hash = ethash::keccak256(b, n);
@@ -1400,110 +1508,10 @@ struct Slot
     x = intx::be::load<uint256>(hash);
 #endif
     if (slot != nullptr)
-    {
-        const wl::word_t* const xw = reinterpret_cast<const wl::word_t*>(&x);
-        slot->size = static_cast<uint32_t>(n);
-        for (size_t j = 0; j < 8; ++j)
-            slot->value[j] = xw[j];
-        for (size_t i = 0; i < last; ++i)
-            slot->key[i] = w[i];
-        slot->key[last] = last_word;
-    }
+        keccak_memo::fill<wl::word_t>(
+            *slot, w, last + 1, last_word, static_cast<wl::word_t>(n),
+            reinterpret_cast<const wl::word_t*>(&x));
 }
-#endif
-
-#if defined(ZISK)
-namespace keccak_memo
-{
-// 8192 slots: subset-measured over 4096.
-inline constexpr unsigned BITS = 13;
-// One Keccak block less its padding byte.
-inline constexpr size_t MAX_SIZE = 135;
-
-// Size 0 marks an empty slot.
-struct Slot
-{
-    uint64_t size;
-    uint64_t value[4];  // The pushed value's limbs.
-    uint64_t key[(MAX_SIZE + 7) / 8];  // The input words, tail masked.
-};
-
-inline Slot* table() noexcept
-{
-    static Slot slots[size_t{1} << BITS];
-    return slots;
-}
-
-// Memoized KECCAK256 of 1..135 aligned bytes.
-[[gnu::noinline]] inline void hash(uint256& out, const uint8_t* p, size_t s) noexcept
-{
-    p = static_cast<const uint8_t*>(__builtin_assume_aligned(p, 8));
-    const auto w = reinterpret_cast<const uint64_t*>(p);
-    constexpr uint64_t K = 0x9E3779B97F4A7C15;
-    if (s == 64) [[likely]]
-    {
-        uint64_t h = 64 * K;
-        for (int i = 0; i < 8; ++i)
-            h = (h ^ w[i]) * K;
-
-        auto& slot = table()[h >> (64 - BITS)];
-        if (slot.size == 64) [[likely]]
-        {
-            if (slot.key[0] == w[0] && slot.key[1] == w[1] && slot.key[2] == w[2] &&
-                slot.key[3] == w[3] && slot.key[4] == w[4] && slot.key[5] == w[5] &&
-                slot.key[6] == w[6] && slot.key[7] == w[7]) [[likely]]
-            {
-                for (int j = 0; j < 4; ++j)
-                    out[j] = slot.value[j];
-                return;
-            }
-        }
-
-        const auto v = intx::be::load<uint256>(ethash::keccak256(p, 64));
-        out = v;
-        slot.size = 64;
-        for (int i = 0; i < 8; ++i)
-            slot.key[i] = w[i];
-        for (int j = 0; j < 4; ++j)
-            slot.value[j] = v[j];
-        return;
-    }
-
-    const size_t n = (s + 7) / 8;
-    const unsigned tail_bits = unsigned{s & 7} * 8;
-    const uint64_t tail_mask = tail_bits != 0 ? (uint64_t{1} << tail_bits) - 1 : ~uint64_t{0};
-    uint64_t h = s * K;
-    for (size_t i = 0; i < n - 1; ++i)
-        h = (h ^ w[i]) * K;
-    h = (h ^ (w[n - 1] & tail_mask)) * K;
-
-    auto& slot = table()[h >> (64 - BITS)];
-    if (slot.size == s) [[likely]]
-    {
-        size_t i = 0;
-        for (; i + 1 < n; ++i)
-        {
-            if (slot.key[i] != w[i]) [[unlikely]]
-                break;
-        }
-        if (i + 1 == n && slot.key[n - 1] == (w[n - 1] & tail_mask))
-        {
-            for (size_t j = 0; j < 4; ++j)
-                out[j] = slot.value[j];
-            return;
-        }
-    }
-
-    const auto v = intx::be::load<uint256>(ethash::keccak256(p, s));
-    out = v;
-    slot.size = s;
-    for (size_t i = 0; i < n - 1; ++i)
-        slot.key[i] = w[i];
-    slot.key[n - 1] = w[n - 1] & tail_mask;
-    for (size_t j = 0; j < 4; ++j)
-        slot.value[j] = v[j];
-}
-}  // namespace keccak_memo
 #endif
 
 /// The general KECCAK256: any size and offset, growing the memory as needed.
