@@ -1302,6 +1302,100 @@ struct Slot
 }
 #endif
 
+#if defined(ZISK)
+namespace keccak_memo
+{
+// 8192 slots: subset-measured over 4096.
+inline constexpr unsigned BITS = 13;
+// One Keccak block less its padding byte.
+inline constexpr size_t MAX_SIZE = 135;
+
+// Size 0 marks an empty slot.
+struct Slot
+{
+    uint64_t size;
+    uint64_t value[4];  // The pushed value's limbs.
+    uint64_t key[(MAX_SIZE + 7) / 8];  // The input words, tail masked.
+};
+
+inline Slot* table() noexcept
+{
+    static Slot slots[size_t{1} << BITS];
+    return slots;
+}
+
+// Memoized KECCAK256 of 1..135 aligned bytes.
+[[gnu::noinline]] inline void hash(uint256& out, const uint8_t* p, size_t s) noexcept
+{
+    p = static_cast<const uint8_t*>(__builtin_assume_aligned(p, 8));
+    const auto w = reinterpret_cast<const uint64_t*>(p);
+    constexpr uint64_t K = 0x9E3779B97F4A7C15;
+    if (s == 64) [[likely]]
+    {
+        uint64_t h = 64 * K;
+        for (int i = 0; i < 8; ++i)
+            h = (h ^ w[i]) * K;
+
+        auto& slot = table()[h >> (64 - BITS)];
+        if (slot.size == 64) [[likely]]
+        {
+            if (slot.key[0] == w[0] && slot.key[1] == w[1] && slot.key[2] == w[2] &&
+                slot.key[3] == w[3] && slot.key[4] == w[4] && slot.key[5] == w[5] &&
+                slot.key[6] == w[6] && slot.key[7] == w[7]) [[likely]]
+            {
+                for (int j = 0; j < 4; ++j)
+                    out[j] = slot.value[j];
+                return;
+            }
+        }
+
+        const auto v = intx::be::load<uint256>(ethash::keccak256(p, 64));
+        out = v;
+        slot.size = 64;
+        for (int i = 0; i < 8; ++i)
+            slot.key[i] = w[i];
+        for (int j = 0; j < 4; ++j)
+            slot.value[j] = v[j];
+        return;
+    }
+
+    const size_t n = (s + 7) / 8;
+    const unsigned tail_bits = unsigned{s & 7} * 8;
+    const uint64_t tail_mask = tail_bits != 0 ? (uint64_t{1} << tail_bits) - 1 : ~uint64_t{0};
+    uint64_t h = s * K;
+    for (size_t i = 0; i < n - 1; ++i)
+        h = (h ^ w[i]) * K;
+    h = (h ^ (w[n - 1] & tail_mask)) * K;
+
+    auto& slot = table()[h >> (64 - BITS)];
+    if (slot.size == s) [[likely]]
+    {
+        size_t i = 0;
+        for (; i + 1 < n; ++i)
+        {
+            if (slot.key[i] != w[i]) [[unlikely]]
+                break;
+        }
+        if (i + 1 == n && slot.key[n - 1] == (w[n - 1] & tail_mask))
+        {
+            for (size_t j = 0; j < 4; ++j)
+                out[j] = slot.value[j];
+            return;
+        }
+    }
+
+    const auto v = intx::be::load<uint256>(ethash::keccak256(p, s));
+    out = v;
+    slot.size = s;
+    for (size_t i = 0; i < n - 1; ++i)
+        slot.key[i] = w[i];
+    slot.key[n - 1] = w[n - 1] & tail_mask;
+    for (size_t j = 0; j < 4; ++j)
+        slot.value[j] = v[j];
+}
+}  // namespace keccak_memo
+#endif
+
 /// The general KECCAK256: any size and offset, growing the memory as needed.
 ///
 /// On rv32 it is out of line, so that the fast path in keccak256() stays small enough to be
@@ -1337,6 +1431,17 @@ inline Result keccak256_general(
         }
     }
 #endif
+#if defined(ZISK)
+    // Short hashes repeat within the block.
+    const auto data = s != 0 ? &state.memory[i] : nullptr;
+    if (s - 1 < keccak_memo::MAX_SIZE && (reinterpret_cast<uintptr_t>(data) & 7) == 0) [[likely]]
+    {
+        keccak_memo::hash(size, data, s);
+        return {EVMC_SUCCESS, gas_left};
+    }
+    size = intx::be::load<uint256>(ethash::keccak256(data, s));
+    return {EVMC_SUCCESS, gas_left};
+#else
 #ifdef EVMONE_WORD_LAYOUT
     keccak256_w(size, s != 0 ? &state.memory[i] : nullptr, s);
 #else
@@ -1344,6 +1449,7 @@ inline Result keccak256_general(
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
 #endif
     return {EVMC_SUCCESS, gas_left};
+#endif
 }
 
 #if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
