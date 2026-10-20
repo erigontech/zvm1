@@ -40,6 +40,11 @@
 #define EVMONE_ZISK_PUSH1_FUSION 0
 #endif
 
+#if defined(ZISK) && !defined(EVMONE_DEFER_OOG)
+// ZisK: OOG branch moved to checkpoints.
+#define EVMONE_DEFER_OOG 1
+#endif
+
 namespace evmone::baseline
 {
 namespace
@@ -96,6 +101,25 @@ static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP
     return floor;
 }
 
+#if EVMONE_DEFER_OOG
+// Halts, jumps, host calls: never on debt.
+template <Opcode Op>
+inline constexpr bool kDeferredCheckpoint = Op == Opcode::OP_STOP || Op == Opcode::OP_RETURN ||
+    Op == Opcode::OP_REVERT || Op == Opcode::OP_SELFDESTRUCT || Op == Opcode::OP_INVALID ||
+    Op == Opcode::OP_JUMP || Op == Opcode::OP_JUMPI || Op == Opcode::OP_GAS ||
+    Op == Opcode::OP_SSTORE || Op == Opcode::OP_TSTORE || Op == Opcode::OP_LOG0 ||
+    Op == Opcode::OP_LOG1 || Op == Opcode::OP_LOG2 || Op == Opcode::OP_LOG3 ||
+    Op == Opcode::OP_LOG4 || Op == Opcode::OP_CALL || Op == Opcode::OP_CALLCODE ||
+    Op == Opcode::OP_DELEGATECALL || Op == Opcode::OP_STATICCALL || Op == Opcode::OP_CREATE ||
+    Op == Opcode::OP_CREATE2 || Op == Opcode::OP_SLOAD || Op == Opcode::OP_TLOAD ||
+    Op == Opcode::OP_BALANCE || Op == Opcode::OP_SELFBALANCE || Op == Opcode::OP_EXTCODESIZE ||
+    Op == Opcode::OP_EXTCODECOPY || Op == Opcode::OP_EXTCODEHASH || Op == Opcode::OP_BLOCKHASH ||
+    Op == Opcode::OP_BLOBHASH || Op == Opcode::OP_ORIGIN || Op == Opcode::OP_GASPRICE ||
+    Op == Opcode::OP_CHAINID || Op == Opcode::OP_COINBASE || Op == Opcode::OP_TIMESTAMP ||
+    Op == Opcode::OP_NUMBER || Op == Opcode::OP_PREVRANDAO || Op == Opcode::OP_GASLIMIT ||
+    Op == Opcode::OP_BASEFEE || Op == Opcode::OP_BLOBBASEFEE || Op == Opcode::OP_SLOTNUM;
+#endif
+
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
@@ -104,7 +128,7 @@ static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP
 /// @param          bottom2       stack_bottom + 2.
 /// @return  Status code with information which check has failed
 ///          or EVMC_SUCCESS if everything is fine.
-template <Opcode Op>
+template <Opcode Op, bool DeferOOG = false>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
     const uint256* stack_top, const uint256* stack_bottom, const uint256* bottom1,
     const uint256* bottom2, const uint256* stack_limit) noexcept
@@ -162,7 +186,9 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         if (INTX_UNLIKELY(!deduct_gas(gas_left, static_cast<uint32_t>(gas_cost))))
             return EVMC_OUT_OF_GAS;
 #else
-        if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
+        if constexpr (DeferOOG && instr::has_const_gas_cost(Op))
+            gas_left -= gas_cost;  // Tested at a checkpoint instead.
+        else if (INTX_UNLIKELY((gas_left -= gas_cost) < 0))
             return EVMC_OUT_OF_GAS;
 #endif
     }
@@ -1095,6 +1121,10 @@ template <Opcode Op>
     const auto k = unsigned{c[3]} - OP_JUMP;
     if (k > 1)
         return false;
+#if EVMONE_DEFER_OOG
+    if (INTX_UNLIKELY(gas < 0))
+        return fail(EVMC_OUT_OF_GAS);
+#endif
     if (INTX_UNLIKELY(pos.stack_end == stack_limit))
         return fail(EVMC_STACK_OVERFLOW);
     if (k == 0)
@@ -1148,6 +1178,10 @@ template <Opcode Op>
         pos.code_it = nullptr;
         return true;
     };
+#if EVMONE_DEFER_OOG
+    if (INTX_UNLIKELY(gas < 0))
+        return fail(EVMC_OUT_OF_GAS);
+#endif
     if (INTX_UNLIKELY(pos.stack_end <= (required == 2 ? bottom1 : stack_bottom)))
         return fail(EVMC_STACK_UNDERFLOW);
     if constexpr (Op == OP_ISZERO)
@@ -1210,6 +1244,10 @@ template <Opcode Op>
         pos.code_it = nullptr;
         return true;
     };
+#if EVMONE_DEFER_OOG
+    if (INTX_UNLIKELY(gas < 0))
+        return fail(EVMC_OUT_OF_GAS);
+#endif
     if (INTX_UNLIKELY(pos.stack_end <= bottom1))
         return fail(EVMC_STACK_UNDERFLOW);
     const auto& a = pos.stack_end[-1];
@@ -1324,7 +1362,12 @@ template <Opcode Op, bool TracingEnabled>
     }
 #endif
     // auto starting_gas = gas;
-    const auto status = check_requirements<Op>(
+#if EVMONE_DEFER_OOG
+    static constexpr bool kDeferOOG = !TracingEnabled;
+#else
+    static constexpr bool kDeferOOG = false;
+#endif
+    const auto status = check_requirements<Op, kDeferOOG>(
         cost_table, gas, pos.stack_end, stack_bottom, bottom1, bottom2, stack_limit);
     if (status != EVMC_SUCCESS)
     {
@@ -1353,6 +1396,16 @@ template <Opcode Op, bool TracingEnabled>
         state.status = status;
         return {nullptr, pos.stack_end};
     }
+#if EVMONE_DEFER_OOG
+    if constexpr (kDeferOOG && kDeferredCheckpoint<Op>)
+    {
+        if (INTX_UNLIKELY(gas < 0))
+        {
+            state.status = EVMC_OUT_OF_GAS;
+            return {nullptr, pos.stack_end};
+        }
+    }
+#endif
 #if EVMONE_RV32_DISPATCH
     if constexpr (Op == OP_SAR)
     {
