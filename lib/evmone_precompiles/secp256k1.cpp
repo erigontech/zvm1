@@ -722,8 +722,15 @@ struct GlvHalf
 /// round(k * g / 2^384).
 inline uint256 mul_shift_384(const uint256& k, const uint256& g) noexcept
 {
+#if defined(ZISK)
+    uint64_t dl[4];
+    uint64_t dh[4];
+    zisk::arith256(&k[0], &g[0], &zisk::kZero256[0], dl, dh);
+    return uint256{dh[2], dh[3], 0, 0} + (dh[1] >> 63);
+#else
     const auto p = intx::umul(k, g);
     return uint256{p[6], p[7], 0, 0} + (p[5] >> 63);
+#endif
 }
 
 inline GlvHalf glv_half(const uint256& t) noexcept
