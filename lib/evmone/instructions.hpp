@@ -239,6 +239,18 @@ constexpr int64_t copy_cost(uint64_t size_in_bytes) noexcept
         return gas_left;
     }
 #endif
+#if defined(ZISK)
+    if (new_words == current_words + 1) [[likely]]
+    {
+        // C(n + 1) - C(n), exact at any size.
+        const uint64_t n = current_words;
+        const auto cost = 3 + static_cast<int64_t>((((n * n) & 511) + 2 * n + 1) >> 9);
+        gas_left -= cost;
+        if (gas_left >= 0) [[likely]]
+            memory.grow(static_cast<size_t>(new_words) * word_size);
+        return gas_left;
+    }
+#endif
     // The square must be computed in 64 bits: it wraps uint32 once memory crosses
     // 2MB (65536 words), which turns the cost delta negative-then-huge and OOGs the
     // frame. On rv32im a 32x32->64 multiply is still a single mul/mulhu pair.
@@ -381,6 +393,62 @@ inline bool check_memory_for_mstore(
         }
     }
     at = w0;
+    return true;
+}
+#endif
+
+#if defined(ZISK)
+/// rv64 port of the rv32 check_memory32() above.
+[[gnu::always_inline]] inline bool check_memory32(
+    int64_t& gas_left, Memory& memory, const uint256& offset, size_t& at) noexcept
+{
+    const uint64_t* const w = reinterpret_cast<const uint64_t*>(&offset);
+    if ((w[3] | w[2] | w[1]) != 0) [[unlikely]]
+        return false;
+
+    const uint64_t w0 = w[0];
+    if (w0 >= memory.limit32()) [[unlikely]]
+    {
+        if (w0 > max_buffer_size)
+            return false;
+        gas_left = grow_memory(gas_left, memory, w0 + 32);
+        if (gas_left < 0) [[unlikely]]
+            return false;
+    }
+    at = static_cast<size_t>(w0);
+    return true;
+}
+
+/// rv64 port of the rv32 check_memory_for_mstore() above.
+[[gnu::always_inline]] inline bool check_memory_for_mstore(
+    int64_t& gas_left, Memory& memory, const uint256& offset, size_t& at) noexcept
+{
+    const uint64_t* const w = reinterpret_cast<const uint64_t*>(&offset);
+    if ((w[3] | w[2] | w[1]) != 0) [[unlikely]]
+        return false;
+
+    const uint64_t w0 = w[0];
+    if (w0 >= memory.limit32()) [[unlikely]]
+    {
+        if (w0 > max_buffer_size)
+            return false;
+        const auto size = memory.size();
+        if (w0 <= size && size + word_size <= memory.capacity())
+        {
+            const auto n = size >> 5;
+            const auto cost = 3 + static_cast<int64_t>((((n * n) & 511) + 2 * n + 1) >> 9);
+            if ((gas_left -= cost) < 0)
+                return false;
+            memory.grow_word_for_store(static_cast<size_t>(w0));
+        }
+        else
+        {
+            gas_left = grow_memory(gas_left, memory, w0 + 32);
+            if (gas_left < 0) [[unlikely]]
+                return false;
+        }
+    }
+    at = static_cast<size_t>(w0);
     return true;
 }
 #endif
@@ -2047,7 +2115,8 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
 {
     auto& index = stack.top();
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST) || \
+    defined(ZISK)
     size_t at = 0;
     if (!check_memory32(gas_left, state.memory, index, at))
         return {EVMC_OUT_OF_GAS, gas_left};
@@ -2070,7 +2139,8 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     const auto& index = stack.pop();
     const auto& value = stack.pop();
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST) || \
+    defined(ZISK)
     // The fast path leaves a new word the store covers whole unzeroed: the store below writes
     // all 32 bytes.
     size_t at = 0;
