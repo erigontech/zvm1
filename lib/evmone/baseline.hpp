@@ -21,6 +21,11 @@
 #define EVMONE_JUMPDEST_BYTEMAP 1
 /// Code the host keeps padded in place is analyzed without a copy, see set_in_place_code_region().
 #define EVMONE_IN_PLACE_CODE 1
+#elif defined(ZISK)
+// One precompile call fills the bit set.
+#define EVMONE_LAZY_JUMPDESTS 0
+#define EVMONE_JUMPDEST_BYTEMAP 0
+#define EVMONE_IN_PLACE_CODE 1
 #else
 #define EVMONE_LAZY_JUMPDESTS 0
 #define EVMONE_JUMPDEST_BYTEMAP 0

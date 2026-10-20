@@ -117,7 +117,7 @@ struct InPlaceRegion
     uintptr_t end = 0;
 };
 // The guests run one thread and have no TLS; a host test build may run VMs on several.
-#if defined(AIRBENDER) || defined(SP1)
+#if defined(AIRBENDER) || defined(SP1) || defined(ZISK)
 constinit InPlaceRegion in_place_region;
 #else
 constinit thread_local InPlaceRegion in_place_region;
@@ -125,22 +125,31 @@ constinit thread_local InPlaceRegion in_place_region;
 
 /// Whether the code can be executed where it lies: inside the region and followed by 33 zero
 /// bytes. The test of the bytes on every analysis keeps the copy as the fallback for anything the
-/// host has not padded. The 9 aligned words read cover them with up to 3 bytes more on either
-/// side, which the two shifts drop (the region's contract keeps those readable).
+/// host has not padded. The aligned word loads cover them with a few bytes more on either side,
+/// which the shifts drop (the region's contract keeps those readable).
 bool is_padded_in_place(bytes_view code) noexcept
 {
     static_assert(std::endian::native == std::endian::little);
-    typedef uint32_t __attribute__((may_alias)) word;
     const auto begin = reinterpret_cast<uintptr_t>(code.data());
     const auto end = begin + code.size();
     if (begin < in_place_region.begin || end > in_place_region.end)
         return false;
+#if defined(ZISK)
+    // 4-byte loads cost 7x aligned u64 ones.
+    using word = uint64_t __attribute__((may_alias));
+    const word* const w = reinterpret_cast<const word*>(end & ~uintptr_t{7});
+    const unsigned sh = static_cast<unsigned>(end & 7) * 8;
+    uint64_t acc = (w[0] >> sh) | w[1] | w[2] | w[3] | (w[4] << (56 - sh));
+    return acc == 0;
+#else
+    typedef uint32_t __attribute__((may_alias)) word;
     const word* const w = reinterpret_cast<const word*>(end & ~uintptr_t{3});
     const auto sh = static_cast<unsigned>(end & 3) * 8;
     uint32_t acc = (w[0] >> sh) | (w[8] << (24 - sh));
     for (size_t i = 1; i < 8; ++i)
         acc |= w[i];
     return acc == 0;
+#endif
 }
 #endif
 
@@ -156,8 +165,13 @@ CodeAnalysis analyze_legacy(bytes_view code)
     const auto padded_code_size = code.size() + PADDING;
     [[maybe_unused]] const auto bitset_words = (code.size() + (BitsetSpan::WORD_BITS)) / BitsetSpan::WORD_BITS;
 #if EVMONE_IN_PLACE_CODE
+#if defined(ZISK)
+    // The precompile builds the bit set here.
+    static_assert(!EVMONE_LAZY_JUMPDESTS && !EVMONE_JUMPDEST_BYTEMAP);
+#else
     // Code in place is scanned on demand, never up front, into a byte map of its own.
     static_assert(EVMONE_LAZY_JUMPDESTS && EVMONE_JUMPDEST_BYTEMAP);
+#endif
 #endif
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // The copy starts at the code's own offset modulo 32: the guest's memcpy then copies the
@@ -196,6 +210,7 @@ CodeAnalysis analyze_legacy(bytes_view code)
     return {std::move(storage), padded, code.size(), map};
 #else
 #if EVMONE_IN_PLACE_CODE
+#if EVMONE_JUMPDEST_BYTEMAP
     if (is_padded_in_place(code))
     {
         // Only the map is stored, zeroed here: this heap reuses memory, and the SP1 prover does
@@ -206,6 +221,21 @@ CodeAnalysis analyze_legacy(bytes_view code)
         uint8_t* const map = storage.get();
         return {std::move(storage), code.data(), code.size(), map};
     }
+#elif defined(ZISK)
+    // The precompile zeroes and writes every word.
+    if (code.size() != 0 && is_padded_in_place(code) &&
+        (reinterpret_cast<uintptr_t>(code.data()) % BITSET_ALIGNMENT) == 0) [[likely]]
+    {
+        auto storage =
+            std::make_unique_for_overwrite<uint8_t[]>(bitset_words * sizeof(BitsetSpan::word_type));
+        if ((reinterpret_cast<uintptr_t>(storage.get()) % BITSET_ALIGNMENT) == 0) [[likely]]
+        {
+            auto* const bits = new (storage.get()) BitsetSpan::word_type[bitset_words];
+            zisk::jump_dest(bits, code.data(), code.size());
+            return {std::move(storage), code.data(), code.size(), JumpdestMap{bits}};
+        }
+    }
+#endif
 #endif
     const auto aligned_code_size =
         (padded_code_size + (BITSET_ALIGNMENT - 1)) / BITSET_ALIGNMENT * BITSET_ALIGNMENT;
