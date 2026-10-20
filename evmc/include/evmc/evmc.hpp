@@ -1022,7 +1022,7 @@ struct hash<evmc::address>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::address& s) const noexcept
     {
-#if defined(AIRBENDER)
+#if defined(AIRBENDER) || defined(ZISK)
         // Use the last uint32_t word directly: keccak-derived addresses have full entropy in any
         // 32-bit slice, and small ones (precompiles, system contracts) differ in their low bytes.
         // Saves 4 loads + 5 multiplies.
@@ -1053,7 +1053,7 @@ struct hash<evmc::bytes32>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::bytes32& s) const noexcept
     {
-#if defined(AIRBENDER)
+#if defined(AIRBENDER) || defined(ZISK)
         // Use the last uint32_t word directly: keccak outputs have full entropy in any 32-bit
         // slice, and small storage keys (slots 0, 1, 2, ...) differ in their low bytes, which
         // the first word would map to a single bucket. Saves 7 loads + 8 multiplies per lookup.
