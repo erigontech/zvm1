@@ -448,6 +448,15 @@ inline bool check_memory_for_mstore(
     const uint64_t w0 = w[0];
     if (w0 >= memory.limit32()) [[unlikely]]
     {
+        if (w0 == 0x40 && memory.size() == 0) [[unlikely]]
+        {
+            // Solidity prologue: 3 words cost 9.
+            if ((gas_left -= 9) < 0)
+                return false;
+            memory.grow_empty_for_store_at_64();
+            at = 0x40;
+            return true;
+        }
         const auto size = memory.size();
         if (w0 <= size && size + word_size <= memory.capacity())
         {
