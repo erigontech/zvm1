@@ -855,9 +855,8 @@ static inline ALWAYS_INLINE void keccak_build_short(uint64_t* state, const uint8
     // Reads past the input; masked out.
     state[i] = rem != 0 ? (load_le_word(data + i * WORD_SIZE) & (bit - 1)) | bit : bit;
     ++i;
-#pragma GCC unroll 8
-    for (; i < 25; ++i)
-        state[i] = 0;
+    // Filler DMA beats unrolled copyb stores.
+    __builtin_memset(state + i, 0, (25 - i) * WORD_SIZE);
 }
 #endif
 
