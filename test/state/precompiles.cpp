@@ -1083,7 +1083,7 @@ struct WordInput
 #endif
 }  // namespace
 
-bool is_precompile_from_byte1(evmc_revision rev, const evmc::address& addr) noexcept
+bool is_precompile_from_byte1(evmc_revision rev, const evmc_address& addr) noexcept
 {
     static constexpr auto AVAILABILITY_LOOKUP_TABLE = [] {
         using Entry = std::underlying_type_t<evmc_revision>;
@@ -1103,7 +1103,7 @@ bool is_precompile_from_byte1(evmc_revision rev, const evmc::address& addr) noex
         if (addr.bytes[i] != 0)
             return false;
     }
-    const auto index = to_lookup_index(addr);
+    const auto index = to_lookup_index(evmc::internal::as_cpp(&addr));
     if (index >= AVAILABILITY_LOOKUP_TABLE.size())
         return false;
     return AVAILABILITY_LOOKUP_TABLE[index] <= stdx::to_underlying(rev);

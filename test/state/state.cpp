@@ -446,12 +446,12 @@ StateDiff State::build_diff(evmc_revision rev) const
     return diff;
 }
 
-std::pair<Account&, bool> State::get_or_create(const address& addr)
+std::pair<Account&, bool> State::get_or_create(const evmc_address& addr)
 {
     return get_or_create(get(addr), addr);
 }
 
-std::pair<Account&, bool> State::get_or_create(Account& acc, const address& addr)
+std::pair<Account&, bool> State::get_or_create(Account& acc, const evmc_address& addr)
 {
     get(acc, addr);
     if (!acc.nonexistent)
@@ -463,7 +463,7 @@ std::pair<Account&, bool> State::get_or_create(Account& acc, const address& addr
     return {acc, true};
 }
 
-Account& State::get_or_insert(const address& addr)
+Account& State::get_or_insert(const evmc_address& addr)
 {
     auto& acc = get(addr);
     if (acc.nonexistent)
@@ -531,13 +531,13 @@ void State::journal_account_flags(Account& acc)
         {&acc}, acc.access_status, acc.nonexistent, acc.destructed, acc.erase_if_empty});
 }
 
-void State::load_initial(Account& acc, const address& addr) noexcept
+void State::load_initial(Account& acc, const evmc_address& addr) noexcept
 {
     // Load the account from the initial state. A miss is cached as a nonexistent account,
     // so the initial state is queried once per address rather than once per access.
     assert(acc.is_empty() && !acc.nonexistent && !acc.destructed && !acc.erase_if_empty);
     acc.loaded = true;
-    if (const auto cacc = m_initial.get_account(addr); cacc)
+    if (const auto cacc = m_initial.get_account(evmc::internal::as_cpp(&addr)); cacc)
     {
         acc.nonce = cacc->nonce;
         acc.balance = cacc->balance;
@@ -551,7 +551,7 @@ void State::load_initial(Account& acc, const address& addr) noexcept
     }
 }
 
-bytes_view State::resolve_code(Account& a, const address& addr)
+bytes_view State::resolve_code(Account& a, const evmc_address& addr)
 {
     // A stateless witness may omit a body this transaction already wrote (EIP-7928).
     const auto [first, last] = m_changed_code_addresses.equal_range(a.code_hash);
@@ -563,7 +563,7 @@ bytes_view State::resolve_code(Account& a, const address& addr)
     }
     // Borrowed: the EIP-7702 delegation probe asks for the code of every callee just to read
     // its 23-byte prefix, so copying the whole contract here would be pure waste.
-    return m_initial.get_account_code_at(a.view_handle, addr);
+    return m_initial.get_account_code_at(a.view_handle, evmc::internal::as_cpp(&addr));
 }
 
 void State::create_touched(Account& acc)

@@ -75,8 +75,8 @@ class State
     /// reverts and overwrites leave stale ones, which get_code() skips by re-checking the hash.
     std::unordered_multimap<bytes32, address> m_changed_code_addresses;
 
-    [[gnu::noinline]] void load_initial(Account& acc, const address& addr) noexcept;
-    [[gnu::noinline]] bytes_view resolve_code(Account& a, const address& addr);
+    [[gnu::noinline]] void load_initial(Account& acc, const evmc_address& addr) noexcept;
+    [[gnu::noinline]] bytes_view resolve_code(Account& a, const evmc_address& addr);
     [[gnu::noinline]] void create_touched(Account& acc);
 
 public:
@@ -95,12 +95,12 @@ public:
     //   an alternative to operator[] with different inlining hints: GCC 15/16 inline its lookup.
 
     /// Returns the account at the address without loading it from the initial state.
-    Account& access(const address& addr) noexcept { return m_modified[addr]; }
+    Account& access(const evmc_address& addr) noexcept { return m_modified[evmc::internal::as_cpp(&addr)]; }
 
     /// Returns the account at the address. An account absent from the state is returned as a
     /// node flagged nonexistent, so the reference is always valid and the flag is the answer to
     /// "does this account exist?".
-    Account& get(const address& addr) noexcept
+    Account& get(const evmc_address& addr) noexcept
     {
         auto& acc = access(addr);
         if (!acc.loaded) [[unlikely]]
@@ -112,7 +112,7 @@ public:
     }
 
     /// get() on a known, stable node.
-    Account& get(Account& acc, const address& addr) noexcept
+    Account& get(Account& acc, const evmc_address& addr) noexcept
     {
         if (!acc.loaded) [[unlikely]]
             load_initial(acc, addr);
@@ -120,11 +120,11 @@ public:
     }
 
     /// Gets an existing account or creates new erasable account without journaling.
-    Account& get_or_insert(const address& addr);
+    Account& get_or_insert(const evmc_address& addr);
 
-    bytes_view get_code(const address& addr) { return get_code(get(addr), addr); }
+    bytes_view get_code(const evmc_address& addr) { return get_code(get(addr), addr); }
 
-    bytes_view get_code(Account& a, const address& addr)
+    bytes_view get_code(Account& a, const evmc_address& addr)
     {
         if (!a.loaded) [[unlikely]]
             load_initial(a, addr);
@@ -167,13 +167,13 @@ public:
 
     /// Gets the account, creating it if it doesn't exist. The creation is journaled.
     /// @return The account and whether it has been created.
-    std::pair<Account&, bool> get_or_create(const address& addr);
+    std::pair<Account&, bool> get_or_create(const evmc_address& addr);
 
     /// get_or_create() on a known, stable node.
-    std::pair<Account&, bool> get_or_create(Account& acc, const address& addr);
+    std::pair<Account&, bool> get_or_create(Account& acc, const evmc_address& addr);
 
     /// Touches (as in EIP-161) an existing account or creates new erasable account.
-    Account& touch(const address& addr)
+    Account& touch(const evmc_address& addr)
     {
         auto& acc = get(addr);
         if (!acc.erase_if_empty && acc.is_empty())  // Also true for a nonexistent account.
@@ -182,7 +182,7 @@ public:
     }
 
     /// touch() on a known, stable node.
-    Account& touch(Account& acc, const address& addr)
+    Account& touch(Account& acc, const evmc_address& addr)
     {
         get(acc, addr);
         if (!acc.erase_if_empty && acc.is_empty())

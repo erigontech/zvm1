@@ -340,8 +340,9 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         (Op == OP_CALL || Op == OP_STATICCALL) ? dst_acc : state.acc_handle;
     void* const acc_code = (delegation != Delegation::delegated) ? dst_acc : nullptr;
     void* const acc_sender = (Op == OP_DELEGATECALL) ? nullptr : state.acc_handle;
-    auto result = host_call(state, msg, acc_recipient, acc_code, acc_sender, HAS_VALUE_ARG,
-        has_value);
+    // Constant-zero value: host skips is_zero test.
+    auto result = host_call(state, msg, acc_recipient, acc_code, acc_sender,
+        HAS_VALUE_ARG || Op == OP_STATICCALL, HAS_VALUE_ARG && has_value);
 #ifdef EVMONE_WORD_LAYOUT
     state.return_data.take(result);
 #else
