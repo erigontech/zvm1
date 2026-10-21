@@ -2475,7 +2475,14 @@ inline uint64_t load_partial_push_data<1>(code_iterator pos) noexcept
 template <>
 inline uint64_t load_partial_push_data<2>(code_iterator pos) noexcept
 {
+#if defined(ZISK)
+    // Barrier blocks the lhu+rev8 re-fold.
+    uint64_t hi = static_cast<uint8_t>(pos[0]);
+    asm("" : "+r"(hi));
+    return (hi << 8) | static_cast<uint8_t>(pos[1]);
+#else
     return intx::be::unsafe::load<uint16_t>(pos);
+#endif
 }
 
 template <>
@@ -2582,6 +2589,32 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
     for (size_t i = 0; i < NUM_FULL_WORDS; ++i)
     {
         r[NUM_FULL_WORDS - 1 - i] = load_be_bytes<sizeof(word_type)>(pos);
+        pos += sizeof(word_type);
+    }
+    for (size_t i = NUM_DATA_WORDS; i < 4; ++i)
+        r[i] = 0;
+    return pos;
+}
+#elif defined(ZISK)
+/// ZisK PUSH: each slot word stored once.
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    using word_type = uint256::word_type;
+    static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
+    static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
+    static constexpr auto NUM_DATA_WORDS = NUM_FULL_WORDS + (NUM_PARTIAL_BYTES != 0 ? 1 : 0);
+
+    auto& r = *stack.end();
+    pos += 1;  // Skip the opcode.
+    if constexpr (NUM_PARTIAL_BYTES != 0)
+    {
+        r[NUM_FULL_WORDS] = load_partial_push_data<NUM_PARTIAL_BYTES>(pos);
+        pos += NUM_PARTIAL_BYTES;
+    }
+    for (size_t i = 0; i < NUM_FULL_WORDS; ++i)
+    {
+        r[NUM_FULL_WORDS - 1 - i] = intx::be::unsafe::load<word_type>(pos);
         pos += sizeof(word_type);
     }
     for (size_t i = NUM_DATA_WORDS; i < 4; ++i)
