@@ -353,7 +353,7 @@ public:
 /// caller's return slot, it reaches call_impl with no release_raw() copy and no re-wrap. The C
 /// entry points release it.
 inline evmc::Result make_execution_result(
-    ExecutionState& state, int64_t gas_left, bool allow_borrow = false) noexcept
+    ExecutionState& state, int64_t gas_left, [[maybe_unused]] bool allow_borrow = false) noexcept
 {
     if (state.rev >= EVMC_AMSTERDAM && state.status != EVMC_SUCCESS)
     {
