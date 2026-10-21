@@ -711,6 +711,21 @@ constexpr sp1_AffinePoint sp1_GpPhiG = {GpPhiGx_val[0], GpPhiGx_val[1], GpPhiGx_
 constexpr sp1_AffinePoint sp1_GmPhiG = {GmPhiGx_val[0], GmPhiGx_val[1], GmPhiGx_val[2],
     GmPhiGx_val[3], GmPhiGy_val[0], GmPhiGy_val[1], GmPhiGy_val[2], GmPhiGy_val[3]};
 
+#if defined(ZISK)
+// y-flipped entries; picks replace negate
+constexpr auto NGy_val = Curve::FIELD_PRIME - Gy_val;
+constexpr auto NGpPhiGy_val = Curve::FIELD_PRIME - GpPhiGy_val;
+constexpr auto NGmPhiGy_val = Curve::FIELD_PRIME - GmPhiGy_val;
+constexpr sp1_AffinePoint sp1_NG = {
+    Gx_val[0], Gx_val[1], Gx_val[2], Gx_val[3], NGy_val[0], NGy_val[1], NGy_val[2], NGy_val[3]};
+constexpr sp1_AffinePoint sp1_NPhiG = {PhiGx_val[0], PhiGx_val[1], PhiGx_val[2], PhiGx_val[3],
+    NGy_val[0], NGy_val[1], NGy_val[2], NGy_val[3]};
+constexpr sp1_AffinePoint sp1_NGpPhiG = {GpPhiGx_val[0], GpPhiGx_val[1], GpPhiGx_val[2],
+    GpPhiGx_val[3], NGpPhiGy_val[0], NGpPhiGy_val[1], NGpPhiGy_val[2], NGpPhiGy_val[3]};
+constexpr sp1_AffinePoint sp1_NGmPhiG = {GmPhiGx_val[0], GmPhiGx_val[1], GmPhiGx_val[2],
+    GmPhiGx_val[3], NGmPhiGy_val[0], NGmPhiGy_val[1], NGmPhiGy_val[2], NGmPhiGy_val[3]};
+#endif
+
 /// p + q in affine coordinates, for p != +-q (the table constants above, checked below).
 constexpr AffinePoint affine_add(const AffinePoint& p, const AffinePoint& q) noexcept
 {
@@ -823,6 +838,14 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
 
     // t[i] is the sum of the signed bases selected by the bits of i: G, phi(G), Q, phi(Q).
     sp1_AffinePoint t[16];
+#if defined(ZISK)
+    std::copy_n(k[0].neg ? sp1_NG : sp1_G, SP1_POINT_SIZE, t[1]);
+    std::copy_n(k[1].neg ? sp1_NPhiG : sp1_PhiG, SP1_POINT_SIZE, t[2]);
+    if (const bool same_sign = k[0].neg == k[1].neg; k[0].neg)
+        std::copy_n(same_sign ? sp1_NGpPhiG : sp1_NGmPhiG, SP1_POINT_SIZE, t[3]);
+    else
+        std::copy_n(same_sign ? sp1_GpPhiG : sp1_GmPhiG, SP1_POINT_SIZE, t[3]);
+#else
     std::copy_n(sp1_G, SP1_POINT_SIZE, t[1]);
     std::copy_n(sp1_PhiG, SP1_POINT_SIZE, t[2]);
     std::copy_n(k[0].neg == k[1].neg ? sp1_GpPhiG : sp1_GmPhiG, SP1_POINT_SIZE, t[3]);
@@ -833,6 +856,7 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
     }
     if (k[1].neg)
         sp1_negate(t[2]);
+#endif
     std::copy_n(q, SP1_POINT_SIZE, t[4]);
     if (k[2].neg)
         sp1_negate(t[4]);
@@ -846,6 +870,20 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
     if (k[3].neg)
         sp1_negate(t[8]);
     std::copy_n(t[4], SP1_POINT_SIZE, t[12]);
+#if defined(ZISK)
+    // add_nz zeroes on false; t[4],t[8] never zero
+    bool bad = !sp1_secp256k1_add_nz(t[12], t[8]);
+    for (const unsigned hi : {4u, 8u, 12u})
+    {
+        for (const unsigned lo : {1u, 2u, 3u})
+        {
+            std::copy_n(t[lo], SP1_POINT_SIZE, t[hi | lo]);
+            bad |= !sp1_secp256k1_add_nz(t[hi | lo], t[hi]);
+        }
+    }
+    if (bad) [[unlikely]]
+        return sp1_msm(r, u, sp1_G, v, q);
+#else
     sp1_secp256k1_add_nz(t[12], t[8]);
     for (const unsigned hi : {4u, 8u, 12u})
     {
@@ -860,6 +898,7 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
         if (is_zero(t[i])) [[unlikely]]
             return sp1_msm(r, u, sp1_G, v, q);
     }
+#endif
 
     // Digits d = bit(k0) | bit(k1) << 1 | bit(k2) << 2 | bit(k3) << 3, 16 per word, bit 16w + j
     // at nibble j of word w.
