@@ -174,8 +174,8 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     if (state.rev >= EVMC_BERLIN && state.cpp_host != nullptr)
     {
         evmc_access_status access;
-        status = state.cpp_host->sstore(
-            recipient, evmc::internal::as_cpp(&key), evmc::internal::as_cpp(&value), access);
+        status = state.cpp_host->sstore(recipient, evmc::internal::as_cpp(&key),
+            evmc::internal::as_cpp(&value), access, state.acc_handle, &state.acc_handle);
         gas_cost_cold = access == EVMC_ACCESS_COLD ? STORAGE_COST_SPEC[state.rev].cold : 0;
     }
     else

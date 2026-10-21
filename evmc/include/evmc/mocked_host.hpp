@@ -314,7 +314,8 @@ public:
     }
 
     /// Get the account's balance (EVMC Host method).
-    uint256be get_balance(const address& addr, void* /*acc_in*/ = nullptr) const noexcept override
+    uint256be get_balance(const address& addr, void* /*acc_in*/ = nullptr,
+        void** /*acc_out*/ = nullptr) const noexcept override
     {
         record_account_access(addr);
         const auto it = accounts.find(addr);
@@ -495,7 +496,8 @@ public:
     /// @param addr  The account address.
     /// @param key   The account's transient storage key.
     /// @return      The transient storage value. Null value in case the account does not exist.
-    bytes32 get_transient_storage(const address& addr, const bytes32& key) const noexcept override
+    bytes32 get_transient_storage(const address& addr, const bytes32& key,
+        void* /*acc_in*/ = nullptr, void** /*acc_out*/ = nullptr) const noexcept override
     {
         record_account_access(addr);
 
@@ -516,7 +518,9 @@ public:
     /// @param value  The value to be stored.
     void set_transient_storage(const address& addr,
                                const bytes32& key,
-                               const bytes32& value) noexcept override
+                               const bytes32& value,
+                               void* /*acc_in*/ = nullptr,
+                               void** /*acc_out*/ = nullptr) noexcept override
     {
         record_account_access(addr);
         accounts[addr].transient_storage[key] = value;

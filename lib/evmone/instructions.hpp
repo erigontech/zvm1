@@ -2228,7 +2228,12 @@ inline void selfbalance(StackTop stack, ExecutionState& state) noexcept
         state.host.get_balance_raw(evmc::internal::as_cpp(&state.msg->recipient));
     intx::be::unsafe::load_aligned_into(*stack.end(), balance.bytes);
 #else
-    stack.push(intx::be::load<uint256>(state.host.get_balance(state.msg->recipient)));
+    // Fills the frame's node for later ops.
+    const auto balance = state.cpp_host != nullptr ?
+                             state.cpp_host->get_balance(
+                                 state.msg->recipient, state.acc_handle, &state.acc_handle) :
+                             state.host.get_balance(state.msg->recipient);
+    stack.push(intx::be::load<uint256>(balance));
 #endif
 }
 
@@ -2425,7 +2430,11 @@ inline void tload(StackTop stack, ExecutionState& state) noexcept
     intx::be::unsafe::load_aligned_into(x, value.bytes);
 #else
     const auto key = intx::be::store<evmc::bytes32>(x);
-    const auto value = state.host.get_transient_storage(state.msg->recipient, key);
+    // Fills the frame's node for later ops.
+    const auto value = state.cpp_host != nullptr ?
+                           state.cpp_host->get_transient_storage(
+                               state.msg->recipient, key, state.acc_handle, &state.acc_handle) :
+                           state.host.get_transient_storage(state.msg->recipient, key);
     x = intx::be::load<uint256>(value);
 #endif
 }
@@ -2446,7 +2455,11 @@ inline Result tstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
 #else
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
-    state.host.set_transient_storage(state.msg->recipient, key, value);
+    if (state.cpp_host != nullptr)
+        state.cpp_host->set_transient_storage(state.msg->recipient, key, value,
+            state.acc_handle, &state.acc_handle);
+    else
+        state.host.set_transient_storage(state.msg->recipient, key, value);
 #endif
     return {EVMC_SUCCESS, gas_left};
 }

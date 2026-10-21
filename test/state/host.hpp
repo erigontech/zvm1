@@ -27,6 +27,8 @@ class Host : public evmc::Host
     /// it is read only once set.
     mutable evmc_tx_context m_tx_context;
     mutable bool m_tx_context_set = false;
+    /// Next frame's recipient node, for reset().
+    void* m_frame_acc = nullptr;
 
 public:
     Host(evmc_revision rev, evmc::VM& vm, State& state, const BlockInfo& block,
@@ -35,6 +37,13 @@ public:
     {}
 
     [[nodiscard]] std::vector<Log>&& take_logs() noexcept { return std::move(m_logs); }
+
+    void* take_frame_acc() noexcept override
+    {
+        const auto acc = m_frame_acc;
+        m_frame_acc = nullptr;  // Stale nodes must never seed later frames.
+        return acc;
+    }
 
     evmc::Result call(const evmc_message& msg, void* acc_recipient = nullptr,
         void* acc_code = nullptr, void* acc_sender = nullptr) noexcept override;
@@ -49,14 +58,14 @@ private:
     evmc_storage_status set_storage(
         const address& addr, const bytes32& key, const bytes32& value) noexcept override;
 
-    [[nodiscard]] evmc::bytes32 get_transient_storage(
-        const address& addr, const bytes32& key) const noexcept override;
+    [[nodiscard]] evmc::bytes32 get_transient_storage(const address& addr, const bytes32& key,
+        void* acc_in = nullptr, void** acc_out = nullptr) const noexcept override;
 
-    void set_transient_storage(
-        const address& addr, const bytes32& key, const bytes32& value) noexcept override;
+    void set_transient_storage(const address& addr, const bytes32& key, const bytes32& value,
+        void* acc_in = nullptr, void** acc_out = nullptr) noexcept override;
 
-    [[nodiscard]] uint256be get_balance(
-        const address& addr, void* acc_in = nullptr) const noexcept override;
+    [[nodiscard]] uint256be get_balance(const address& addr, void* acc_in = nullptr,
+        void** acc_out = nullptr) const noexcept override;
 
     [[nodiscard]] uint64_t get_nonce(const address& addr) const noexcept override;
 
@@ -89,7 +98,8 @@ private:
         int64_t& gas_left, evmc_bytes32& buffer, void* acc_in, void** acc_out) noexcept override;
 
     evmc_storage_status sstore(const address& addr, const bytes32& key, const bytes32& value,
-        evmc_access_status& access) noexcept override;
+        evmc_access_status& access, void* acc_in = nullptr,
+        void** acc_out = nullptr) noexcept override;
 
     evmc::Result execute_message(const evmc_message& msg, void* acc_recipient, void* acc_code,
         void* acc_sender) noexcept;

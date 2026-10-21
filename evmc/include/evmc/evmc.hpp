@@ -505,8 +505,9 @@ public:
                                             const bytes32& value) noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_balance
-    /// @p acc_in skips the host's address lookup when it holds the account node.
-    virtual uint256be get_balance(const address& addr, void* acc_in = nullptr) const noexcept = 0;
+    /// @p acc_in/@p acc_out: as in sload().
+    virtual uint256be get_balance(const address& addr, void* acc_in = nullptr,
+        void** acc_out = nullptr) const noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_nonce
     virtual uint64_t get_nonce(const address& addr) const noexcept = 0;
@@ -576,24 +577,35 @@ public:
     }
 
     /// SSTORE's host work in one call: access_storage() (its result in @p access), then
-    /// set_storage().
+    /// set_storage(). @p acc_in/@p acc_out: as in sload().
     virtual evmc_storage_status sstore(const address& addr,
                                        const bytes32& key,
                                        const bytes32& value,
-                                       evmc_access_status& access) noexcept
+                                       evmc_access_status& access,
+                                       void* acc_in = nullptr,
+                                       void** acc_out = nullptr) noexcept
     {
         access = access_storage(addr, key);
         return set_storage(addr, key, value);
     }
 
     /// @copydoc evmc_host_interface::get_transient_storage
+    /// @p acc_in/@p acc_out: as in sload().
     virtual bytes32 get_transient_storage(const address& addr,
-                                          const bytes32& key) const noexcept = 0;
+                                          const bytes32& key,
+                                          void* acc_in = nullptr,
+                                          void** acc_out = nullptr) const noexcept = 0;
 
     /// @copydoc evmc_host_interface::set_transient_storage
+    /// @p acc_in/@p acc_out: as in sload().
     virtual void set_transient_storage(const address& addr,
                                        const bytes32& key,
-                                       const bytes32& value) noexcept = 0;
+                                       const bytes32& value,
+                                       void* acc_in = nullptr,
+                                       void** acc_out = nullptr) noexcept = 0;
+
+    /// Recipient node for the frame's reset().
+    virtual void* take_frame_acc() noexcept { return nullptr; }
 };
 
 
@@ -633,7 +645,8 @@ public:
         return host->set_storage(context, &address, &key, &value);
     }
 
-    uint256be get_balance(const address& address, void* /*acc_in*/ = nullptr) const noexcept final
+    uint256be get_balance(const address& address, void* /*acc_in*/ = nullptr,
+        void** /*acc_out*/ = nullptr) const noexcept final
     {
         return host->get_balance(context, &address);
     }
@@ -707,7 +720,8 @@ public:
         return host->access_storage(context, &address, &key);
     }
 
-    bytes32 get_transient_storage(const address& address, const bytes32& key) const noexcept final
+    bytes32 get_transient_storage(const address& address, const bytes32& key,
+        void* /*acc_in*/ = nullptr, void** /*acc_out*/ = nullptr) const noexcept final
     {
         return host->get_transient_storage(context, &address, &key);
     }
@@ -722,7 +736,9 @@ public:
 
     void set_transient_storage(const address& address,
                                const bytes32& key,
-                               const bytes32& value) noexcept final
+                               const bytes32& value,
+                               void* /*acc_in*/ = nullptr,
+                               void** /*acc_out*/ = nullptr) noexcept final
     {
         host->set_transient_storage(context, &address, &key, &value);
     }

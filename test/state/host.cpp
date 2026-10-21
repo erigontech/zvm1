@@ -109,10 +109,12 @@ evmc_storage_status Host::set_storage(
     return update_storage(m_state, m_state.get_storage(addr, key), value);
 }
 
-uint256be Host::get_balance(const address& addr, void* acc_in) const noexcept
+uint256be Host::get_balance(const address& addr, void* acc_in, void** acc_out) const noexcept
 {
-    const auto& acc = acc_in != nullptr ? m_state.get(*static_cast<Account*>(acc_in), addr) :
-                                          m_state.get(addr);
+    auto& acc = acc_in != nullptr ? m_state.get(*static_cast<Account*>(acc_in), addr) :
+                                    m_state.get(addr);
+    if (acc_out != nullptr)
+        *acc_out = &acc;
     return intx::be::store<uint256be>(acc.balance);
 }
 
@@ -257,6 +259,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     create_msg.input_data = nullptr;
     create_msg.input_size = 0;
     const bytes_view initcode{msg.input_data, msg.input_size};
+    m_frame_acc = &new_acc;  // Seed the initcode frame.
     auto result = m_vm.execute(*this, m_rev, create_msg, initcode.data(), initcode.size());
     if (result.status_code != EVMC_SUCCESS)
         return result;
@@ -375,6 +378,8 @@ evmc::Result Host::execute_message(
     if (code_acc->code_hash == Account::EMPTY_CODE_HASH)  // Skip trivial execution.
         return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
+    // Taken by the frame's reset().
+    m_frame_acc = recipient_acc_ptr != nullptr ? recipient_acc_ptr : acc_recipient;
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     if (my_vm->has_cached_execution())
     {
@@ -528,10 +533,12 @@ const evmc_bytes32* Host::sload(const address& addr, const bytes32& key, int64_t
 }
 
 evmc_storage_status Host::sstore(const address& addr, const bytes32& key, const bytes32& value,
-    evmc_access_status& access) noexcept
+    evmc_access_status& access, void* acc_in, void** acc_out) noexcept
 {
     // access_storage() and set_storage() on one lookup of the account and of the slot, see sload().
-    auto& acc = m_state.access(addr);
+    auto& acc = acc_in != nullptr ? *static_cast<Account*>(acc_in) : m_state.access(addr);
+    if (acc_out != nullptr)
+        *acc_out = &acc;
     assert(acc.loaded && !acc.nonexistent);
     auto& slot = acc.storage[key];
     access = slot.access_status;
@@ -546,17 +553,24 @@ evmc_storage_status Host::sstore(const address& addr, const bytes32& key, const 
 }
 
 
-evmc::bytes32 Host::get_transient_storage(const address& addr, const bytes32& key) const noexcept
+evmc::bytes32 Host::get_transient_storage(const address& addr, const bytes32& key,
+    void* acc_in, void** acc_out) const noexcept
 {
-    const auto& acc = m_state.get(addr);
+    auto& acc = acc_in != nullptr ? m_state.get(*static_cast<Account*>(acc_in), addr) :
+                                    m_state.get(addr);
+    if (acc_out != nullptr)
+        *acc_out = &acc;
     const auto it = acc.transient_storage.find(key);
     return it != acc.transient_storage.end() ? it->second : bytes32{};
 }
 
-void Host::set_transient_storage(
-    const address& addr, const bytes32& key, const bytes32& value) noexcept
+void Host::set_transient_storage(const address& addr, const bytes32& key, const bytes32& value,
+    void* acc_in, void** acc_out) noexcept
 {
-    auto& acc = m_state.get(addr);
+    auto& acc = acc_in != nullptr ? m_state.get(*static_cast<Account*>(acc_in), addr) :
+                                    m_state.get(addr);
+    if (acc_out != nullptr)
+        *acc_out = &acc;
     assert(!acc.nonexistent);
     auto& slot = acc.transient_storage[key];
     m_state.journal_transient_storage_change(slot);
