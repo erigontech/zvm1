@@ -121,8 +121,9 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
         // One host call warms the slot, charges the cold access and returns the value: the slot
         // is looked up once. Out of gas returns before the value is read.
         evmc_bytes32 buffer;
-        const auto* value = state.cpp_host->sload(
-            recipient, evmc::internal::as_cpp(&key), ADDITIONAL_COLD_STORAGE_ACCESS, gas_left, buffer);
+        const auto* value = state.cpp_host->sload(recipient, evmc::internal::as_cpp(&key),
+            ADDITIONAL_COLD_STORAGE_ACCESS, gas_left, buffer, state.acc_handle,
+            &state.acc_handle);
         if (value == nullptr)
             return {EVMC_OUT_OF_GAS, gas_left};
         // Convert at once: the pointer may refer to host state that the next host call changes.

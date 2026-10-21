@@ -550,11 +550,14 @@ public:
     /// was cold, then get_storage(). Returns null on out of gas, before the value is read, and
     /// otherwise a pointer to the value, which is either @p buffer or owned by the host. The
     /// pointer is valid until the next call into the host.
+    /// @p acc_in/@p acc_out cache the host account node.
     virtual const evmc_bytes32* sload(const address& addr,
                                       const bytes32& key,
                                       int64_t cold_cost,
                                       int64_t& gas_left,
-                                      evmc_bytes32& buffer) noexcept
+                                      evmc_bytes32& buffer,
+                                      void* acc_in = nullptr,
+                                      void** acc_out = nullptr) noexcept
     {
         if (access_storage(addr, key) == EVMC_ACCESS_COLD && (gas_left -= cold_cost) < 0)
             return nullptr;

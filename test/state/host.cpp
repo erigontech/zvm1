@@ -481,11 +481,14 @@ evmc_access_status Host::access_storage(const address& addr, const bytes32& key)
 }
 
 const evmc_bytes32* Host::sload(const address& addr, const bytes32& key, int64_t cold_cost,
-    int64_t& gas_left, evmc_bytes32& /*buffer*/) noexcept
+    int64_t& gas_left, evmc_bytes32& /*buffer*/, void* acc_in, void** acc_out) noexcept
 {
     // access_storage() and get_storage() on one lookup of the account and of the slot (node
     // references are stable and nothing inserts between the two parts).
-    auto& acc = m_state.access(addr);
+    // Recipient node; m_modified never erases mid-tx.
+    auto& acc = acc_in != nullptr ? *static_cast<Account*>(acc_in) : m_state.access(addr);
+    if (acc_out != nullptr)
+        *acc_out = &acc;
     assert(acc.loaded);  // The storage of the executing account, loaded to run its code.
     auto& slot = acc.storage[key];
     if (slot.access_status != EVMC_ACCESS_WARM)

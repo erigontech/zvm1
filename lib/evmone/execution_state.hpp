@@ -235,6 +235,8 @@ public:
     /// otherwise): SLOAD and SSTORE call its fused virtuals directly instead of several C callbacks,
     /// and CALL and CREATE receive its evmc::Result without the C round trip.
     evmc::Host* cpp_host = nullptr;
+    /// Recipient's host account node; reset per message.
+    void* acc_handle = nullptr;
     evmc_revision rev = {};
 #ifdef EVMONE_WORD_LAYOUT
     wl::ReturnData return_data;
@@ -297,6 +299,7 @@ public:
         cd_lim = calldata_limit(message);
         host = {host_interface, host_ctx};
         cpp_host = cpp_host_of(host_interface, host_ctx);
+        acc_handle = nullptr;
         rev = revision;
         return_data.clear();
         original_code = _code;
