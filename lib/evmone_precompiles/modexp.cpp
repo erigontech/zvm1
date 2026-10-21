@@ -728,7 +728,12 @@ void modexp_zisk(std::span<const uint8_t> base_bytes, const Exponent& exp,
                 const size_t n = exp.size();
                 const size_t D = (bw + 3) / 4;
                 const auto nib = [&](size_t d) noexcept {
+#if defined(__riscv)
                     return (e[n - 1 - (d >> 1)] >> (4 * (d & 1))) & 15u;
+#else
+                    // host builds keep -Wsign-conversion quiet
+                    return (static_cast<unsigned>(e[n - 1 - (d >> 1)]) >> (4 * (d & 1))) & 15u;
+#endif
                 };
 
                 // [0,1] square, [2,3] multiply, by parity.
