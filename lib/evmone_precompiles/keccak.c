@@ -1312,6 +1312,7 @@ typedef uint32_t __attribute__((may_alias)) branch_word32;
 typedef uint32_t branch_word32;
 #endif
 
+#if defined(__riscv) && __riscv_xlen == 32
 #if defined(ZISK)
 /// 64-bit lanes for whole-block XORs.
 #if __has_attribute(may_alias)
@@ -1393,6 +1394,91 @@ static inline ALWAYS_INLINE void full_branch_slot_delta(branch_word32* s, const 
         full_branch_delta(s, n, full_branch_new_hash(hashes, ptrs, j, tmp), j, k, t_lo, t_hi);
     }
 }
+#else
+/// 64-bit lanes for whole-block XORs and for the slot deltas.
+#if __has_attribute(may_alias)
+typedef uint64_t __attribute__((may_alias)) branch_word64;
+#else
+typedef uint64_t branch_word64;
+#endif
+
+/// Witness refs are any-aligned: copy to tmp.
+static inline ALWAYS_INLINE const branch_word64* full_branch_new_hash(
+    const uint8_t* hashes, const uint8_t* const* ptrs, unsigned j, uint64_t tmp[4])
+{
+    if (ptrs[j] != NULL)
+    {
+        __builtin_memcpy(tmp, ptrs[j], 32);
+        return tmp;
+    }
+    return (const branch_word64*)(hashes + 32 * j);
+}
+
+/// Hash bytes [t0, t0+8); zero past 32.
+static inline ALWAYS_INLINE uint64_t full_branch_hash_lane(const branch_word64* h, unsigned t0)
+{
+    const unsigned q = t0 >> 3;
+    const unsigned sh = 8 * (t0 & 7u);
+    if (sh == 0)
+        return h[q];
+    if (q == 3)
+        return h[3] >> sh;
+    return (h[q] >> sh) | (h[q + 1] << (64 - sh));
+}
+
+/// Lane mask for bytes [lo, hi).
+static inline ALWAYS_INLINE uint64_t full_branch_lane_mask(unsigned lo, unsigned hi)
+{
+    return (~UINT64_C(0) << (8 * lo)) & (~UINT64_C(0) >> (8 * (8 - hi)));
+}
+
+/// Phase mod 8: first and last lanes partial.
+static inline ALWAYS_INLINE void full_branch_put0(branch_word64* s, const branch_word64* h, unsigned j)
+{
+    const unsigned r = 4 + 33 * j;  // The slot's first hash byte, in block 0.
+#pragma GCC unroll 5
+    for (unsigned i = r >> 3; i <= ((r + 31) >> 3); ++i)
+    {
+        const unsigned b0 = r > 8 * i ? r - 8 * i : 0u;
+        const unsigned b1 = r + 32 < 8 * i + 8 ? r + 32 - 8 * i : 8u;
+        const unsigned t0 = 8 * i > r ? 8 * i - r : 0u;
+        const uint64_t v = full_branch_hash_lane(h, t0) << (8 * b0);
+        const uint64_t m = full_branch_lane_mask(b0, b1);
+        s[i] = (s[i] & ~m) | (v & m);
+    }
+}
+
+/// XOR old^new into block k's lanes; slots 8 and 12 straddle.
+static inline ALWAYS_INLINE void full_branch_delta(branch_word64* s, const branch_word64* n,
+    const branch_word64* h, unsigned j, unsigned k)
+{
+    const int r = (int)(4 + 33 * j) - 136 * (int)k;  // Slot's first hash byte, in the block.
+    const unsigned lo = r > 0 ? (unsigned)r : 0u;
+    const unsigned hi = (unsigned)(r + 32) < 136u ? (unsigned)(r + 32) : 136u;
+    const branch_word64* const d = n + 17 * k;
+#pragma GCC unroll 5
+    for (unsigned i = lo >> 3; i <= ((hi - 1) >> 3); ++i)
+    {
+        const unsigned b0 = lo > 8 * i ? lo - 8 * i : 0u;
+        const unsigned b1 = hi < 8 * i + 8 ? hi - 8 * i : 8u;
+        const int t = 8 * (int)i - r;  // The lane's first byte as a hash byte, negative at the head.
+        const unsigned t0 = t > 0 ? (unsigned)t : 0u;
+        const uint64_t v = full_branch_hash_lane(h, t0) << (8 * b0);
+        s[i] ^= (d[i] ^ v) & full_branch_lane_mask(b0, b1);
+    }
+}
+
+/// full_branch_delta() of slot j if dirty.
+static inline ALWAYS_INLINE void full_branch_slot_delta(branch_word64* s, const branch_word64* n,
+    uint32_t dirty, const uint8_t* hashes, const uint8_t* const* ptrs, unsigned j, unsigned k)
+{
+    if (dirty & (1u << j))
+    {
+        uint64_t tmp[4];
+        full_branch_delta(s, n, full_branch_new_hash(hashes, ptrs, j, tmp), j, k);
+    }
+}
+#endif
 
 /// XORs block @p k (1 to 3) of the node into the state; the last block with its padding.
 static inline ALWAYS_INLINE void full_branch_absorb(branch_word32* s, const branch_word32* n, unsigned k)
@@ -1452,6 +1538,9 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
 {
     union ethash_hash256 hash;
     const branch_word32* const n = (const branch_word32*)node;
+#if !defined(__riscv) || __riscv_xlen != 32
+    const branch_word64* const n64 = (const branch_word64*)node;
+#endif
 #if defined(AIRBENDER)
     // From the start, the state is buf[], as in keccak(); resumed, the slot is permuted in place.
     uint64_t* const state = blocks != 0 ? slot : buf;
@@ -1460,7 +1549,12 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
     uint64_t* const state = blocks != 0 ? slot : local;
 #endif
     branch_word32* const s = (branch_word32*)state;
+#if defined(__riscv) && __riscv_xlen == 32
     uint32_t tmp[8];
+#else
+    branch_word64* const s64 = (branch_word64*)state;
+    uint64_t tmp[4];
+#endif
 
     // Each block's deltas are tested for as a group first: most updates change one or two slots.
     // Each group opens with an empty asm statement: without them GCC schedules the copy and the
@@ -1486,13 +1580,29 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
         {
             FULL_BRANCH_BARRIER();
             if (dirty & 0x0001u)
+#if defined(__riscv) && __riscv_xlen == 32
                 full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 0, tmp), 0);
+#else
+                full_branch_put0(s64, full_branch_new_hash(hashes, ptrs, 0, tmp), 0);
+#endif
             if (dirty & 0x0002u)
+#if defined(__riscv) && __riscv_xlen == 32
                 full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 1, tmp), 1);
+#else
+                full_branch_put0(s64, full_branch_new_hash(hashes, ptrs, 1, tmp), 1);
+#endif
             if (dirty & 0x0004u)
+#if defined(__riscv) && __riscv_xlen == 32
                 full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 2, tmp), 2);
+#else
+                full_branch_put0(s64, full_branch_new_hash(hashes, ptrs, 2, tmp), 2);
+#endif
             if (dirty & 0x0008u)
+#if defined(__riscv) && __riscv_xlen == 32
                 full_branch_put0(s, full_branch_new_hash(hashes, ptrs, 3, tmp), 3);
+#else
+                full_branch_put0(s64, full_branch_new_hash(hashes, ptrs, 3, tmp), 3);
+#endif
         }
         FULL_BRANCH_PERMUTE(state);
     }
@@ -1502,11 +1612,19 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
         if (dirty & 0x01f0u)
         {
             FULL_BRANCH_BARRIER();
+#if defined(__riscv) && __riscv_xlen == 32
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 4, 1, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 5, 1, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 6, 1, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 7, 1, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 8, 1, 0, 1);
+#else
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 4, 1);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 5, 1);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 6, 1);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 7, 1);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 8, 1);
+#endif
         }
         FULL_BRANCH_PERMUTE(state);
         /* fallthrough */
@@ -1515,11 +1633,19 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
         if (dirty & 0x1f00u)
         {
             FULL_BRANCH_BARRIER();
+#if defined(__riscv) && __riscv_xlen == 32
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 8, 2, 1, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 9, 2, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 10, 2, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 11, 2, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 12, 2, 0, 2);
+#else
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 8, 2);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 9, 2);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 10, 2);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 11, 2);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 12, 2);
+#endif
         }
         FULL_BRANCH_PERMUTE(state);
         /* fallthrough */
@@ -1528,10 +1654,17 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
         if (dirty & 0xf000u)
         {
             FULL_BRANCH_BARRIER();
+#if defined(__riscv) && __riscv_xlen == 32
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 12, 3, 2, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 13, 3, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 14, 3, 0, 8);
             full_branch_slot_delta(s, n, dirty, hashes, ptrs, 15, 3, 0, 8);
+#else
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 12, 3);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 13, 3);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 14, 3);
+            full_branch_slot_delta(s64, n64, dirty, hashes, ptrs, 15, 3);
+#endif
         }
         FULL_BRANCH_PERMUTE(state);
     }
