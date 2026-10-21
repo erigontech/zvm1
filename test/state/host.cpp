@@ -313,8 +313,8 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     return evmc::Result{result.status_code, gas_left, result.gas_refund, state_gas};
 }
 
-evmc::Result Host::execute_message(
-    const evmc_message& msg, void* acc_recipient, void* acc_code, void* acc_sender) noexcept
+evmc::Result Host::execute_message(const evmc_message& msg, void* acc_recipient,
+    void* acc_code, void* acc_sender, bool value_checked, bool value_nonzero) noexcept
 {
     if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2)
         return create(msg);
@@ -323,7 +323,7 @@ evmc::Result Host::execute_message(
     Account* recipient_acc_ptr = nullptr;
     if (msg.kind == EVMC_CALL)
     {
-        if (evmc::is_zero(msg.value))
+        if (value_checked ? !value_nonzero : evmc::is_zero(msg.value))
         {
             recipient_acc_ptr = acc_recipient != nullptr ?
                                     &m_state.touch(*static_cast<Account*>(acc_recipient),
@@ -394,8 +394,8 @@ evmc::Result Host::execute_message(
     return m_vm.execute(*this, static_cast<evmc_revision>(m_rev), msg, code.data(), code.size());
 }
 
-evmc::Result Host::call(
-    const evmc_message& msg, void* acc_recipient, void* acc_code, void* acc_sender) noexcept
+evmc::Result Host::call(const evmc_message& msg, void* acc_recipient,
+    void* acc_code, void* acc_sender, bool value_checked, bool value_nonzero) noexcept
 {
     if (msg.depth != 0 && (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2))
     {
@@ -410,7 +410,8 @@ evmc::Result Host::call(
     const auto logs_checkpoint = m_logs.size();
     const auto state_checkpoint = m_state.checkpoint();
 
-    auto result = execute_message(msg, acc_recipient, acc_code, acc_sender);
+    auto result = execute_message(msg, acc_recipient, acc_code, acc_sender,
+        value_checked, value_nonzero);
 
     if (result.status_code != EVMC_SUCCESS)
     {

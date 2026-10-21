@@ -2904,7 +2904,7 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
     }
 
     // Not const: the result is returned by NRVO (evmc::Result cannot be copied).
-    auto result = make_execution_result(state, gas);
+    auto result = make_execution_result(state, gas, true);
 
     if (INTX_UNLIKELY(tracer != nullptr))
         tracer->notify_execution_end(result.raw());

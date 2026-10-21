@@ -50,7 +50,8 @@ public:
     }
 
     evmc::Result call(const evmc_message& msg, void* acc_recipient = nullptr,
-        void* acc_code = nullptr, void* acc_sender = nullptr) noexcept override;
+        void* acc_code = nullptr, void* acc_sender = nullptr,
+        bool value_checked = false, bool value_nonzero = false) noexcept override;
 
     [[nodiscard]] bool account_exists(
         const address& addr, void* acc_in = nullptr) const noexcept override;
@@ -106,6 +107,6 @@ private:
         void** acc_out = nullptr) noexcept override;
 
     evmc::Result execute_message(const evmc_message& msg, void* acc_recipient, void* acc_code,
-        void* acc_sender) noexcept;
+        void* acc_sender, bool value_checked, bool value_nonzero) noexcept;
 };
 }  // namespace evmone::state

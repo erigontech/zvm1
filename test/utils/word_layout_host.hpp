@@ -17,7 +17,8 @@ class WordLayoutMockedHost : public evmc::MockedHost
 {
 public:
     evmc::Result call(const evmc_message& msg, void* acc_recipient = nullptr,
-        void* acc_code = nullptr, void* acc_sender = nullptr) noexcept override
+        void* acc_code = nullptr, void* acc_sender = nullptr,
+        bool value_checked = false, bool value_nonzero = false) noexcept override
     {
         auto byte_msg = msg;
         byte_msg.flags &= ~(wl::FLAG_WORD_INPUT | wl::FLAG_WORD_OUTPUT);

@@ -352,7 +352,8 @@ public:
 /// The result is returned as the evmc::Result the host hands to the calling frame: built in the
 /// caller's return slot, it reaches call_impl with no release_raw() copy and no re-wrap. The C
 /// entry points release it.
-inline evmc::Result make_execution_result(ExecutionState& state, int64_t gas_left) noexcept
+inline evmc::Result make_execution_result(
+    ExecutionState& state, int64_t gas_left, bool allow_borrow = false) noexcept
 {
     if (state.rev >= EVMC_AMSTERDAM && state.status != EVMC_SUCCESS)
     {
@@ -401,6 +402,16 @@ inline evmc::Result make_execution_result(ExecutionState& state, int64_t gas_lef
     }
     return result;
 #else
+    // Borrowed; parent consumes before frame reuse.
+    if (allow_borrow && state.msg->depth != 0 && state.output_size != 0)
+    {
+        evmc::Result result{static_cast<evmc_status_code>(state.status), gas_left, gas_refund,
+            state.state_gas};
+        auto& raw = result.raw();
+        raw.output_data = &state.memory[state.output_offset];
+        raw.output_size = state.output_size;
+        return result;
+    }
     return evmc::Result{static_cast<evmc_status_code>(state.status), gas_left, gas_refund,
         state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size,
         state.state_gas};

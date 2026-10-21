@@ -62,10 +62,12 @@ inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& co
 /// evmc::Result is released to a raw evmc_result and wrapped again in HostContext::call, two
 /// copies of the result per call; the same virtual call on the C++ Host returns it as is.
 inline evmc::Result host_call(ExecutionState& state, const evmc_message& msg,
-    void* acc_recipient = nullptr, void* acc_code = nullptr, void* acc_sender = nullptr) noexcept
+    void* acc_recipient = nullptr, void* acc_code = nullptr, void* acc_sender = nullptr,
+    bool value_checked = false, bool value_nonzero = false) noexcept
 {
     if (state.cpp_host != nullptr) [[likely]]
-        return state.cpp_host->call(msg, acc_recipient, acc_code, acc_sender);
+        return state.cpp_host->call(msg, acc_recipient, acc_code, acc_sender,
+            value_checked, value_nonzero);
     return state.host.call(msg);
 }
 
@@ -338,7 +340,8 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         (Op == OP_CALL || Op == OP_STATICCALL) ? dst_acc : state.acc_handle;
     void* const acc_code = (delegation != Delegation::delegated) ? dst_acc : nullptr;
     void* const acc_sender = (Op == OP_DELEGATECALL) ? nullptr : state.acc_handle;
-    auto result = host_call(state, msg, acc_recipient, acc_code, acc_sender);
+    auto result = host_call(state, msg, acc_recipient, acc_code, acc_sender, HAS_VALUE_ARG,
+        has_value);
 #ifdef EVMONE_WORD_LAYOUT
     state.return_data.take(result);
 #else

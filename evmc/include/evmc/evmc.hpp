@@ -534,7 +534,9 @@ public:
     virtual Result call(const evmc_message& msg,
                         void* acc_recipient = nullptr,
                         void* acc_code = nullptr,
-                        void* acc_sender = nullptr) noexcept = 0;
+                        void* acc_sender = nullptr,
+                        bool value_checked = false,
+                        bool value_nonzero = false) noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_tx_context
     virtual evmc_tx_context get_tx_context() const noexcept = 0;
@@ -687,7 +689,8 @@ public:
     }
 
     Result call(const evmc_message& message, void* /*acc_recipient*/ = nullptr,
-        void* /*acc_code*/ = nullptr, void* /*acc_sender*/ = nullptr) noexcept final
+        void* /*acc_code*/ = nullptr, void* /*acc_sender*/ = nullptr,
+        bool /*value_checked*/ = false, bool /*value_nonzero*/ = false) noexcept final
     {
         return Result{host->call(context, &message)};
     }
