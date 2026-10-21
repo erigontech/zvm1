@@ -23,6 +23,8 @@ constexpr bool is_code_delegated(bytes_view code) noexcept
 }
 
 /// Get EIP-7702 delegate address from the code of addr, if it is delegated.
+/// @p fused (or @p host) reads the code; @p acc_in is the host's node for addr.
 EVMC_EXPORT std::optional<evmc::address> get_delegate_address(
-    const evmc::HostInterface& host, const evmc::address& addr) noexcept;
+    const evmc::HostInterface& host, const evmc::address& addr,
+    const evmc::HostInterface* fused = nullptr, void* acc_in = nullptr) noexcept;
 }  // namespace evmone

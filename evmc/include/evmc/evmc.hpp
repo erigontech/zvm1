@@ -493,7 +493,8 @@ public:
     virtual ~HostInterface() noexcept = default;
 
     /// @copydoc evmc_host_interface::account_exists
-    virtual bool account_exists(const address& addr) const noexcept = 0;
+    /// @p acc_in skips the host's address lookup when it holds the account node.
+    virtual bool account_exists(const address& addr, void* acc_in = nullptr) const noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_storage
     virtual bytes32 get_storage(const address& addr, const bytes32& key) const noexcept = 0;
@@ -504,7 +505,8 @@ public:
                                             const bytes32& value) noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_balance
-    virtual uint256be get_balance(const address& addr) const noexcept = 0;
+    /// @p acc_in skips the host's address lookup when it holds the account node.
+    virtual uint256be get_balance(const address& addr, void* acc_in = nullptr) const noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_nonce
     virtual uint64_t get_nonce(const address& addr) const noexcept = 0;
@@ -516,16 +518,22 @@ public:
     virtual bytes32 get_code_hash(const address& addr) const noexcept = 0;
 
     /// @copydoc evmc_host_interface::copy_code
+    /// @p acc_in skips the host's address lookup when it holds the account node.
     virtual size_t copy_code(const address& addr,
                              size_t code_offset,
                              uint8_t* buffer_data,
-                             size_t buffer_size) const noexcept = 0;
+                             size_t buffer_size,
+                             void* acc_in = nullptr) const noexcept = 0;
 
     /// @copydoc evmc_host_interface::selfdestruct
     virtual bool selfdestruct(const address& addr, const address& beneficiary) noexcept = 0;
 
     /// @copydoc evmc_host_interface::call
-    virtual Result call(const evmc_message& msg) noexcept = 0;
+    /// @p acc_* skip address lookups when the host holds those account nodes.
+    virtual Result call(const evmc_message& msg,
+                        void* acc_recipient = nullptr,
+                        void* acc_code = nullptr,
+                        void* acc_sender = nullptr) noexcept = 0;
 
     /// @copydoc evmc_host_interface::get_tx_context
     virtual evmc_tx_context get_tx_context() const noexcept = 0;
@@ -541,7 +549,9 @@ public:
                           size_t num_topics) noexcept = 0;
 
     /// @copydoc evmc_host_interface::access_account
-    virtual evmc_access_status access_account(const address& addr) noexcept = 0;
+    /// @p acc_out receives the host's account node for @p addr; pass it back as @p acc_in.
+    virtual evmc_access_status access_account(
+        const address& addr, void** acc_out = nullptr) noexcept = 0;
 
     /// @copydoc evmc_host_interface::access_storage
     virtual evmc_access_status access_storage(const address& addr, const bytes32& key) noexcept = 0;
@@ -606,7 +616,7 @@ public:
       : host{&interface}, context{ctx}
     {}
 
-    bool account_exists(const address& address) const noexcept final
+    bool account_exists(const address& address, void* /*acc_in*/ = nullptr) const noexcept final
     {
         return host->account_exists(context, &address);
     }
@@ -623,7 +633,7 @@ public:
         return host->set_storage(context, &address, &key, &value);
     }
 
-    uint256be get_balance(const address& address) const noexcept final
+    uint256be get_balance(const address& address, void* /*acc_in*/ = nullptr) const noexcept final
     {
         return host->get_balance(context, &address);
     }
@@ -652,7 +662,8 @@ public:
     size_t copy_code(const address& address,
                      size_t code_offset,
                      uint8_t* buffer_data,
-                     size_t buffer_size) const noexcept final
+                     size_t buffer_size,
+                     void* /*acc_in*/ = nullptr) const noexcept final
     {
         return host->copy_code(context, &address, code_offset, buffer_data, buffer_size);
     }
@@ -662,7 +673,8 @@ public:
         return host->selfdestruct(context, &addr, &beneficiary);
     }
 
-    Result call(const evmc_message& message) noexcept final
+    Result call(const evmc_message& message, void* /*acc_recipient*/ = nullptr,
+        void* /*acc_code*/ = nullptr, void* /*acc_sender*/ = nullptr) noexcept final
     {
         return Result{host->call(context, &message)};
     }
@@ -684,7 +696,8 @@ public:
         host->emit_log(context, &addr, data, data_size, topics, topics_count);
     }
 
-    evmc_access_status access_account(const address& address) noexcept final
+    evmc_access_status access_account(
+        const address& address, void** /*acc_out*/ = nullptr) noexcept final
     {
         return host->access_account(context, &address);
     }

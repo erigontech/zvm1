@@ -13,13 +13,14 @@ namespace
 /// Kept out of line so that the one-byte probe in get_delegate_address(), which every CALL-like
 /// instruction runs, stays small where it is inlined.
 [[gnu::noinline, gnu::cold]] std::optional<evmc::address> read_designation(
-    const evmc::HostInterface& host, const evmc::address& addr) noexcept
+    const evmc::HostInterface& host, const evmc::address& addr, void* acc_in) noexcept
 {
     // Load the code prefix up to the delegation designation size.
     // The HostInterface::copy_code() copies up to the addr's code size
     // and returns the number of bytes copied.
     uint8_t designation_buffer[std::size(DELEGATION_MAGIC) + sizeof(evmc::address)];
-    const auto size = host.copy_code(addr, 0, designation_buffer, std::size(designation_buffer));
+    const auto size =
+        host.copy_code(addr, 0, designation_buffer, std::size(designation_buffer), acc_in);
     const bytes_view designation{designation_buffer, size};
 
     if (!is_code_delegated(designation))
@@ -34,16 +35,17 @@ namespace
 }
 }  // namespace
 
-std::optional<evmc::address> get_delegate_address(
-    const evmc::HostInterface& host, const evmc::address& addr) noexcept
+std::optional<evmc::address> get_delegate_address(const evmc::HostInterface& host,
+    const evmc::address& addr, const evmc::HostInterface* fused, void* acc_in) noexcept
 {
     // Probe the first byte alone. Since EIP-3541, only delegation designations (and a few older
     // contracts) start with 0xEF, so almost every target is decided here. A one-byte copy is a
     // byte move in the host, while the full 23-byte prefix costs it a memmove call.
+    const auto& h = fused != nullptr ? *fused : host;
     uint8_t first_byte;
-    if (host.copy_code(addr, 0, &first_byte, 1) == 0 || first_byte != DELEGATION_MAGIC[0])
+    if (h.copy_code(addr, 0, &first_byte, 1, acc_in) == 0 || first_byte != DELEGATION_MAGIC[0])
         return {};
 
-    return read_designation(host, addr);
+    return read_designation(h, addr, acc_in);
 }
 }  // namespace evmone

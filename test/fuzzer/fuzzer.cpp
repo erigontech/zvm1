@@ -69,7 +69,8 @@ class FuzzHost : public evmc::MockedHost
 public:
     uint8_t gas_left_factor = 0;
 
-    evmc::Result call(const evmc_message& msg) noexcept override
+    evmc::Result call(const evmc_message& msg, void* = nullptr, void* = nullptr,
+        void* = nullptr) noexcept override
     {
         auto result = MockedHost::call(msg);
 

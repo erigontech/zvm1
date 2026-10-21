@@ -111,13 +111,24 @@ public:
         return acc;
     }
 
+    /// get() on a known, stable node.
+    Account& get(Account& acc, const address& addr) noexcept
+    {
+        if (!acc.loaded) [[unlikely]]
+            load_initial(acc, addr);
+        return acc;
+    }
+
     /// Gets an existing account or creates new erasable account without journaling.
     Account& get_or_insert(const address& addr);
 
-    bytes_view get_code(const address& addr)
+    bytes_view get_code(const address& addr) { return get_code(get(addr), addr); }
+
+    bytes_view get_code(Account& a, const address& addr)
     {
+        if (!a.loaded) [[unlikely]]
+            load_initial(a, addr);
         // A nonexistent account has the empty code hash, so it needs no separate check.
-        auto& a = get(addr);
         if (a.code_hash == Account::EMPTY_CODE_HASH)
             return {};
         // Non-empty only if this transaction wrote the code; every writer either leaves it
@@ -158,11 +169,23 @@ public:
     /// @return The account and whether it has been created.
     std::pair<Account&, bool> get_or_create(const address& addr);
 
+    /// get_or_create() on a known, stable node.
+    std::pair<Account&, bool> get_or_create(Account& acc, const address& addr);
+
     /// Touches (as in EIP-161) an existing account or creates new erasable account.
     Account& touch(const address& addr)
     {
         auto& acc = get(addr);
         if (!acc.erase_if_empty && acc.is_empty())  // Also true for a nonexistent account.
+            create_touched(acc);
+        return acc;
+    }
+
+    /// touch() on a known, stable node.
+    Account& touch(Account& acc, const address& addr)
+    {
+        get(acc, addr);
+        if (!acc.erase_if_empty && acc.is_empty())
             create_touched(acc);
         return acc;
     }

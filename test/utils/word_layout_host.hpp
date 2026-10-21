@@ -16,7 +16,8 @@ namespace evmone::test
 class WordLayoutMockedHost : public evmc::MockedHost
 {
 public:
-    evmc::Result call(const evmc_message& msg) noexcept override
+    evmc::Result call(const evmc_message& msg, void* acc_recipient = nullptr,
+        void* acc_code = nullptr, void* acc_sender = nullptr) noexcept override
     {
         auto byte_msg = msg;
         byte_msg.flags &= ~(wl::FLAG_WORD_INPUT | wl::FLAG_WORD_OUTPUT);
@@ -26,7 +27,7 @@ public:
             input = wl::to_bytes(msg.input_data, msg.input_size);
             byte_msg.input_data = input.data();
         }
-        auto result = MockedHost::call(byte_msg);
+        auto result = MockedHost::call(byte_msg, acc_recipient, acc_code, acc_sender);
         if ((msg.flags & wl::FLAG_WORD_OUTPUT) == 0 || result.output_size == 0)
             return result;
 

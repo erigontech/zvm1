@@ -448,7 +448,12 @@ StateDiff State::build_diff(evmc_revision rev) const
 
 std::pair<Account&, bool> State::get_or_create(const address& addr)
 {
-    auto& acc = get(addr);
+    return get_or_create(get(addr), addr);
+}
+
+std::pair<Account&, bool> State::get_or_create(Account& acc, const address& addr)
+{
+    get(acc, addr);
     if (!acc.nonexistent)
         return {acc, false};
     journal_account_flags(acc);

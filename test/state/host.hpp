@@ -36,9 +36,11 @@ public:
 
     [[nodiscard]] std::vector<Log>&& take_logs() noexcept { return std::move(m_logs); }
 
-    evmc::Result call(const evmc_message& msg) noexcept override;
+    evmc::Result call(const evmc_message& msg, void* acc_recipient = nullptr,
+        void* acc_code = nullptr, void* acc_sender = nullptr) noexcept override;
 
-    [[nodiscard]] bool account_exists(const address& addr) const noexcept override;
+    [[nodiscard]] bool account_exists(
+        const address& addr, void* acc_in = nullptr) const noexcept override;
 
 private:
     [[nodiscard]] bytes32 get_storage(
@@ -53,7 +55,8 @@ private:
     void set_transient_storage(
         const address& addr, const bytes32& key, const bytes32& value) noexcept override;
 
-    [[nodiscard]] uint256be get_balance(const address& addr) const noexcept override;
+    [[nodiscard]] uint256be get_balance(
+        const address& addr, void* acc_in = nullptr) const noexcept override;
 
     [[nodiscard]] uint64_t get_nonce(const address& addr) const noexcept override;
 
@@ -62,7 +65,7 @@ private:
     [[nodiscard]] bytes32 get_code_hash(const address& addr) const noexcept override;
 
     size_t copy_code(const address& addr, size_t code_offset, uint8_t* buffer_data,
-        size_t buffer_size) const noexcept override;
+        size_t buffer_size, void* acc_in = nullptr) const noexcept override;
 
     bool selfdestruct(const address& addr, const address& beneficiary) noexcept override;
 
@@ -76,7 +79,8 @@ private:
         const bytes32 topics[], size_t topics_count) noexcept override;
 
 public:
-    evmc_access_status access_account(const address& addr) noexcept override;
+    evmc_access_status access_account(
+        const address& addr, void** acc_out = nullptr) noexcept override;
 
 private:
     evmc_access_status access_storage(const address& addr, const bytes32& key) noexcept override;
@@ -87,6 +91,7 @@ private:
     evmc_storage_status sstore(const address& addr, const bytes32& key, const bytes32& value,
         evmc_access_status& access) noexcept override;
 
-    evmc::Result execute_message(const evmc_message& msg) noexcept;
+    evmc::Result execute_message(const evmc_message& msg, void* acc_recipient, void* acc_code,
+        void* acc_sender) noexcept;
 };
 }  // namespace evmone::state

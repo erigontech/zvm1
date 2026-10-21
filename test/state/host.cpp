@@ -89,9 +89,11 @@ bool runs_recipient_code(const evmc_message& msg) noexcept
 }
 }  // namespace
 
-bool Host::account_exists(const address& addr) const noexcept
+bool Host::account_exists(const address& addr, void* acc_in) const noexcept
 {
-    const auto& acc = m_state.get(addr);
+    const auto& acc = acc_in != nullptr ?
+                          m_state.get(*static_cast<Account*>(acc_in), addr) :
+                          m_state.get(addr);
     return !acc.nonexistent && (m_rev < EVMC_SPURIOUS_DRAGON || !acc.is_empty());
 }
 
@@ -107,9 +109,11 @@ evmc_storage_status Host::set_storage(
     return update_storage(m_state, m_state.get_storage(addr, key), value);
 }
 
-uint256be Host::get_balance(const address& addr) const noexcept
+uint256be Host::get_balance(const address& addr, void* acc_in) const noexcept
 {
-    return intx::be::store<uint256be>(m_state.get(addr).balance);
+    const auto& acc = acc_in != nullptr ? m_state.get(*static_cast<Account*>(acc_in), addr) :
+                                          m_state.get(addr);
+    return intx::be::store<uint256be>(acc.balance);
 }
 
 uint64_t Host::get_nonce(const address& addr) const noexcept
@@ -157,9 +161,11 @@ bytes32 Host::get_code_hash(const address& addr) const noexcept
 }
 
 size_t Host::copy_code(const address& addr, size_t code_offset, uint8_t* buffer_data,
-    size_t buffer_size) const noexcept
+    size_t buffer_size, void* acc_in) const noexcept
 {
-    const auto code = m_state.get_code(addr);
+    const auto code = acc_in != nullptr ?
+                          m_state.get_code(*static_cast<Account*>(acc_in), addr) :
+                          m_state.get_code(addr);
     const auto code_slice = code.substr(std::min(code_offset, code.size()));
     const auto num_bytes = std::min(buffer_size, code_slice.size());
     std::copy_n(code_slice.begin(), num_bytes, buffer_data);
@@ -304,7 +310,8 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     return evmc::Result{result.status_code, gas_left, result.gas_refund, state_gas};
 }
 
-evmc::Result Host::execute_message(const evmc_message& msg) noexcept
+evmc::Result Host::execute_message(
+    const evmc_message& msg, void* acc_recipient, void* acc_code, void* acc_sender) noexcept
 {
     if (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2)
         return create(msg);
@@ -315,20 +322,30 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
     {
         if (evmc::is_zero(msg.value))
         {
-            recipient_acc_ptr = &m_state.touch(msg.recipient);
+            recipient_acc_ptr = acc_recipient != nullptr ?
+                                    &m_state.touch(*static_cast<Account*>(acc_recipient),
+                                        msg.recipient) :
+                                    &m_state.touch(msg.recipient);
         }
         else
         {
             // We skip touching if we send value, because account cannot end up empty.
             // It will either have value, or code that transfers this value out, or will be
             // selfdestructed anyway.
-            auto& recipient_acc = m_state.get_or_create(msg.recipient).first;
+            auto& recipient_acc = acc_recipient != nullptr ?
+                                      m_state
+                                          .get_or_create(
+                                              *static_cast<Account*>(acc_recipient), msg.recipient)
+                                          .first :
+                                      m_state.get_or_create(msg.recipient).first;
             recipient_acc_ptr = &recipient_acc;
 
             // Transfer value: sender → recipient.
             // The sender's balance is already checked therefore the sender account must exist.
             const auto value = intx::be::load<intx::uint256>(msg.value);
-            auto& sender_acc = m_state.get(msg.sender);
+            auto& sender_acc = acc_sender != nullptr ?
+                                   m_state.get(*static_cast<Account*>(acc_sender), msg.sender) :
+                                   m_state.get(msg.sender);
             assert(!sender_acc.nonexistent);
             assert(sender_acc.balance >= value);
             m_state.journal_balance_change(sender_acc);
@@ -347,29 +364,33 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
 
     // A call that runs the recipient's own code (not a delegated one) has its account already,
     // and the node stays where it is through the inserts since.
-    const auto& code_acc = (msg.kind == EVMC_CALL && runs_recipient_code(msg)) ?
-                               *recipient_acc_ptr :
-                               m_state.get(msg.code_address);
+    Account* code_acc;
+    if (msg.kind == EVMC_CALL && runs_recipient_code(msg))
+        code_acc = recipient_acc_ptr;
+    else if (acc_code != nullptr)
+        code_acc = &m_state.get(*static_cast<Account*>(acc_code), msg.code_address);
+    else
+        code_acc = &m_state.get(msg.code_address);
     // A nonexistent account has the empty code hash, so it needs no separate check.
-    if (code_acc.code_hash == Account::EMPTY_CODE_HASH)  // Skip trivial execution.
+    if (code_acc->code_hash == Account::EMPTY_CODE_HASH)  // Skip trivial execution.
         return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     if (my_vm->has_cached_execution())
     {
-        return my_vm->execute_cached_code(*this, m_rev, msg, code_acc.code_hash,
+        return my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
             [this](const address& addr) { return m_state.get_code(addr); });
     }
 
-    // TODO: get_code() performs the account lookup. Add a way to get an account with code?
-    const auto code = m_state.get_code(msg.code_address);
+    const auto code = m_state.get_code(*code_acc, msg.code_address);
     if (code.empty())  // Skip trivial execution.
         return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
     return m_vm.execute(*this, m_rev, msg, code.data(), code.size());
 }
 
-evmc::Result Host::call(const evmc_message& msg) noexcept
+evmc::Result Host::call(
+    const evmc_message& msg, void* acc_recipient, void* acc_code, void* acc_sender) noexcept
 {
     if (msg.depth != 0 && (msg.kind == EVMC_CREATE || msg.kind == EVMC_CREATE2))
     {
@@ -384,7 +405,7 @@ evmc::Result Host::call(const evmc_message& msg) noexcept
     const auto logs_checkpoint = m_logs.size();
     const auto state_checkpoint = m_state.checkpoint();
 
-    auto result = execute_message(msg);
+    auto result = execute_message(msg, acc_recipient, acc_code, acc_sender);
 
     if (result.status_code != EVMC_SUCCESS)
     {
@@ -453,7 +474,7 @@ void Host::emit_log(const address& addr, const uint8_t* data, size_t data_size,
 #endif
 }
 
-evmc_access_status Host::access_account(const address& addr) noexcept
+evmc_access_status Host::access_account(const address& addr, void** acc_out) noexcept
 {
     if (m_rev < EVMC_BERLIN)
         return EVMC_ACCESS_COLD;  // Ignore before Berlin.
@@ -462,6 +483,8 @@ evmc_access_status Host::access_account(const address& addr) noexcept
         return EVMC_ACCESS_WARM;
 
     auto& acc = m_state.access(addr);
+    if (acc_out != nullptr)
+        *acc_out = &acc;  // Stable node: nothing erases accounts mid-transaction.
     if (acc.access_status == EVMC_ACCESS_WARM)
         return EVMC_ACCESS_WARM;
 

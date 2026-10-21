@@ -28,12 +28,12 @@ enum class Delegation
 /// address to code_addr (which the caller has set to addr) and applies the gas charge for accessing
 /// the delegate account, which may fail with out of gas.
 inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& code_addr,
-    int64_t& gas_left, ExecutionState& state) noexcept
+    int64_t& gas_left, ExecutionState& state, void* acc_in) noexcept
 {
     if (state.rev < EVMC_PRAGUE)
         return Delegation::none;
 
-    const auto delegate_addr = get_delegate_address(state.host, addr);
+    const auto delegate_addr = get_delegate_address(state.host, addr, state.cpp_host, acc_in);
     if (!delegate_addr)
         return Delegation::none;
 
@@ -61,10 +61,11 @@ inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& co
 /// Sends the message of a CALL or CREATE to the host. Through the C callback the C++ Host's
 /// evmc::Result is released to a raw evmc_result and wrapped again in HostContext::call, two
 /// copies of the result per call; the same virtual call on the C++ Host returns it as is.
-inline evmc::Result host_call(ExecutionState& state, const evmc_message& msg) noexcept
+inline evmc::Result host_call(ExecutionState& state, const evmc_message& msg,
+    void* acc_recipient = nullptr, void* acc_code = nullptr, void* acc_sender = nullptr) noexcept
 {
     if (state.cpp_host != nullptr) [[likely]]
-        return state.cpp_host->call(msg);
+        return state.cpp_host->call(msg, acc_recipient, acc_code, acc_sender);
     return state.host.call(msg);
 }
 
@@ -220,30 +221,43 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
-    if (state.rev >= EVMC_BERLIN && state.host.access_account(dst) == EVMC_ACCESS_COLD)
+    void* dst_acc = nullptr;  // The dst account node from the host.
+    if (state.rev >= EVMC_BERLIN)
     {
-        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
-            return {EVMC_OUT_OF_GAS, gas_left};
+        const auto status = state.cpp_host != nullptr ?
+                                state.cpp_host->access_account(dst, &dst_acc) :
+                                state.host.access_account(dst);
+        if (status == EVMC_ACCESS_COLD)
+        {
+            if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
+                return {EVMC_OUT_OF_GAS, gas_left};
+        }
     }
 
     msg.code_address = dst;
-    const auto delegation = resolve_delegation(dst, msg.code_address, gas_left, state);
+    const auto delegation = resolve_delegation(dst, msg.code_address, gas_left, state, dst_acc);
     if (delegation == Delegation::out_of_gas)
         return {EVMC_OUT_OF_GAS, gas_left};
 
     bool new_account_charged = false;  // NOLINT(*-const-correctness)
     if constexpr (Op == OP_CALL)
     {
-        if ((has_value || state.rev < EVMC_SPURIOUS_DRAGON) && !state.host.account_exists(dst))
+        if (has_value || state.rev < EVMC_SPURIOUS_DRAGON)
         {
-            if (state.rev >= EVMC_AMSTERDAM)
+            const bool exists = state.cpp_host != nullptr ?
+                                    state.cpp_host->account_exists(dst, dst_acc) :
+                                    state.host.account_exists(dst);
+            if (!exists)
             {
-                if (!state.state_gas.charge(gas_left, NEW_ACCOUNT_STATE_GAS))
+                if (state.rev >= EVMC_AMSTERDAM)
+                {
+                    if (!state.state_gas.charge(gas_left, NEW_ACCOUNT_STATE_GAS))
+                        return {EVMC_OUT_OF_GAS, gas_left};
+                    new_account_charged = true;
+                }
+                else if ((gas_left -= ACCOUNT_CREATION_COST) < 0)
                     return {EVMC_OUT_OF_GAS, gas_left};
-                new_account_charged = true;
             }
-            else if ((gas_left -= ACCOUNT_CREATION_COST) < 0)
-                return {EVMC_OUT_OF_GAS, gas_left};
         }
     }
 
@@ -304,7 +318,11 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
         {
             msg.gas += CALL_STIPEND;
             gas_left += CALL_STIPEND;
-            if (intx::be::load<uint256>(state.host.get_balance(state.msg->recipient)) < value)
+            const auto sender_balance = state.cpp_host != nullptr ?
+                                            state.cpp_host->get_balance(
+                                                state.msg->recipient, state.acc_handle) :
+                                            state.host.get_balance(state.msg->recipient);
+            if (intx::be::load<uint256>(sender_balance) < value)
             {
                 if (new_account_charged)
                     state.state_gas.refill(gas_left, NEW_ACCOUNT_STATE_GAS);
@@ -316,7 +334,11 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
     if (state.rev < EVMC_OSAKA && state.msg->depth >= 1024)
         return {EVMC_SUCCESS, gas_left};  // "Light" failure.
 
-    auto result = host_call(state, msg);
+    void* const acc_recipient =
+        (Op == OP_CALL || Op == OP_STATICCALL) ? dst_acc : state.acc_handle;
+    void* const acc_code = (delegation != Delegation::delegated) ? dst_acc : nullptr;
+    void* const acc_sender = (Op == OP_DELEGATECALL) ? nullptr : state.acc_handle;
+    auto result = host_call(state, msg, acc_recipient, acc_code, acc_sender);
 #ifdef EVMONE_WORD_LAYOUT
     state.return_data.take(result);
 #else

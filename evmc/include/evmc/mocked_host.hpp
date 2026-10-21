@@ -147,7 +147,7 @@ private:
 
 public:
     /// Returns true if an account exists (EVMC Host method).
-    bool account_exists(const address& addr) const noexcept override
+    bool account_exists(const address& addr, void* /*acc_in*/ = nullptr) const noexcept override
     {
         record_account_access(addr);
         return accounts.count(addr) != 0;
@@ -314,7 +314,7 @@ public:
     }
 
     /// Get the account's balance (EVMC Host method).
-    uint256be get_balance(const address& addr) const noexcept override
+    uint256be get_balance(const address& addr, void* /*acc_in*/ = nullptr) const noexcept override
     {
         record_account_access(addr);
         const auto it = accounts.find(addr);
@@ -359,7 +359,8 @@ public:
     size_t copy_code(const address& addr,
                      size_t code_offset,
                      uint8_t* buffer_data,
-                     size_t buffer_size) const noexcept override
+                     size_t buffer_size,
+                     void* /*acc_in*/ = nullptr) const noexcept override
     {
         record_account_access(addr);
         const auto it = accounts.find(addr);
@@ -388,7 +389,8 @@ public:
     }
 
     /// Call/create other contract (EVMC host method).
-    Result call(const evmc_message& msg) noexcept override
+    Result call(const evmc_message& msg, void* /*acc_recipient*/ = nullptr,
+        void* /*acc_code*/ = nullptr, void* /*acc_sender*/ = nullptr) noexcept override
     {
         record_account_access(msg.recipient);
 
@@ -448,7 +450,8 @@ public:
     /// @param addr  The address of the accessed account.
     /// @returns     The ::EVMC_ACCESS_WARM if the account has been accessed before,
     ///              the ::EVMC_ACCESS_COLD otherwise.
-    evmc_access_status access_account(const address& addr) noexcept override
+    evmc_access_status access_account(
+        const address& addr, void** /*acc_out*/ = nullptr) noexcept override
     {
         // Check if the address have been already accessed.
         const auto already_accessed =
