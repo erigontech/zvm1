@@ -455,6 +455,9 @@ static inline ALWAYS_INLINE void absorb_words(uint64_t* state, size_t words, str
     if (r->misalign == 0)
     {
         const uint8_t* const data = r->data;
+#if defined(ZISK)
+#pragma GCC unroll 16
+#endif
         for (size_t i = 0; i < words; ++i)
             state[i] ^= load_le_word(data + i * WORD_SIZE);
         r->data = data + words * WORD_SIZE;
@@ -465,6 +468,16 @@ static inline ALWAYS_INLINE void absorb_words(uint64_t* state, size_t words, str
             state[i] ^= read_unaligned_word(r);
     }
 }
+
+#if defined(ZISK)
+/// One 17-word block, fully unrolled.
+static inline ALWAYS_INLINE void absorb_block_ptr(uint64_t* state, const uint8_t* data)
+{
+#pragma GCC unroll 17
+    for (size_t i = 0; i < 17; ++i)
+        state[i] ^= load_le_word(data + i * WORD_SIZE);
+}
+#endif
 
 /// Rotates the bits of x left by the count value specified by s.
 /// The s must be in range <0, 64> exclusively, otherwise the result is undefined.
@@ -751,6 +764,21 @@ static inline ALWAYS_INLINE void absorb_input(
 {
     struct word_reader reader = init_word_reader(data, size, misalign);
 
+#if defined(ZISK)
+    if (misalign == 0 && block_words == 17)
+    {
+        const uint8_t* base = reader.data;
+        while (size >= block_words * WORD_SIZE)
+        {
+            absorb_block_ptr(state, base);
+            keccakf1600_best(state);
+            base += block_words * WORD_SIZE;
+            size -= block_words * WORD_SIZE;
+        }
+        reader.data = base;
+    }
+    else
+#endif
     while (size >= block_words * WORD_SIZE)
     {
         absorb_words(state, block_words, &reader);
@@ -815,14 +843,21 @@ static NO_INLINE void* zisk_dma(void* dst, const void* src, size_t n)
 /// Short input: stores plus pad, no XOR.
 static inline ALWAYS_INLINE void keccak_build_short(uint64_t* state, const uint8_t* data, size_t size)
 {
-    __builtin_memset(state, 0, 25 * WORD_SIZE);
     const size_t words = size / WORD_SIZE;
     const size_t rem = size % WORD_SIZE;
     const uint64_t bit = (uint64_t)1 << (rem * 8);
-    for (size_t i = 0; i < words; ++i)
-        state[i] = load_le_word(data + i * WORD_SIZE);
+    size_t i = 0;
+    if (words != 0)
+    {
+        zisk_dma(state, data, words * WORD_SIZE);
+        i = words;
+    }
     // Reads past the input; masked out.
-    state[words] = rem != 0 ? (load_le_word(data + words * WORD_SIZE) & (bit - 1)) | bit : bit;
+    state[i] = rem != 0 ? (load_le_word(data + i * WORD_SIZE) & (bit - 1)) | bit : bit;
+    ++i;
+#pragma GCC unroll 8
+    for (; i < 25; ++i)
+        state[i] = 0;
 }
 #endif
 
@@ -1097,12 +1132,14 @@ union ethash_hash256 ethash_keccak256_snap(
         zisk_dma(state, data, block_words * WORD_SIZE);
         __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
         keccakf1600_best(state);
-        reader.data = data + block_words * WORD_SIZE;
+        const uint8_t* base = data + block_words * WORD_SIZE;
         for (size_t b = 1; b < blocks; ++b)
         {
-            absorb_words(state, block_words, &reader);
+            absorb_block_ptr(state, base);
             keccakf1600_best(state);
+            base += block_words * WORD_SIZE;
         }
+        reader.data = base;
     }
     else
         __builtin_memset(state, 0, 25 * WORD_SIZE);
@@ -1168,7 +1205,11 @@ union ethash_hash256 ethash_keccak256_cap(const uint8_t* data, size_t size,
     if (init_blocks == 0)
     {
         // Zero state: first block copies, not XORs.
+#if defined(ZISK)
+        zisk_dma(state, data, block_words * WORD_SIZE);
+#else
         __builtin_memcpy(state, data, block_words * WORD_SIZE);
+#endif
         __builtin_memset(state + block_words, 0, (25 - block_words) * WORD_SIZE);
         keccakf1600_best(state);
         depth = 1;
@@ -1179,7 +1220,11 @@ union ethash_hash256 ethash_keccak256_cap(const uint8_t* data, size_t size,
     }
     else
     {
+#if defined(ZISK)
+        zisk_dma(state, init, 25 * WORD_SIZE);
+#else
         __builtin_memcpy(state, init, 25 * WORD_SIZE);
+#endif
         depth = init_blocks;
         d = data + init_blocks * block_words * WORD_SIZE;
         sz = size - init_blocks * block_words * WORD_SIZE;
@@ -1190,19 +1235,39 @@ union ethash_hash256 ethash_keccak256_cap(const uint8_t* data, size_t size,
     const size_t nb_to_capture =
         capture_at > depth ? capture_at - depth : nb_total;
     const size_t nb_a = nb_to_capture < nb_total ? nb_to_capture : nb_total;
+#if defined(ZISK)
+    const uint8_t* base = d;
+    for (size_t b = 0; b < nb_a; ++b)
+    {
+        absorb_block_ptr(state, base);
+        keccakf1600_best(state);
+        base += block_words * WORD_SIZE;
+    }
+#else
     for (size_t b = 0; b < nb_a; ++b)
     {
         absorb_words(state, block_words, &reader);
         keccakf1600_best(state);
     }
+#endif
     depth += nb_a;
     if (depth == capture_at)
         __builtin_memcpy(out_state, state, 25 * WORD_SIZE);
+#if defined(ZISK)
+    for (size_t b = nb_a; b < nb_total; ++b)
+    {
+        absorb_block_ptr(state, base);
+        keccakf1600_best(state);
+        base += block_words * WORD_SIZE;
+    }
+    reader.data = base;
+#else
     for (size_t b = nb_a; b < nb_total; ++b)
     {
         absorb_words(state, block_words, &reader);
         keccakf1600_best(state);
     }
+#endif
     sz -= nb_total * block_words * WORD_SIZE;
     const size_t last_words = sz / WORD_SIZE;
     absorb_words(state, last_words, &reader);
