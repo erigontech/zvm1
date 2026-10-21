@@ -507,6 +507,26 @@ inline bool check_memory(
 namespace instr::core
 {
 
+/// Low limb first: most values are nonzero.
+inline bool is_zero_fast(const uint256& x) noexcept
+{
+    if (x[0] != 0) [[likely]]
+        return false;
+    return (x[1] | x[2] | x[3]) == 0;
+}
+
+/// High limb first: unequal usually differ high.
+inline bool eq_fast(const uint256& a, const uint256& b) noexcept
+{
+    if (a[3] != b[3])
+        return false;
+    if (a[2] != b[2])
+        return false;
+    if (a[1] != b[1])
+        return false;
+    return a[0] == b[0];
+}
+
 /// The "core" instruction implementations.
 ///
 /// These are minimal EVM instruction implementations which assume:
@@ -674,7 +694,7 @@ inline void div(StackTop stack) noexcept
 inline void div(StackTop stack) noexcept
 {
     auto& v = stack[1];
-    if (v == 0) [[unlikely]]
+    if (is_zero_fast(v)) [[unlikely]]
     {
         v = 0;
         return;
@@ -900,7 +920,11 @@ inline void mulmod(StackTop stack) noexcept
     const auto& y = stack[1];
     auto& m = stack[2];
 
+#if defined(ZISK)
+    if (is_zero_fast(m)) [[unlikely]]
+#else
     if (m == 0) [[unlikely]]
+#endif
     {
         m = 0;
         return;
@@ -1255,6 +1279,8 @@ inline void eq(StackTop stack) noexcept
     register uint32_t r12 asm("x12") = 0x20;  // EQ
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
     stack[1] = uint64_t{r12 != 0};
+#elif defined(ZISK)
+    stack[1] = uint64_t{eq_fast(stack[0], stack[1])};
 #else
     stack[1] = uint64_t{stack[0] == stack[1]};
 #endif
@@ -1278,6 +1304,9 @@ inline void iszero(StackTop stack) noexcept
     // Slow path: low 64 bits are zero, check remaining.
     const uint32_t upper = w[2] | w[3] | w[4] | w[5] | w[6] | w[7];
     x = uint64_t{upper == 0};
+#elif defined(ZISK)
+    auto& x = stack.top();
+    x = uint64_t{is_zero_fast(x)};
 #else
     // Direct word check avoids constructing a uint256{0} for comparison.
     auto& x = stack.top();

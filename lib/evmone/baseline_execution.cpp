@@ -1257,12 +1257,20 @@ template <Opcode Op>
     const auto& a = pos.stack_end[-1];
     bool taken;
     if constexpr (Op == OP_ISZERO)
+#if defined(ZISK)
+        taken = instr::core::is_zero_fast(a);
+#else
         taken = a == 0;
+#endif
     else
     {
         const auto& b = pos.stack_end[-2];
         if constexpr (Op == OP_EQ)
+#if defined(ZISK)
+            taken = instr::core::eq_fast(a, b);
+#else
             taken = a == b;
+#endif
         else if constexpr (Op == OP_LT)
             taken = a < b;
         else if constexpr (Op == OP_GT)
