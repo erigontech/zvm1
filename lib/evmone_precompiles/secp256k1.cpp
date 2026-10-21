@@ -546,11 +546,24 @@ constexpr sp1_AffinePoint sp1_G = {
 #endif
 
 /// Add non-zero p to non-zero r with first-limb fast reject on x-coordinate.
-[[gnu::always_inline]] inline bool sp1_secp256k1_add_nz(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
+/// cached: hot add writes only p2.
+[[gnu::always_inline]] inline bool sp1_secp256k1_add_nz(sp1_AffinePoint r, const sp1_AffinePoint p
+#if defined(ZISK)
+    , zisk::InOutParams* cached = nullptr
+#endif
+    ) noexcept
 {
     // Quick reject on first limb of x-coordinate (~1/2^64 false positive).
     if (r[0] != p[0]) [[likely]]
     {
+#if defined(ZISK)
+        if (cached != nullptr) [[likely]]
+        {
+            cached->p2 = p;
+            zisk::secp256k1_add(*cached);
+            return true;
+        }
+#endif
         syscall_secp256k1_add(r, p);
         return true;
     }
@@ -765,15 +778,39 @@ inline void sp1_negate(sp1_AffinePoint r) noexcept
     y = Curve::FIELD_PRIME - y;
 }
 
+#if defined(ZISK)
+struct Spread8
+{
+    uint64_t v[256];
+};
+
+constexpr Spread8 make_spread8() noexcept
+{
+    Spread8 t{};
+    for (unsigned b = 0; b < 256; ++b)
+        for (unsigned i = 0; i < 8; ++i)
+            if ((b >> i) & 1)
+                t.v[b] |= 1ULL << (4 * i);
+    return t;
+}
+
+inline constexpr Spread8 SPREAD8 = make_spread8();
+#endif
+
 /// Spreads the 16 bits of x to bits 0, 4, 8, ..., 60.
 inline uint64_t spread4(uint64_t x) noexcept
 {
+#if defined(ZISK)
+    const unsigned lo = static_cast<unsigned>(x) & 0xffU;
+    return SPREAD8.v[lo] | (SPREAD8.v[(static_cast<unsigned>(x) >> 8) & 0xffU] << 32);
+#else
     x &= 0xffff;
     x = (x | (x << 24)) & 0x000000ff000000ff;
     x = (x | (x << 12)) & 0x000f000f000f000f;
     x = (x | (x << 6)) & 0x0303030303030303;
     x = (x | (x << 3)) & 0x1111111111111111;
     return x;
+#endif
 }
 
 /// SP1 u×G + v×Q with the GLV endomorphism. Falls back to sp1_msm() when a table entry is the
@@ -857,6 +894,47 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
     --left;
 
     bool nz = true;
+#if defined(ZISK)
+    zisk::InOutParams ap{r, nullptr};
+    auto step = [&]() noexcept {
+        const auto idx = static_cast<unsigned>(dw >> 60);
+        dw <<= 4;
+        if (nz) [[likely]]
+        {
+            syscall_secp256k1_double(r);
+            if (idx != 0)
+                nz = sp1_secp256k1_add_nz(r, t[idx], &ap);
+        }
+        else
+        {
+            // Accumulator at infinity: identity-safe ops.
+            if (idx != 0)
+                sp1_secp256k1_add(r, t[idx]);
+            nz = !is_zero(r);
+        }
+    };
+    for (;;)
+    {
+        // Unroll 4: amortise the nibble counter.
+        while (left >= 4)
+        {
+            step();
+            step();
+            step();
+            step();
+            left -= 4;
+        }
+        while (left != 0)
+        {
+            step();
+            --left;
+        }
+        if (--w < 0)
+            break;
+        dw = d[w];
+        left = 16;
+    }
+#else
     for (;;)
     {
         for (; left != 0; --left)
@@ -882,6 +960,7 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
         dw = d[w];
         left = 16;
     }
+#endif
 }
 #endif
 }  // namespace
