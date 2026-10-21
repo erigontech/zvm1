@@ -1435,13 +1435,17 @@ template <typename W>
 [[nodiscard]] inline size_t index_of(const W* w, size_t n, W tail, W s) noexcept
 {
 #ifdef ZISK
-    W h = s * MULT;
+    // xor fold; full compare decides hits
+    W h = s;
+    for (size_t i = 0; i + 1 < n; ++i)
+        h ^= w[i];
+    h = (h ^ tail) * MULT;
 #else
     W h = s;
-#endif
     for (size_t i = 0; i + 1 < n; ++i)
         h = (h ^ w[i]) * MULT;
     h = (h ^ tail) * MULT;
+#endif
     return static_cast<size_t>(h >> (8 * sizeof(W) - BITS));
 }
 
@@ -1521,9 +1525,10 @@ inline void fill(Slot& slot, const W* w, size_t n, W tail, W s, const W* value) 
     const auto o = reinterpret_cast<word_t*>(&out);
     if (s == 64) [[likely]]
     {
-        word_t h = word_t{64} * MULT;
+        word_t h = 64;
         for (int i = 0; i < 8; ++i)
-            h = (h ^ w[i]) * MULT;
+            h ^= w[i];
+        h *= MULT;
         auto& slot = table()[h >> (8 * sizeof(word_t) - BITS)];
         if (slot.size == 64 && slot.key[0] == w[0] && slot.key[1] == w[1] && slot.key[2] == w[2] &&
             slot.key[3] == w[3] && slot.key[4] == w[4] && slot.key[5] == w[5] &&
