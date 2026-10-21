@@ -14,7 +14,11 @@ using evmc::uint256be;
 
 class Host : public evmc::Host
 {
+#if defined(ZISK)
+    int64_t m_rev = 0;
+#else
     evmc_revision m_rev;
+#endif
     evmc::VM& m_vm;
     State& m_state;
     const BlockInfo& m_block;

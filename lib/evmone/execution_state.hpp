@@ -237,7 +237,11 @@ public:
     evmc::Host* cpp_host = nullptr;
     /// Recipient's host account node; seeded by reset().
     void* acc_handle = nullptr;
+#if defined(ZISK)
+    int64_t rev = 0;  // 4-byte loads cost 122 on ZisK.
+#else
     evmc_revision rev = {};
+#endif
 #ifdef EVMONE_WORD_LAYOUT
     wl::ReturnData return_data;
     /// The init code of the frame's CREATE in byte order, for as long as the call that runs it.
@@ -249,7 +253,11 @@ public:
     /// Reference to original EVM code.
     bytes_view original_code;
 
+#if defined(ZISK)
+    int64_t status = EVMC_SUCCESS;
+#else
     evmc_status_code status = EVMC_SUCCESS;
+#endif
     size_t output_offset = 0;
     size_t output_size = 0;
 
@@ -362,7 +370,7 @@ inline evmc::Result make_execution_result(ExecutionState& state, int64_t gas_lef
     assert(state.output_size != 0 || state.output_offset == 0);
 #ifdef EVMONE_WORD_LAYOUT
     // One named result on every path, so that it is constructed in the return slot (NRVO).
-    evmc::Result result{state.status, gas_left, gas_refund, state.state_gas};
+    evmc::Result result{static_cast<evmc_status_code>(state.status), gas_left, gas_refund, state.state_gas};
     if (state.output_size != 0)
     {
         // The output leaves the frame in the layout its consumer reads: the W data of phase 0 for
@@ -393,7 +401,7 @@ inline evmc::Result make_execution_result(ExecutionState& state, int64_t gas_lef
     }
     return result;
 #else
-    return evmc::Result{state.status, gas_left, gas_refund,
+    return evmc::Result{static_cast<evmc_status_code>(state.status), gas_left, gas_refund,
         state.output_size != 0 ? &state.memory[state.output_offset] : nullptr, state.output_size,
         state.state_gas};
 #endif

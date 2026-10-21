@@ -32,7 +32,7 @@ class State
 
     struct JournalAccountFlags : JournalBase
     {
-        evmc_access_status access_status;
+        AccessStatus access_status;
         bool nonexistent;
         bool destructed;
         bool erase_if_empty;
@@ -42,7 +42,7 @@ class State
     {
         StorageValue* slot = nullptr;  ///< Storage slot in a node-based container (stable refs).
         bytes32 prev_value;
-        evmc_access_status prev_access_status;
+        AccessStatus prev_access_status;
         bool prev_loaded;  ///< A slot warmed before loading has no value to restore.
     };
 

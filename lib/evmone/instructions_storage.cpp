@@ -176,7 +176,7 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
         evmc_access_status access;
         status = state.cpp_host->sstore(recipient, evmc::internal::as_cpp(&key),
             evmc::internal::as_cpp(&value), access, state.acc_handle, &state.acc_handle);
-        gas_cost_cold = access == EVMC_ACCESS_COLD ? STORAGE_COST_SPEC[state.rev].cold : 0;
+        gas_cost_cold = access == EVMC_ACCESS_COLD ? STORAGE_COST_SPEC[static_cast<evmc_revision>(state.rev)].cold : 0;
     }
     else
     {
@@ -184,13 +184,13 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
             (state.rev >= EVMC_BERLIN &&
                 state.host.access_storage(recipient, evmc::internal::as_cpp(&key)) ==
                     EVMC_ACCESS_COLD) ?
-                STORAGE_COST_SPEC[state.rev].cold :
+                STORAGE_COST_SPEC[static_cast<evmc_revision>(state.rev)].cold :
                 0;
         status = state.host.set_storage(
             recipient, evmc::internal::as_cpp(&key), evmc::internal::as_cpp(&value));
     }
 
-    const auto [gas_cost_warm, gas_refund] = SSTORE_COSTS[state.rev][status];
+    const auto [gas_cost_warm, gas_refund] = SSTORE_COSTS[static_cast<evmc_revision>(state.rev)][status];
     const auto gas_cost = gas_cost_warm + gas_cost_cold;
 
     if ((gas_left -= gas_cost) < 0)

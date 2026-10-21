@@ -16,6 +16,13 @@ using evmc::bytes;
 using evmc::bytes32;
 using namespace evmc::literals;
 
+#if defined(ZISK)
+/// u64: aligned 8-byte loads on ZisK.
+using AccessStatus = std::uint64_t;
+#else
+using AccessStatus = evmc_access_status;
+#endif
+
 /// The representation of the account storage value.
 struct StorageValue
 {
@@ -25,7 +32,7 @@ struct StorageValue
     /// The original value.
     bytes32 original;
 
-    evmc_access_status access_status = EVMC_ACCESS_COLD;
+    AccessStatus access_status = EVMC_ACCESS_COLD;
 
     /// The value has been loaded from the initial state.
     /// A slot may be warmed (EIP-2929) but not read (EIP-7928).
@@ -63,7 +70,7 @@ struct Account
 
     /// The account access status (EIP-2929): warm once accessed earlier in the transaction.
     /// Revertible.
-    evmc_access_status access_status = EVMC_ACCESS_COLD;
+    AccessStatus access_status = EVMC_ACCESS_COLD;
 
     /// The account has been loaded from the initial state by its first read.
     /// Warming (EIP-2929) is not a read (EIP-7928).

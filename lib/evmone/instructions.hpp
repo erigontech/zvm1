@@ -1753,7 +1753,7 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(static_cast<evmc_revision>(state.rev))) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -2066,7 +2066,7 @@ inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(static_cast<evmc_revision>(state.rev))) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -2090,7 +2090,7 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(static_cast<evmc_revision>(state.rev))) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -2169,7 +2169,7 @@ inline Result extcodehash(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
+        if ((gas_left -= additional_cold_account_access(static_cast<evmc_revision>(state.rev))) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -2906,7 +2906,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(beneficiary) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= cold_account_access(state.rev)) < 0)
+        if ((gas_left -= cold_account_access(static_cast<evmc_revision>(state.rev))) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 

@@ -39,7 +39,7 @@ inline Delegation resolve_delegation(const evmc::address& addr, evmc_address& co
 
     const auto delegate_account_access_cost =
         (state.host.access_account(*delegate_addr) == EVMC_ACCESS_COLD ?
-                cold_account_access(state.rev) :
+                cold_account_access(static_cast<evmc_revision>(state.rev)) :
                 WARM_ACCESS);
 
     if ((gas_left -= delegate_account_access_cost) < 0)
@@ -229,7 +229,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
                                 state.host.access_account(dst);
         if (status == EVMC_ACCESS_COLD)
         {
-            if ((gas_left -= additional_cold_account_access(state.rev)) < 0)
+            if ((gas_left -= additional_cold_account_access(static_cast<evmc_revision>(state.rev))) < 0)
                 return {EVMC_OUT_OF_GAS, gas_left};
         }
     }

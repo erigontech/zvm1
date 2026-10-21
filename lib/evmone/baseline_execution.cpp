@@ -2885,12 +2885,12 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 
-    const auto& cost_table = get_baseline_cost_table(state.rev);
+    const auto& cost_table = get_baseline_cost_table(static_cast<evmc_revision>(state.rev));
 
     auto* tracer = vm.get_tracer();
     if (INTX_UNLIKELY(tracer != nullptr))
     {
-        tracer->notify_execution_start(state.rev, *state.msg, code);
+        tracer->notify_execution_start(static_cast<evmc_revision>(state.rev), *state.msg, code);
         gas = dispatch<true>(cost_table, state, gas, code_begin, tracer);
     }
     else

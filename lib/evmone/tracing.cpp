@@ -163,7 +163,7 @@ class InstructionTracer : public Tracer
         m_out << R"("pc":)" << std::dec << pc;
         m_out << R"(,"op":)" << std::dec << int{opcode};
         m_out << R"(,"gas":"0x)" << std::hex << gas << '"';
-        m_out << R"(,"gasCost":"0x)" << std::hex << instr::gas_costs[state.rev][opcode] << '"';
+        m_out << R"(,"gasCost":"0x)" << std::hex << instr::gas_costs[static_cast<evmc_revision>(state.rev)][opcode] << '"';
 
         // Full memory can be dumped as evmc::hex({state.memory.data(), state.memory.size()}),
         // but this should not be done by default. Adding --tracing=+memory option would be nice.

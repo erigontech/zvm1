@@ -260,7 +260,7 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     create_msg.input_size = 0;
     const bytes_view initcode{msg.input_data, msg.input_size};
     m_frame_acc = &new_acc;  // Seed the initcode frame.
-    auto result = m_vm.execute(*this, m_rev, create_msg, initcode.data(), initcode.size());
+    auto result = m_vm.execute(*this, static_cast<evmc_revision>(m_rev), create_msg, initcode.data(), initcode.size());
     if (result.status_code != EVMC_SUCCESS)
         return result;
 
@@ -362,8 +362,8 @@ evmc::Result Host::execute_message(
     }
 
     // Calls to precompile address via EIP-7702 delegation execute empty code instead of precompile.
-    if ((msg.flags & EVMC_DELEGATED) == 0 && is_precompile(m_rev, msg.code_address))
-        return call_precompile(m_rev, msg);
+    if ((msg.flags & EVMC_DELEGATED) == 0 && is_precompile(static_cast<evmc_revision>(m_rev), msg.code_address))
+        return call_precompile(static_cast<evmc_revision>(m_rev), msg);
 
     // A call that runs the recipient's own code (not a delegated one) has its account already,
     // and the node stays where it is through the inserts since.
@@ -383,7 +383,7 @@ evmc::Result Host::execute_message(
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     if (my_vm->has_cached_execution())
     {
-        return my_vm->execute_cached_code(*this, m_rev, msg, code_acc->code_hash,
+        return my_vm->execute_cached_code(*this, static_cast<evmc_revision>(m_rev), msg, code_acc->code_hash,
             [this](const address& addr) { return m_state.get_code(addr); });
     }
 
@@ -391,7 +391,7 @@ evmc::Result Host::execute_message(
     if (code.empty())  // Skip trivial execution.
         return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
-    return m_vm.execute(*this, m_rev, msg, code.data(), code.size());
+    return m_vm.execute(*this, static_cast<evmc_revision>(m_rev), msg, code.data(), code.size());
 }
 
 evmc::Result Host::call(
@@ -484,7 +484,7 @@ evmc_access_status Host::access_account(const address& addr, void** acc_out) noe
     if (m_rev < EVMC_BERLIN)
         return EVMC_ACCESS_COLD;  // Ignore before Berlin.
 
-    if (is_precompile(m_rev, addr))  // Precompiles are always warm. Don't insert to state.
+    if (is_precompile(static_cast<evmc_revision>(m_rev), addr))  // Precompiles are always warm. Don't insert to state.
         return EVMC_ACCESS_WARM;
 
     auto& acc = m_state.access(addr);
@@ -541,7 +541,7 @@ evmc_storage_status Host::sstore(const address& addr, const bytes32& key, const 
         *acc_out = &acc;
     assert(acc.loaded && !acc.nonexistent);
     auto& slot = acc.storage[key];
-    access = slot.access_status;
+    access = static_cast<evmc_access_status>(slot.access_status);
     if (access == EVMC_ACCESS_COLD)
     {
         m_state.journal_storage_change(slot);
