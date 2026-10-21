@@ -165,6 +165,20 @@ public:
     /// The executable code. This is where the interpreter should start execution.
     [[nodiscard]] bytes_view code() const noexcept { return m_code; }
 
+#if defined(ZISK)
+    /// The JUMPDEST map, for dispatch's register copy.
+    [[nodiscard]] JumpdestMap jumpdest_map() const noexcept { return m_jumpdest_map; }
+
+    /// check_jumpdest() on register copies.
+    [[nodiscard]] bool check_jumpdest_in(
+        JumpdestMap map, uint64_t size, uint64_t position) const noexcept
+    {
+        if (position >= size) [[unlikely]]
+            return false;
+        return map.test(position);
+    }
+#endif
+
     /// Check if given position is valid jump destination. Use only for legacy code.
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     // On rv32im, callers already verified position fits in 32 bits.

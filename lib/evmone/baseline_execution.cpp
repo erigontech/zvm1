@@ -247,6 +247,31 @@ struct JumpBase
         __builtin_unreachable();
     return target;
 }
+#elif defined(ZISK)
+/// The jump probe's analysis reads, in registers.
+struct JumpBase
+{
+    BitsetSpan map;
+    uint64_t size;
+    code_iterator code1;
+};
+
+[[gnu::always_inline]] inline JumpBase jump_base(
+    const uint8_t*, const ExecutionState& state) noexcept
+{
+    const auto& a = *state.analysis.baseline;
+    return {a.jumpdest_map(), a.code().size(), a.code().data() + 1};
+}
+
+/// The position after the landing JUMPDEST at dst.
+[[gnu::always_inline]] inline code_iterator landing(const JumpBase& jb, uint64_t dst) noexcept
+{
+    const auto target = jb.code1 + dst;
+    // Never null; lets GCC drop checks.
+    if (target == nullptr)
+        __builtin_unreachable();
+    return target;
+}
 #else
 struct JumpBase
 {};
@@ -1087,11 +1112,33 @@ template <Opcode Op>
 #endif
 
 #if EVMONE_JUMP_SKIPS_JUMPDEST
+/// check_jumpdest() on the register copy.
+[[gnu::always_inline]] inline bool jump_dest_ok(
+    const CodeAnalysis& analysis, JumpBase jb, uint64_t dst) noexcept
+{
+#if defined(ZISK)
+    return analysis.check_jumpdest_in(jb.map, jb.size, dst);
+#else
+    return analysis.check_jumpdest(dst);
+#endif
+}
+
+/// Past the landing JUMPDEST.
+[[gnu::always_inline]] inline code_iterator jump_landing(
+    JumpBase jb, const CodeAnalysis& analysis, uint64_t dst) noexcept
+{
+#if defined(ZISK)
+    return landing(jb, dst);
+#else
+    return analysis.code().data() + dst + 1;
+#endif
+}
+
 /// The taken jump of a fused sequence to the PUSH2 immediate at imm, its gas paid: resumes after
 /// the JUMPDEST at the destination, as jump_impl() does, or fails on a bad destination. Returns
 /// true, the fused sequence handled.
 [[gnu::always_inline]] inline bool jump_to(
-    const uint8_t* imm, Position& pos, ExecutionState& state) noexcept
+    const uint8_t* imm, Position& pos, ExecutionState& state, JumpBase jb) noexcept
 {
     // Two byte loads, a shift and an or: without the barrier GCC takes the two bytes for a
     // big-endian halfword and expands its byte swap, 9 instructions without Zbb.
@@ -1099,13 +1146,13 @@ template <Opcode Op>
     asm("" : "+r"(dst));
     dst = dst << 8 | imm[1];
     const auto& analysis = *state.analysis.baseline;
-    if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+    if (INTX_UNLIKELY(!jump_dest_ok(analysis, jb, dst)))
     {
         state.status = EVMC_BAD_JUMP_DESTINATION;
         pos.code_it = nullptr;
         return true;
     }
-    pos.code_it = analysis.code().data() + dst + 1;
+    pos.code_it = jump_landing(jb, analysis, dst);
     return true;
 }
 
@@ -1118,7 +1165,8 @@ template <Opcode Op>
 /// gas or JUMPI's underflow fails first depending on the gas left. The rv32 dispatch has its own
 /// form, fused_push2_jump() above.
 [[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state,
+    JumpBase jb) noexcept
 {
     static constexpr auto PUSH2_GAS = instr::gas_costs[EVMC_FRONTIER][OP_PUSH2];
     static constexpr auto JUMP_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMP];
@@ -1147,7 +1195,7 @@ template <Opcode Op>
     {
         if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMP_GAS + instr::core::JUMPDEST_GAS) < 0))
             return fail(EVMC_OUT_OF_GAS);
-        return jump_to(c + 1, pos, state);
+        return jump_to(c + 1, pos, state, jb);
     }
     if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
         return false;
@@ -1158,7 +1206,7 @@ template <Opcode Op>
     {
         if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMPI_GAS + instr::core::JUMPDEST_GAS) < 0))
             return fail(EVMC_OUT_OF_GAS);
-        return jump_to(c + 1, pos, state);
+        return jump_to(c + 1, pos, state, jb);
     }
     if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMPI_GAS) < 0))
         return fail(EVMC_OUT_OF_GAS);
@@ -1177,7 +1225,7 @@ template <Opcode Op>
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
     const uint256* bottom1, const uint256* stack_limit, Position& pos, int64_t& gas,
-    ExecutionState& state) noexcept
+    ExecutionState& state, JumpBase jb) noexcept
 {
     static_assert(Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT || Op == OP_SLT ||
                   Op == OP_SGT);
@@ -1234,7 +1282,7 @@ template <Opcode Op>
     }
     if (INTX_UNLIKELY((gas -= GAS + instr::core::JUMPDEST_GAS) < 0))
         return fail(EVMC_OUT_OF_GAS);
-    return jump_to(c + 2, pos, state);
+    return jump_to(c + 2, pos, state, jb);
 }
 #endif
 
@@ -1244,7 +1292,7 @@ template <Opcode Op>
 /// with the checks of fused_cmp_push2_jumpi(): the comparison pops one, so nothing can overflow.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* bottom1,
-    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    Position& pos, int64_t& gas, ExecutionState& state, JumpBase jb) noexcept
 {
     static_assert(Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT);
     static constexpr auto GAS = 3 + 3 + instr::gas_costs[EVMC_FRONTIER][OP_PUSH2] +
@@ -1288,14 +1336,15 @@ template <Opcode Op>
     }
     if (INTX_UNLIKELY((gas -= GAS + instr::core::JUMPDEST_GAS) < 0))
         return fail(EVMC_OUT_OF_GAS);
-    return jump_to(c + 3, pos, state);
+    return jump_to(c + 3, pos, state, jb);
 }
 #endif
 
 #if EVMONE_ZISK_SELECTOR_FUSION
 /// Solidity dispatcher arm, one step.
 [[gnu::always_inline]] inline bool fused_selector_arm(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state,
+    JumpBase jb) noexcept
 {
     static constexpr auto PUSH4_GAS = instr::gas_costs[EVMC_FRONTIER][OP_PUSH4];
     static constexpr auto EQ_GAS = instr::gas_costs[EVMC_FRONTIER][OP_EQ];
@@ -1338,7 +1387,7 @@ template <Opcode Op>
         pos.code_it += 10;
         return true;
     }
-    return jump_to(c + 7, pos, state);
+    return jump_to(c + 7, pos, state, jb);
 }
 #endif
 
@@ -1352,7 +1401,7 @@ template <Opcode Op, bool TracingEnabled>
     // Not with a tracer attached: it is to see each instruction.
     if constexpr (Op == OP_PUSH2 && !TracingEnabled)
     {
-        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state, jb))
             return pos;
     }
     else if constexpr ((Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT ||
@@ -1362,10 +1411,10 @@ template <Opcode Op, bool TracingEnabled>
         if constexpr (Op != OP_ISZERO && Op != OP_EQ)
         {
             // ISZERO first: it follows each of them more often than PUSH2 does.
-            if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state))
+            if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state, jb))
                 return pos;
         }
-        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state))
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state, jb))
             return pos;
     }
 #if EVMONE_ZISK_SELECTOR_FUSION
@@ -1373,8 +1422,69 @@ template <Opcode Op, bool TracingEnabled>
     {
         // One byte first: most PUSH4s mask.
         if (pos.code_it[5] == OP_EQ) [[unlikely]]
-            if (fused_selector_arm(stack_bottom, stack_limit, pos, gas, state))
+            if (fused_selector_arm(stack_bottom, stack_limit, pos, gas, state, jb))
                 return pos;
+    }
+#endif
+#if defined(ZISK)
+    else if constexpr ((Op == OP_JUMP || Op == OP_JUMPI) && !TracingEnabled)
+    {
+        // Bare jumps: no analysis loads.
+        static constexpr auto JUMPI_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+        if constexpr (Op == OP_JUMP)
+        {
+            if (INTX_UNLIKELY(pos.stack_end <= stack_bottom))
+            {
+                state.status = EVMC_STACK_UNDERFLOW;
+                return {nullptr, pos.stack_end};
+            }
+            gas -= instr::gas_costs[EVMC_FRONTIER][OP_JUMP] + instr::core::JUMPDEST_GAS;
+            if (INTX_UNLIKELY(gas < 0))
+            {
+                state.status = EVMC_OUT_OF_GAS;
+                return {nullptr, pos.stack_end};
+            }
+        }
+        else
+        {
+            if (INTX_UNLIKELY(pos.stack_end <= bottom1))
+            {
+                state.status = EVMC_STACK_UNDERFLOW;
+                return {nullptr, pos.stack_end};
+            }
+            if (INTX_UNLIKELY(gas < 0))
+            {
+                state.status = EVMC_OUT_OF_GAS;
+                return {nullptr, pos.stack_end};
+            }
+            if (!pos.stack_end[-2])  // Not taken: pays 10, steps over.
+            {
+                if (INTX_UNLIKELY((gas -= JUMPI_GAS) < 0))
+                {
+                    state.status = EVMC_OUT_OF_GAS;
+                    return {nullptr, pos.stack_end - 2};
+                }
+                return {pos.code_it + 1, pos.stack_end - 2};
+            }
+            if (INTX_UNLIKELY((gas -= JUMPI_GAS + instr::core::JUMPDEST_GAS) < 0))
+            {
+                state.status = EVMC_OUT_OF_GAS;
+                return {nullptr, pos.stack_end - 2};
+            }
+        }
+        const auto& analysis = *state.analysis.baseline;
+        const auto& dst = pos.stack_end[-1];
+        const uint64_t offset = dst[0];
+        if (INTX_UNLIKELY((dst[1] | dst[2] | dst[3]) != 0 ||
+                          !jump_dest_ok(analysis, jb, offset)))
+        {
+            state.status = EVMC_BAD_JUMP_DESTINATION;
+            return {nullptr, pos.stack_end};
+        }
+        if constexpr (Op == OP_JUMP)
+            return {jump_landing(jb, analysis, offset), pos.stack_end - 1};
+        else
+            return {jump_landing(jb, analysis, offset), pos.stack_end - 2};
     }
 #endif
 #endif
@@ -2261,7 +2371,7 @@ constexpr bool zswap2_fuses(Opcode op) noexcept
 /// SWAP1 + Op, swap not yet made.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool zswap1_then(const uint256* bottom2, const uint256* stack_limit,
-    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    Position& pos, int64_t& gas, ExecutionState& state, JumpBase jb) noexcept
 {
     static_assert(instr::has_const_gas_cost(OP_POP) && instr::has_const_gas_cost(OP_JUMP) &&
                   instr::has_const_gas_cost(OP_SWAP2) && instr::has_const_gas_cost(OP_DUP2));
@@ -2288,11 +2398,11 @@ template <Opcode Op>
         const auto& dst = s[-2];
         const uint64_t offset = dst[0];
         const auto& analysis = *state.analysis.baseline;
-        if (INTX_UNLIKELY((dst[1] | dst[2] | dst[3]) != 0 || !analysis.check_jumpdest(offset)))
+        if (INTX_UNLIKELY((dst[1] | dst[2] | dst[3]) != 0 || !jump_dest_ok(analysis, jb, offset)))
             return fail(EVMC_BAD_JUMP_DESTINATION);
         s[-2] = s[-1];
         pos.stack_end = s - 1;
-        pos.code_it = analysis.code().data() + offset + 1;  // Past the paid-for JUMPDEST.
+        pos.code_it = jump_landing(jb, analysis, offset);  // Past the paid-for JUMPDEST.
         return true;
     }
     else if constexpr (Op == OP_SWAP2)
@@ -2643,7 +2753,7 @@ ZPUSH1_THEN_UNDEFINED:
     ZSWAP1_THEN_##OPCODE : ASM_COMMENT(ZSWAP1_##OPCODE);                                         \
     if constexpr (zswap1_fuses(OPCODE))                                                          \
     {                                                                                            \
-        if (!zswap1_then<OPCODE>(bottom2, stack_limit, position, gas, state))                    \
+        if (!zswap1_then<OPCODE>(bottom2, stack_limit, position, gas, state, jb))                \
             return gas;                                                                          \
         goto* CGOTO(*position.code_it);                                                          \
     }                                                                                            \
