@@ -43,8 +43,15 @@ inline constexpr auto ADDITIONAL_COLD_STORAGE_ACCESS = COLD_STORAGE_ACCESS - WAR
 /// @}
 
 
+// 2-byte loads cost 122 on ZisK.
+#if defined(ZISK)
+using GasCost = int64_t;
+#else
+using GasCost = int16_t;
+#endif
+
 /// The table of instruction gas costs per EVM revision.
-using GasCostTable = std::array<std::array<int16_t, 256>, EVMC_MAX_REVISION + 1>;
+using GasCostTable = std::array<std::array<GasCost, 256>, EVMC_MAX_REVISION + 1>;
 
 /// The EVM revision specific table of EVM instructions gas costs. For instructions undefined
 /// in given EVM revision, the value is instr::undefined.

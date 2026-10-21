@@ -65,13 +65,13 @@ namespace
 /// unconditional. JUMPI cannot know until the condition is popped, so it charges nothing here --
 /// a const cost of zero compiles the check below away, leaving one check on either path.
 template <Opcode Op>
-inline constexpr int16_t DISPATCH_GAS_COST = instr::gas_costs[EVMC_FRONTIER][Op];
+inline constexpr instr::GasCost DISPATCH_GAS_COST = instr::gas_costs[EVMC_FRONTIER][Op];
 #if EVMONE_JUMP_SKIPS_JUMPDEST
 template <>
-inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMP> =
+inline constexpr instr::GasCost DISPATCH_GAS_COST<OP_JUMP> =
     instr::gas_costs[EVMC_FRONTIER][OP_JUMP] + instr::core::JUMPDEST_GAS;
 template <>
-inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMPI> = 0;
+inline constexpr instr::GasCost DISPATCH_GAS_COST<OP_JUMPI> = 0;
 
 static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP_JUMPI),
     "the jump instructions must charge a compile-time constant gas cost");

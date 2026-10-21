@@ -5,10 +5,11 @@
 
 #include <evmc/evmc.h>
 #include <array>
+#include "instructions_traits.hpp"
 
 namespace evmone::baseline
 {
-using CostTable = std::array<int16_t, 256>;
+using CostTable = std::array<instr::GasCost, 256>;
 
 const CostTable& get_baseline_cost_table(evmc_revision rev) noexcept;
 }  // namespace evmone::baseline
