@@ -12,7 +12,7 @@
 
 #ifdef SP1
 #include <sp1_syscalls.hpp>
-#elif defined(ZISK)
+#elif defined(ZISK) || defined(EVMONE_ZISK_MODEL_TEST)
 #include <zisk_precompiles.hpp>
 #endif
 
@@ -680,7 +680,7 @@ void modexp_sp1(std::span<const uint8_t> base_bytes, std::span<const uint8_t> ex
     const auto offset = 32 - mod_bytes.size();
     std::copy_n(&tmp[offset], mod_bytes.size(), output);
 }
-#elif defined(ZISK)
+#elif defined(ZISK) || defined(EVMONE_ZISK_MODEL_TEST)
 void modexp_zisk(std::span<const uint8_t> base_bytes, const Exponent& exp,
     std::span<const uint8_t> mod_bytes, uint8_t* output) noexcept
 {
@@ -731,26 +731,44 @@ void modexp_zisk(std::span<const uint8_t> base_bytes, const Exponent& exp,
                     return (e[n - 1 - (d >> 1)] >> (4 * (d & 1))) & 15u;
                 };
 
-                zisk::ArithModParams psq[2] = {
+                // [0,1] square, [2,3] multiply, by parity.
+                zisk::ArithModParams P[4] = {
                     {&r[0][0], &r[0][0], z, m, &r[1][0]},
                     {&r[1][0], &r[1][0], z, m, &r[0][0]},
+                    {&r[0][0], &t[0][0], z, m, &r[1][0]},
+                    {&r[1][0], &t[0][0], z, m, &r[0][0]},
                 };
-                zisk::ArithModParams pmul{&r[0][0], &t[1][0], z, m, &r[1][0]};
+                static_assert(sizeof(zisk::ArithModParams) == 40);
+
+                // Pre-rolled digits; exponents >256 bits keep nib().
+                uint8_t nb[64];
+                const bool tabled = D <= 64;
+                if (tabled)
+                {
+                    size_t j = 0;
+                    for (const uint8_t* bp = e + n; j + 1 < D;)
+                    {
+                        const uint8_t byte = *--bp;
+                        nb[j++] = byte & 15;
+                        if (j + 1 < D)
+                            nb[j++] = byte >> 4;
+                    }
+                }
+
                 const auto sq = [&]() noexcept {
-                    zisk::csrs<0x802>(&psq[p]);
+                    zisk::csrs<0x802>(&P[p]);
                     p ^= 1;
                 };
                 const auto mul = [&](unsigned g) noexcept {
-                    pmul.a = &r[p][0];
-                    pmul.b = &t[g][0];
-                    pmul.d = &r[p ^ 1][0];
-                    zisk::csrs<0x802>(&pmul);
+                    auto* pm = &P[2 + p];  // .a/.d already match r[p]
+                    pm->b = &t[g][0];
+                    zisk::csrs<0x802>(pm);
                     p ^= 1;
                 };
 
-                psq[0].a = psq[0].b = &t[nib(D - 1)][0];
+                P[0].a = P[0].b = &t[nib(D - 1)][0];
                 sq();
-                psq[0].a = psq[0].b = &r[0][0];
+                P[0].a = P[0].b = &r[0][0];
                 sq();
                 sq();
                 sq();
@@ -762,7 +780,7 @@ void modexp_zisk(std::span<const uint8_t> base_bytes, const Exponent& exp,
                     sq();
                     sq();
                     sq();
-                    if (const unsigned g = nib(d - 1))
+                    if (const unsigned g = tabled ? nb[d - 1] : nib(d - 1))
                         mul(g);
                 }
             }
@@ -817,7 +835,7 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
         modexp_sp1(base_bytes, exp_bytes, mod_bytes, output);
         return;
     }
-#elif defined(ZISK)
+#elif defined(ZISK) || defined(EVMONE_ZISK_MODEL_TEST)
     if (std::max(mod_bytes.size(), base_bytes.size()) <= 32)
     {
         modexp_zisk(base_bytes, exp, mod_bytes, output);

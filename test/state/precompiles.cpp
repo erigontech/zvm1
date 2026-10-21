@@ -517,7 +517,8 @@ ExecutionResult expmod_execute(
 #endif
 }
 
-#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
+// ZISK: defined in zisk_precompiles.hpp.
+#if (defined(SP1TURBO) || defined(SP1)) && !defined(ZISK)
 namespace
 {
 using intx::uint256;
@@ -585,6 +586,10 @@ void sp1_bn_mul(sp1_AffinePoint r, const sp1_AffinePoint p, uint256 c) noexcept
 }  // namespace
 #endif
 
+#if defined(ZISK)
+static_assert(zisk::kBn254P == crypto::bn254::Curve::FIELD_PRIME);
+static_assert(zisk::kBn254N == crypto::bn254::Curve::ORDER);
+#endif
 
 ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
@@ -595,6 +600,17 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (input_size != 0)
         std::memcpy(input_buffer, input, std::min(input_size, std::size(input_buffer)));
 
+#if defined(ZISK)
+    sp1_AffinePoint sp1_p;
+    sp1_AffinePoint sp1_q;
+    sp1_point_from_bytes(sp1_p, input_buffer);
+    sp1_point_from_bytes(sp1_q, input_buffer + 64);
+    if (!zisk::bn254_point_valid(sp1_p) || !zisk::bn254_point_valid(sp1_q)) [[unlikely]]
+        return {EVMC_PRECOMPILE_FAILURE, 0};
+    zisk::sp1_bn_add(sp1_p, sp1_q);
+    sp1_point_to_bytes(output, sp1_p);
+    return {EVMC_SUCCESS, 64};
+#else
     const auto input_span = std::span{input_buffer};
 
     using namespace crypto::bn254;
@@ -606,7 +622,7 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (!validate(*p) || !validate(*q)) [[unlikely]]
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
+#if defined(SP1TURBO) || defined(SP1)
     {
         sp1_AffinePoint sp1_p;
         sp1_AffinePoint sp1_q;
@@ -622,6 +638,7 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
     res.to_bytes(output_span);
     return {EVMC_SUCCESS, output_span.size()};
 #endif
+#endif
 }
 
 ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* output,
@@ -633,6 +650,18 @@ ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (input_size != 0)
         std::memcpy(input_buffer, input, std::min(input_size, std::size(input_buffer)));
 
+    const auto c = intx::be::unsafe::load<intx::uint256>(input_buffer + 64);
+
+#if defined(ZISK)
+    sp1_AffinePoint sp1_p;
+    sp1_point_from_bytes(sp1_p, input_buffer);
+    if (!zisk::bn254_point_valid(sp1_p)) [[unlikely]]
+        return {EVMC_PRECOMPILE_FAILURE, 0};
+    sp1_AffinePoint sp1_r;
+    zisk::sp1_bn_mul(sp1_r, sp1_p, c);
+    sp1_point_to_bytes(output, sp1_r);
+    return {EVMC_SUCCESS, 64};
+#else
     const auto input_span = std::span{input_buffer};
 
     using namespace crypto::bn254;
@@ -641,9 +670,7 @@ ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (!p.has_value() || !validate(*p)) [[unlikely]]
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-    const auto c = intx::be::unsafe::load<uint256>(input_buffer + 64);
-
-#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
+#if defined(SP1TURBO) || defined(SP1)
     {
         sp1_AffinePoint sp1_p;
         sp1_point_from_bytes(sp1_p, input_buffer);
@@ -657,6 +684,7 @@ ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* 
     const std::span<uint8_t, 64> output_span{output, 64};
     res.to_bytes(output_span);
     return {EVMC_SUCCESS, output_span.size()};
+#endif
 #endif
 }
 
