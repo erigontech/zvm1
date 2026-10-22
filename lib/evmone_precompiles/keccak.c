@@ -879,31 +879,6 @@ static inline ALWAYS_INLINE void keccak(
     }
 }
 
-#if defined(SP1)
-/// Keccak-256 of an input that fits one absorb block (size < 136 bytes, the block of
-/// keccak-256): zero the state, copy the input in with the guest's word-wise memcpy,
-/// store the pad bytes and permute once. The copy loop stays straight-line (a variable
-/// bound plus a variable tail makes GCC unroll the word loop into a branch chain, which
-/// measured slower than the copy), and every input alignment takes the same path.
-static inline ALWAYS_INLINE union ethash_hash256 keccak256_single_block(
-    const uint8_t* data, size_t size)
-{
-    union ethash_hash256 hash;
-    uint64_t state[25];
-    __builtin_memset(state, 0, sizeof(state));
-    __builtin_memcpy(state, data, size);
-    uint8_t* const sb = (uint8_t*)(void*)state;
-    sb[size] = 0x01;  // The pad byte; size < 136 keeps it inside the block.
-    state[16] |= 0x8000000000000000ULL;  // The block-end bit, lane 16's top byte.
-    keccakf1600_best(state);
-    hash.word64s[0] = to_le64(state[0]);
-    hash.word64s[1] = to_le64(state[1]);
-    hash.word64s[2] = to_le64(state[2]);
-    hash.word64s[3] = to_le64(state[3]);
-    return hash;
-}
-#endif  // SP1
-
 #if defined(AIRBENDER)
 /// Keccak-256 of a short input (size < 136: a single block), left in buf[0..3]. The state is buf[]
 /// as in keccak(), so ethash_keccak256() stores the hash from it and ethash_keccak256_eq() compares
@@ -977,10 +952,6 @@ static inline ALWAYS_INLINE void keccak256_short_into_buf(const uint8_t* data, s
 union ethash_hash256 ethash_keccak256(const uint8_t* data, size_t size)
 {
     union ethash_hash256 hash;
-#if defined(SP1)
-    if (size < 17 * WORD_SIZE) [[likely]]
-        return keccak256_single_block(data, size);
-#endif
 #if defined(AIRBENDER)
     // For keccak-256: block_size = (1600 - 256*2) / 8 = 136 bytes.
     // Most EVM inputs are < 136 bytes (single block). Specialize.
@@ -1355,10 +1326,6 @@ NO_INLINE union ethash_hash256 ethash_keccak256_full_branch(uint64_t* slot, size
 union ethash_hash256 ethash_keccak256_32(const uint8_t data[32])
 {
     union ethash_hash256 hash;
-#if defined(SP1)
-    // 32 bytes is one absorb block: the same single-permutation path as ethash_keccak256().
-    return keccak256_single_block(data, 32);
-#endif
 #if defined(AIRBENDER)
     // Write directly to the CSR-aligned static buffer — skip the state→buf→state copies.
     {
