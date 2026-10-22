@@ -351,17 +351,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t data_size) noe
                 ASSERT_EQ(evmc::uint256be{m1.value}, evmc::uint256be{m2.value});
             }
 
-            // assert(std::equal(ref_host.recorded_logs.begin(), ref_host.recorded_logs.end(),
-                host.recorded_logs.begin(), host.recorded_logs.end()));
-
-                ASSERT_EQ(ref_host.recorded_blockhashes.size(), host.recorded_blockhashes.size());
-                // assert(std::equal(ref_host.recorded_blockhashes.begin(),
-                ref_host.recorded_blockhashes.end(), host.recorded_blockhashes.begin(),
-                host.recorded_blockhashes.end()));
-
-                // assert(std::equal(ref_host.recorded_selfdestructs.begin(),
-                ref_host.recorded_selfdestructs.end(), host.recorded_selfdestructs.begin(),
-                host.recorded_selfdestructs.end()));
+            ASSERT_EQ(ref_host.recorded_logs.size(), host.recorded_logs.size());
+            ASSERT_EQ(ref_host.recorded_blockhashes.size(), host.recorded_blockhashes.size());
+            ASSERT_EQ(ref_host.recorded_selfdestructs.size(), host.recorded_selfdestructs.size());
 
                 // TODO: Enable account accesses check. Currently this is not possible because Aleth
                 //       is doing additional unnecessary account existence checks in calls.

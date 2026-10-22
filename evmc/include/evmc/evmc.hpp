@@ -185,7 +185,7 @@ inline constexpr uint64_t fnv1a_by64(uint64_t h, uint64_t x) noexcept
 /// The "equal to" comparison operator for the evmc::address type.
 inline constexpr bool operator==(const address& a, const address& b) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
+#if defined(SP1) || defined(AIRBENDER)
     typedef uint32_t __attribute__((may_alias)) W;
     const W* const aw = reinterpret_cast<const W*>(&a);
     const W* const bw = reinterpret_cast<const W*>(&b);
@@ -238,7 +238,7 @@ inline constexpr bool operator>=(const address& a, const address& b) noexcept
 /// The "equal to" comparison operator for the evmc::bytes32 type.
 inline constexpr bool operator==(const bytes32& a, const bytes32& b) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
+#if defined(SP1) || defined(AIRBENDER)
     typedef size_t __attribute__((may_alias)) W;
     const W* const aw = reinterpret_cast<const W*>(&a);
     const W* const bw = reinterpret_cast<const W*>(&b);
@@ -1028,7 +1028,7 @@ struct hash<evmc::address>
         // Saves 4 loads + 5 multiplies.
         typedef uint32_t __attribute__((may_alias)) W;
         return *reinterpret_cast<const W*>(&s.bytes[16]);
-#elif defined(SP1TURBO) || defined(SP1)
+#elif defined(SP1)
         using W = uint32_t;
         const auto sw = reinterpret_cast<const W*>(&s);
 
@@ -1059,7 +1059,7 @@ struct hash<evmc::bytes32>
         // the first word would map to a single bucket. Saves 7 loads + 8 multiplies per lookup.
         typedef uint32_t __attribute__((may_alias)) W;
         return *reinterpret_cast<const W*>(&s.bytes[28]);
-#elif defined(SP1TURBO) || defined(SP1)
+#elif defined(SP1)
         using W = size_t;
         const auto sw = reinterpret_cast<const W*>(&s);
 

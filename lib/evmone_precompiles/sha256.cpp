@@ -169,17 +169,7 @@ static bool calc_chunk(uint8_t chunk[CHUNK_SIZE], struct BufferState* state)
 
         const uint8_t* p = chunk;
 
-#ifdef SP1TURBO
-        uint32_t w[64];
-        for (j = 0; j < 16; j++)
-        {
-            w[j] =
-                (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
-            p += 4;
-        }
-        syscall_sha256_extend(w);
-        syscall_sha256_compress(w, h);
-#elif defined(SP1)
+#if defined(SP1)
         uint64_t w[64];
         uint64_t h_sp1[8];
         for (j = 0; j < 8; j++)

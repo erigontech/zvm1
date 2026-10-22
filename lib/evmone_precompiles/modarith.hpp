@@ -580,7 +580,7 @@ class ModArith
 public:
     constexpr explicit ModArith(const UintT& mod) noexcept
       : mod_{mod},
-#if defined SP1 || defined SP1TURBO
+#if defined SP1
         r_squared_{BN ? 1 : compute_r_squared(mod)},
         mod_inv_{BN ? 0 : compute_mont_mod_inv(mod)}
 #elif defined(AIRBENDER) && defined(__riscv)
@@ -604,7 +604,7 @@ public:
     /// what gives aR²R⁻¹ % mod = aR % mod.
     constexpr UintT to_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO
+#if defined SP1
         if constexpr (BN)
             return x;
         else
@@ -618,7 +618,7 @@ public:
     /// Montgomery multiplication mul(x, 1) what gives aRR⁻¹ % mod = a % mod.
     constexpr UintT from_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO
+#if defined SP1
         if constexpr (BN)
             return x;
         else
@@ -684,7 +684,7 @@ public:
     /// The result (abR) is in Montgomery form.
     constexpr UintT mul(const UintT& x, const UintT& y) const noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (BN)
         {
             UintT res = x;
@@ -1194,7 +1194,7 @@ public:
     /// Performs a modular addition.
     constexpr UintT add(const UintT& x, const UintT& y) const noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (BN)
         {
             UintT res = x;
@@ -1266,7 +1266,7 @@ public:
     /// Performs a modular subtraction.
     constexpr UintT sub(const UintT& x, const UintT& y) const noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (BN)
         {
             UintT res = x;

@@ -68,6 +68,13 @@ int ethash_keccak256_read_verify(ethash_w32* dst, size_t size, const ethash_w32*
 #endif
 #endif
 
+#if defined(__riscv) && __riscv_xlen == 64
+/// Keccak-256 of the 64 bytes at @p data, which must be 8-byte aligned, memoized (the mapping
+/// slots keccak(key . slot), see keccak.c). Stores the hash to @p out as the big-endian number,
+/// in little-endian words (the uint256 KECCAK256 pushes).
+void ethash_keccak256_64_memo(uint64_t out[4], const uint64_t* data) noexcept;
+#endif
+
 #ifdef __cplusplus
 }
 #endif

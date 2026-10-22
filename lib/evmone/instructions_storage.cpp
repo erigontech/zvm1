@@ -107,7 +107,11 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     auto& x = stack.top();
     // The conversion writes all 32 bytes, so the key needs no zero-initialization. Words of
     // zero are skipped on rv32: most keys and values have few significant words.
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     alignas(4) evmc_bytes32 key;
+#else
+    evmc_bytes32 key;
+#endif
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     intx::be::unsafe::store_aligned(key.bytes, x);
 #else
@@ -157,8 +161,16 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     if (state.rev >= EVMC_ISTANBUL && gas_left <= CALL_STIPEND)
         return {EVMC_OUT_OF_GAS, gas_left};
 
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     alignas(4) evmc_bytes32 key;
+#else
+    evmc_bytes32 key;
+#endif
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     alignas(4) evmc_bytes32 value;
+#else
+    evmc_bytes32 value;
+#endif
 #if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     intx::be::unsafe::store_aligned(key.bytes, stack.pop());
     intx::be::unsafe::store_aligned(value.bytes, stack.pop());

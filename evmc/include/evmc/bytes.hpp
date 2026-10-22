@@ -59,6 +59,12 @@ struct byte_traits : std::char_traits<char>
     /// Copies count bytes from src to dest. The ranges must not overlap.
     static constexpr char_type* copy(char_type* dest, const char_type* src, std::size_t count)
     {
+        // memcpy() requires non-null arguments even for count == 0; LOG0 copies an
+        // empty log from a null pointer (found by the z6m state-transition fuzzer
+        // under UBSan). Only the empty case is skipped: a null pointer with a real
+        // count must still crash.
+        if (count == 0)
+            return dest;
         if (__builtin_is_constant_evaluated())
             std::copy_n(src, count, dest);
         else
@@ -82,6 +88,12 @@ struct byte_traits : std::char_traits<char>
         }
         else
         {
+            // memcmp() requires non-null arguments even for count == 0; empty views of
+            // null-terminated storage compare as equal here (found by the evmone fuzzer
+            // under UBSan). Only the empty case is skipped: a null pointer with a real
+            // count must still crash.
+            if (count == 0)
+                return 0;
             return std::memcmp(a, b, count);
         }
     }
