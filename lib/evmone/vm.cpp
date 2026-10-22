@@ -111,6 +111,12 @@ VM::VM() noexcept
     next_stack_segment();
 }
 
+void VM::place_frame_near_end(int64_t gas, size_t room) noexcept
+{
+    if (room < FRAME_STRIDE + max_memory_size(gas))
+        next_stack_segment();
+}
+
 void VM::next_stack_segment() noexcept
 {
     if (!stack_segments.empty())

@@ -2119,7 +2119,7 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
     // stack and the EVM memory its gas can pay for do not fit. The memory borrows the rest of
     // the segment as its initial backing. If memory grows past this (only with more gas than a
     // transaction can have), Memory transparently falls back to a heap allocation.
-    auto* const bottom = vm.place_frame(VM::FRAME_STRIDE + VM::max_memory_size(msg.gas));
+    auto* const bottom = vm.place_frame(msg.gas);
     state.stack_segment = vm.stack_segment;
     state.stack_bottom = reinterpret_cast<uint256*>(bottom);
     auto* const mem_buf = reinterpret_cast<uint8_t*>(bottom + VM::FRAME_STRIDE);

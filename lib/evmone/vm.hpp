@@ -176,18 +176,23 @@ public:
                          reinterpret_cast<std::byte*>(caller.stack_bottom) + FRAME_STRIDE;
     }
 
-    /// Places a frame reserving @p size bytes: at the stack tail if it fits in the current
-    /// segment, otherwise at the start of the next segment (allocated if needed).
-    /// Returns the frame bottom; the frame's space ends at the current segment's end.
-    [[nodiscard]] std::byte* place_frame(size_t size) noexcept
+    /// Places a frame with the gas limit @p gas, reserving its stack and the EVM memory the gas
+    /// can pay for: at the stack tail if it fits in the current segment, otherwise at the start
+    /// of the next segment (allocated if needed). Returns the frame bottom; the frame's space
+    /// ends at the current segment's end. The reservation is computed only when the segment has
+    /// less room than the largest one, which is rare: the segment is almost twice as big.
+    [[nodiscard]] std::byte* place_frame(int64_t gas) noexcept
     {
-        if (size > static_cast<size_t>(stack_segments[stack_segment].end - stack_tail))
-            [[unlikely]]
-            next_stack_segment();
+        const auto room = static_cast<size_t>(stack_segments[stack_segment].end - stack_tail);
+        if (room < FRAME_STRIDE + MAX_RESERVED_MEMORY) [[unlikely]]
+            place_frame_near_end(gas, room);
         return stack_tail;
     }
 
 private:
+    /// The place_frame() path when the segment has less room than the largest reservation.
+    [[gnu::cold]] void place_frame_near_end(int64_t gas, size_t room) noexcept;
+
     /// Moves the stack tail to the start of the next stack segment, allocating it if needed.
     [[gnu::cold]] void next_stack_segment() noexcept;
 
