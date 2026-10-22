@@ -2108,24 +2108,24 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
     state.reset(msg, rev, host, ctx, code);
     state.vm = &vm;
 
-    // Top-level entry: rewind the dense buffer to the base.
+    // Top-level entry: rewind to the start of the first stack segment.
     if (msg.depth == 0)
-        vm.stack_tail = vm.stack_buffer_storage;
+    {
+        vm.stack_segment = 0;
+        vm.stack_tail = vm.stack_segments[0].begin;
+    }
 
-    // This frame's stack lives at the current tail; its EVM memory borrows
-    // the rest of the buffer as its initial backing, short of a stack slot for
-    // each deeper frame. The tail then never passes the slot of its depth, so
-    // the stack of every frame up to MAX_DEPTH fits. If memory grows past
-    // this, Memory transparently falls back to a heap allocation.
-    const auto depth = static_cast<size_t>(msg.depth);
-    assert(depth <= VM::MAX_DEPTH);
-    state.stack_bottom = reinterpret_cast<uint256*>(vm.stack_tail);
-    auto* const mem_buf =
-        reinterpret_cast<uint8_t*>(vm.stack_tail + VM::FRAME_STRIDE);
-    auto* const mem_end = reinterpret_cast<uint8_t*>(
-        vm.stack_buffer_end() - (VM::MAX_DEPTH - depth) * VM::FRAME_STRIDE);
-    state.memory.set_borrowed(
-        mem_buf, mem_buf < mem_end ? static_cast<size_t>(mem_end - mem_buf) : 0);
+    // This frame's stack lives at the current tail, or at the start of the next segment if its
+    // stack and the EVM memory its gas can pay for do not fit. The memory borrows the rest of
+    // the segment as its initial backing. If memory grows past this (only with more gas than a
+    // transaction can have), Memory transparently falls back to a heap allocation.
+    auto* const bottom = vm.place_frame(VM::FRAME_STRIDE + VM::max_memory_size(msg.gas));
+    state.stack_segment = vm.stack_segment;
+    state.stack_bottom = reinterpret_cast<uint256*>(bottom);
+    auto* const mem_buf = reinterpret_cast<uint8_t*>(bottom + VM::FRAME_STRIDE);
+    state.memory.set_borrowed(mem_buf,
+        static_cast<size_t>(
+            reinterpret_cast<uint8_t*>(vm.stack_segments[vm.stack_segment].end) - mem_buf));
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 

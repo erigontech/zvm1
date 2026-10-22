@@ -9,8 +9,12 @@
 #include "tracing.hpp"
 #include <evmc/evmc.h>
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
+#include <cstdlib>
 #include <list>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -87,54 +91,106 @@ public:
 class VM : public evmc_vm
 {
 public:
-    /// EVM call depth limit (1024) and max EVM stack items per frame (1024).
-    /// The buffer covers MAX_DEPTH + 1 frame slots at depths 0..MAX_DEPTH: a frame at
-    /// depth MAX_DEPTH still runs (it just cannot call deeper).
-    static constexpr size_t MAX_DEPTH = 1024;
+    /// Max EVM stack items per frame (1024).
     static constexpr size_t MAX_STACK_PER_FRAME = 1024;
 
-    /// Per-frame stride in bytes — exactly the live stack space.
-    /// Frame N's bottom is at `stack_buffer_storage + N * FRAME_STRIDE`.
+    /// The stack space of a frame in bytes: its EVM memory starts after it.
     static constexpr size_t FRAME_STRIDE = MAX_STACK_PER_FRAME * sizeof(intx::uint256);
     static_assert(FRAME_STRIDE == 0x8000);
 
     bool cgoto = EVMONE_CGOTO_SUPPORTED;
 
-    /// The part of the buffer beyond the stack slots of all depths, lent to the frames'
-    /// EVM memories.
-    static constexpr size_t MEMORY_HEADROOM = 4 * 1024 * 1024;
+    /// The most EVM memory a frame reserves in a stack segment, 4 MiB: the memory that the gas
+    /// limit of a transaction (2^24, EIP-7825) can pay for is below it. A frame with more gas
+    /// whose memory grows past the reservation moves it to the heap.
+    static constexpr size_t MAX_RESERVED_MEMORY = size_t{4} * 1024 * 1024;
 
-    /// Shared EVM stack buffer. ~36 MiB ((MAX_DEPTH + 1) * 32 KB + MEMORY_HEADROOM).
+    /// The size of a stack segment: a frame with the largest reservation fits after almost
+    /// 4 MiB of the frames calling it.
+    static constexpr size_t STACK_SEGMENT_SIZE = size_t{8} * 1024 * 1024;
+    static_assert(FRAME_STRIDE + MAX_RESERVED_MEMORY <= STACK_SEGMENT_SIZE);
+
+    /// The upper bound of the EVM memory size in bytes that a frame with the gas limit @p gas can
+    /// pay for, capped at MAX_RESERVED_MEMORY. The w words cost 3w + w²/512 gas, more than
+    /// w²/512, so w < 16 * sqrt(2 * gas). The sqrt is bounded from above by one Newton step from
+    /// a power of 2, with no multiplication nor division: off by at most 25%.
+    [[nodiscard]] static constexpr size_t max_memory_size(int64_t gas) noexcept
+    {
+        // 16 * sqrt(2 * 2^25) words are MAX_RESERVED_MEMORY.
+        if (gas >= (int64_t{1} << 25))
+            return MAX_RESERVED_MEMORY;
+        if (gas <= 0)
+            return 0;
+        const auto n = static_cast<uint32_t>(gas) * 2;
+        const auto k = static_cast<unsigned>(std::bit_width(n) + 1) / 2;  // 2^k >= sqrt(n).
+        // From above, the Newton step stays above sqrt(n) - 1.
+        const auto r = (((uint32_t{1} << k) + (n >> k)) >> 1) + 1;
+        return std::min(size_t{r} * 16 * 32, MAX_RESERVED_MEMORY);
+    }
+
+    /// The EVM stacks and memories of the frames, packed densely in stack segments. A frame
+    /// starts at the stack tail: its stack takes FRAME_STRIDE and its EVM memory the rest of the
+    /// segment, of which max_memory_size(msg.gas) is reserved: the frame moves to the next
+    /// segment if the reservation does not fit. A call places the sub-frame right after the live
+    /// EVM memory of the caller, which does not grow until the sub-frame returns. See
+    /// `baseline::execute` for the entry and `call_impl`/`create_impl` for the pre-call update.
     ///
-    /// Frames are packed densely starting at `stack_buffer_storage`. Each
-    /// frame's bottom is handed out as the current `stack_tail` — see
-    /// `baseline::execute` for entry and `call_impl`/`create_impl` for the
-    /// pre-call update. The spare space beyond a frame's stack is lent to
-    /// that frame's EVM `Memory` as its initial borrowed backing, up to the
-    /// stack slots kept free for the deeper frames, so that the frame at
-    /// any depth up to MAX_DEPTH has its whole stack inside the buffer.
-    ///
-    /// Storage is a raw POD byte array so it is left uninitialized at VM
-    /// construction (an `intx::uint256[]` member would otherwise zero-init
-    /// every slot via its `words_[4]{}` member initializer).
+    /// The segments are kept after the frames in them return: a call in a loop at the end of a
+    /// segment would otherwise allocate and free the next one on every iteration. They are
+    /// malloc-allocated, so their pages are not touched before a frame uses them (a
+    /// `intx::uint256[]` would zero-init every slot via its `words_[4]{}` member initializer).
     ///
     /// Single-threaded per VM.
-    alignas(sizeof(intx::uint256)) std::byte
-        stack_buffer_storage[(MAX_DEPTH + 1) * FRAME_STRIDE + MEMORY_HEADROOM];
-
-    /// Next free byte in `stack_buffer_storage`. The next frame to be
-    /// entered starts its stack at this address. Reset to the buffer base
-    /// on depth-0 entry; updated by `call_impl`/`create_impl` before each
-    /// nested call to skip past the parent's stack + live EVM memory.
-    std::byte* stack_tail = stack_buffer_storage;
-
-    /// One past the last byte of the shared buffer.
-    [[nodiscard]] std::byte* stack_buffer_end() noexcept
+    struct StackSegment
     {
-        return stack_buffer_storage + sizeof(stack_buffer_storage);
+        struct FreeDeleter
+        {
+            void operator()(std::byte* p) const noexcept { std::free(p); }
+        };
+
+        using Storage = std::unique_ptr<std::byte, FreeDeleter>;
+
+        Storage storage;
+        std::byte* begin = nullptr;  ///< The storage aligned to sizeof(uint256).
+        std::byte* end = nullptr;
+    };
+
+    std::vector<StackSegment> stack_segments;
+
+    /// The index of the segment of the stack tail.
+    size_t stack_segment = 0;
+
+    /// Next free byte in the current stack segment. The next frame to be entered starts its
+    /// stack at this address, unless its reservation does not fit. Reset to the first segment
+    /// on depth-0 entry; updated by `call_impl`/`create_impl` before each nested call to skip
+    /// past the parent's stack + live EVM memory.
+    std::byte* stack_tail = nullptr;
+
+    /// Hands the stack tail after the caller's stack and live EVM memory to the sub-frame.
+    void set_stack_tail(const ExecutionState& caller) noexcept
+    {
+        // With the memory moved to the heap, the segment space after the stack is free again.
+        stack_segment = caller.stack_segment;
+        stack_tail = caller.memory.is_borrowed() ?
+                         reinterpret_cast<std::byte*>(caller.memory.borrowed_end()) :
+                         reinterpret_cast<std::byte*>(caller.stack_bottom) + FRAME_STRIDE;
+    }
+
+    /// Places a frame reserving @p size bytes: at the stack tail if it fits in the current
+    /// segment, otherwise at the start of the next segment (allocated if needed).
+    /// Returns the frame bottom; the frame's space ends at the current segment's end.
+    [[nodiscard]] std::byte* place_frame(size_t size) noexcept
+    {
+        if (size > static_cast<size_t>(stack_segments[stack_segment].end - stack_tail))
+            [[unlikely]]
+            next_stack_segment();
+        return stack_tail;
     }
 
 private:
+    /// Moves the stack tail to the start of the next stack segment, allocating it if needed.
+    [[gnu::cold]] void next_stack_segment() noexcept;
+
     std::vector<ExecutionState> m_execution_states;
     CodeCache m_code_cache;
     std::unique_ptr<Tracer> m_first_tracer;
@@ -142,8 +198,7 @@ private:
 public:
     VM() noexcept;
 
-    // ExecutionState::stack_bottom points into this object's storage;
-    // moving the VM would invalidate the pointer.
+    // ExecutionState::vm points to this object; moving the VM would invalidate the pointer.
     VM(const VM&) = delete;
     VM(VM&&) = delete;
     VM& operator=(const VM&) = delete;

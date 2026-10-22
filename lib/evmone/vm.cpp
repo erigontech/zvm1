@@ -108,6 +108,24 @@ VM::VM() noexcept
     }
 {
     m_execution_states.reserve(1025);
+    next_stack_segment();
+}
+
+void VM::next_stack_segment() noexcept
+{
+    if (!stack_segments.empty())
+        ++stack_segment;
+    if (stack_segment == stack_segments.size())
+    {
+        // Every reservation fits a segment, so the segments are all of the same size.
+        constexpr size_t align = sizeof(intx::uint256);
+        auto* const p = static_cast<std::byte*>(std::malloc(STACK_SEGMENT_SIZE + align - 1));
+        if (p == nullptr) [[unlikely]]
+            std::terminate();
+        auto* const begin = p + (-reinterpret_cast<uintptr_t>(p) & (align - 1));
+        stack_segments.push_back({StackSegment::Storage{p}, begin, begin + STACK_SEGMENT_SIZE});
+    }
+    stack_tail = stack_segments[stack_segment].begin;
 }
 
 ExecutionState& VM::get_execution_state(size_t depth) noexcept

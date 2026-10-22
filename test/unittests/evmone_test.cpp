@@ -6,6 +6,7 @@
 #include <evmone/evmone.h>
 #include <evmone/vm.hpp>
 #include <gtest/gtest.h>
+#include <limits>
 
 TEST(evmone, info)
 {
@@ -74,4 +75,46 @@ TEST(evmone, set_option_cgoto)
 #else
     EXPECT_EQ(vm.set_option("cgoto", "no"), EVMC_SET_OPTION_INVALID_NAME);
 #endif
+}
+
+TEST(evmone, max_memory_size)
+{
+    using evmone::VM;
+
+    // The memory of w words costs 3w + w²/512 gas.
+    const auto cost = [](uint64_t words) { return 3 * words + words * words / 512; };
+
+    EXPECT_EQ(VM::max_memory_size(-1), 0);
+    EXPECT_EQ(VM::max_memory_size(0), 0);
+    EXPECT_EQ(VM::max_memory_size(int64_t{1} << 25), VM::MAX_RESERVED_MEMORY);
+    EXPECT_EQ(VM::max_memory_size(std::numeric_limits<int64_t>::max()), VM::MAX_RESERVED_MEMORY);
+
+    for (int64_t gas = 1; gas < (int64_t{1} << 25); gas += gas / 64 + 1)
+    {
+        const auto size = VM::max_memory_size(gas);
+        ASSERT_EQ(size % 32, 0) << gas;
+        ASSERT_LE(size, VM::MAX_RESERVED_MEMORY) << gas;
+
+        // The largest affordable memory fits, unless capped.
+        const auto words = size / 32;
+        if (size < VM::MAX_RESERVED_MEMORY)
+            ASSERT_GT(cost(words + 1), static_cast<uint64_t>(gas)) << gas;
+
+        // Not much more than needed once the w²/512 term dominates: 16 * sqrt(2 * gas) words,
+        // overestimated by the sqrt bound, stay within 50% of the largest affordable size.
+        if (gas >= 1'000'000)
+        {
+            uint64_t max_words = 0;
+            for (uint64_t step = uint64_t{1} << 20; step != 0; step /= 2)
+            {
+                if (cost(max_words + step) <= static_cast<uint64_t>(gas))
+                    max_words += step;
+            }
+            ASSERT_LE(words, max_words * 3 / 2) << gas;
+        }
+    }
+
+    // The transaction gas limit cap (EIP-7825) fits.
+    EXPECT_GE(VM::max_memory_size(int64_t{1} << 24), 91'917 * 32);
+    EXPECT_LT(VM::max_memory_size(int64_t{1} << 24), VM::MAX_RESERVED_MEMORY);
 }

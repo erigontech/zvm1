@@ -319,14 +319,10 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     // Place the sub-frame's stack right after this frame's live EVM memory
     // (or right after this frame's stack if memory has already spilled to
-    // the heap, in which case the buffer's memory region is free again).
+    // the heap, in which case the segment's memory region is free again).
     // state.vm is nullptr only when the Advanced interpreter is in use.
     if (state.vm != nullptr)
-    {
-        state.vm->stack_tail = state.memory.is_borrowed() ?
-            reinterpret_cast<std::byte*>(state.memory.borrowed_end()) :
-            reinterpret_cast<std::byte*>(state.stack_bottom) + VM::FRAME_STRIDE;
-    }
+        state.vm->set_stack_tail(state);
 
     auto result = host_call(state, msg);
 #ifdef EVMONE_WORD_LAYOUT
@@ -469,11 +465,7 @@ Result create_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noex
     // (or right after this frame's stack if memory has spilled to the heap).
     // state.vm is nullptr only when the Advanced interpreter is in use.
     if (state.vm != nullptr)
-    {
-        state.vm->stack_tail = state.memory.is_borrowed() ?
-            reinterpret_cast<std::byte*>(state.memory.borrowed_end()) :
-            reinterpret_cast<std::byte*>(state.stack_bottom) + VM::FRAME_STRIDE;
-    }
+        state.vm->set_stack_tail(state);
 
     auto result = host_call(state, msg);
     gas_left -= msg.gas - result.gas_left;

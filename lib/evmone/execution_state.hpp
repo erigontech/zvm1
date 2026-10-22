@@ -33,7 +33,7 @@ using intx::uint256;
 
 
 /// Constants describing the EVM stack. Storage now lives on the owning VM
-/// (see VM::stack_buffer); this struct keeps the limit constant referenced by
+/// (see VM::stack_segments); this struct keeps the limit constant referenced by
 /// stack-overflow checks throughout the codebase.
 struct StackSpace
 {
@@ -48,9 +48,10 @@ struct StackSpace
 /// are W pointers, see word_layout.hpp. The allocation is 8-byte aligned, which the layout needs.
 ///
 /// On each frame entry the executor calls `set_borrowed()` with a pointer
-/// into VM::stack_buffer_storage (the spare space after this frame's stack)
+/// into a VM stack segment (the spare space after this frame's stack)
 /// — initial capacity is everything between the frame's stack top and the
-/// end of the shared buffer. If `grow()` would exceed that, the data is
+/// end of the segment, at least what the frame's gas can pay for up to
+/// VM::MAX_RESERVED_MEMORY. If `grow()` would exceed that, the data is
 /// copied to a heap buffer once and subsequent grows `realloc()` it.
 /// A Memory not given a borrowed buffer (or given one smaller than a page)
 /// uses a heap page, so the capacity is never below page_size.
@@ -60,7 +61,7 @@ class Memory
     static constexpr size_t page_size = 4 * 1024;
 
     /// Pointer to the active backing storage. Either borrowed (a slice of
-    /// VM::stack_buffer_storage) or heap-owned (malloc-allocated).
+    /// a VM stack segment) or heap-owned (malloc-allocated).
     uint8_t* m_data = nullptr;
 
     /// The "virtual" size of the memory.
@@ -344,10 +345,13 @@ public:
     /// The frame's state-gas counters (EIP-8037).
     StateGas state_gas;
 
-    /// Bottom of this frame's EVM stack. Points into VM::stack_buffer_storage
-    /// at the position the executor entry handed out (= `vm->stack_tail` at
-    /// the moment of entry). Never null during dispatch.
+    /// Bottom of this frame's EVM stack. Points into the VM stack segment
+    /// `stack_segment` at the position the executor entry handed out. Never
+    /// null during dispatch.
     uint256* stack_bottom = nullptr;
+
+    /// The index of the VM stack segment holding this frame's stack and EVM memory.
+    size_t stack_segment = 0;
 
     /// Back-pointer to the owning VM. Used by call/create instructions to
     /// update `VM::stack_tail` before invoking a sub-frame.
