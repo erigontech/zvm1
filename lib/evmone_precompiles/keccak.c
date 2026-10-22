@@ -23,6 +23,12 @@ uint64_t z6mprof_node_verify;        ///< witness node bodies hash-verified (fin
 uint64_t z6mprof_node_verify_bytes;  ///< ... and their total payload bytes
 uint64_t z6mprof_code_verify;        ///< code-store entries hash-verified (sanitize)
 uint64_t z6mprof_code_verify_bytes;  ///< ... and their total payload bytes
+uint64_t z6mprof_verify_snap;        ///< kprefix verify_and_snap calls (the snap path of node verify)
+uint64_t z6mprof_verify_snap_bytes;  ///< ... and their total node bytes
+uint64_t z6mprof_fold_plain;         ///< fold-time keccak256 of a freshly encoded node
+uint64_t z6mprof_fold_plain_bytes;   ///< ... and their total encoded bytes
+uint64_t z6mprof_fold_resume;        ///< fold-time hashes resumed from a saved prefix state
+uint64_t z6mprof_fold_full_branch;   ///< fold-time full-branch hashes (patched witness branch)
 
 #ifdef SP1TURBO
 void syscall_keccak_permute(uint64_t (*state)[25]);
