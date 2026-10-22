@@ -8,6 +8,22 @@
 #include <stdint.h>
 #include <string.h>
 
+// Profiling counters (referenced under Z6M_GUEST_PROFILE or Z6M_HOST_PROFILE from keccak.c
+// itself, evmone's keccak256 opcode, zilkworm's keccak_memo.cpp and direct_state.hpp; defined
+// unconditionally so any build links).
+uint64_t z6mprof_keccak_permutes;    ///< every keccakf1600 through the SP1 ecall
+uint64_t z6mprof_sha3_64;            ///< KECCAK256 calls with a 64-byte 8-aligned input
+uint64_t z6mprof_sha3_64_memo_hit;   ///< of those, answered from the memo
+uint64_t z6mprof_sha3_64_memo_miss;  ///< of those, hashed and stored in the memo
+uint64_t z6mprof_sha3_32;            ///< KECCAK256 opcode calls with a 32-byte input
+uint64_t z6mprof_sha3_other;         ///< KECCAK256 opcode calls of any other size
+uint64_t z6mprof_keyhash_hit;        ///< zilkworm keccak256_memo hits (<=32-byte keys)
+uint64_t z6mprof_keyhash_miss;       ///< zilkworm keccak256_memo misses
+uint64_t z6mprof_node_verify;        ///< witness node bodies hash-verified (find_node_rlp)
+uint64_t z6mprof_node_verify_bytes;  ///< ... and their total payload bytes
+uint64_t z6mprof_code_verify;        ///< code-store entries hash-verified (sanitize)
+uint64_t z6mprof_code_verify_bytes;  ///< ... and their total payload bytes
+
 #ifdef SP1TURBO
 void syscall_keccak_permute(uint64_t (*state)[25]);
 #elif defined(SP1)
@@ -23,6 +39,7 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     asm volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
 #elif defined(AIRBENDER)
+
 // File-level static buffer for keccak CSR delegation (256-byte aligned).
 // Shared between syscall_keccak_permute and direct-access optimized paths.
 static uint64_t __attribute__((aligned(256))) buf[32];
@@ -1579,16 +1596,6 @@ struct keccak64_memo64_slot
 #define KECCAK64_MEMO64_BITS 14
 static struct keccak64_memo64_slot keccak64_memo64[1u << KECCAK64_MEMO64_BITS];
 
-// Profiling counters (referenced under Z6M_GUEST_PROFILE from keccak.c itself, evmone's
-// keccak256 opcode and zilkworm's keccak_memo.cpp; defined unconditionally so any build links).
-uint64_t z6mprof_keccak_permutes;    ///< every keccakf1600 through the SP1 ecall
-uint64_t z6mprof_sha3_64;            ///< KECCAK256 calls with a 64-byte 8-aligned input
-uint64_t z6mprof_sha3_64_memo_hit;   ///< of those, answered from the memo
-uint64_t z6mprof_sha3_64_memo_miss;  ///< of those, hashed and stored in the memo
-uint64_t z6mprof_sha3_32;            ///< KECCAK256 opcode calls with a 32-byte input
-uint64_t z6mprof_sha3_other;         ///< KECCAK256 opcode calls of any other size
-uint64_t z6mprof_keyhash_hit;        ///< zilkworm keccak256_memo hits (<=32-byte keys)
-uint64_t z6mprof_keyhash_miss;       ///< zilkworm keccak256_memo misses
 
 /// Hashes the 64 aligned words at @p data into @p slot and copies the result to @p out: the
 /// memo's miss. Out of line to keep the hit path's register allocation alone.
