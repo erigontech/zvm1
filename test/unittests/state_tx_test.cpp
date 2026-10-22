@@ -41,6 +41,35 @@ TEST(state_tx, validate_nonce)
         "TransactionException.NONCE_MISMATCH_TOO_HIGH");
 }
 
+TEST(state_tx, validate_without_state)
+{
+    const BlockInfo block{
+        .gas_limit = 53000,
+    };
+    Transaction tx{
+        .gas_limit = block.gas_limit,
+        .sender = 0x02_address,
+        .nonce = 1,
+    };
+    const TestState state{{tx.sender, {.nonce = 0, .balance = 0}}};
+
+    // The checks without the state pass a transaction the state rejects.
+    const auto tx_props = validate_transaction(block, tx, EVMC_BERLIN, block.gas_limit, 0, 0);
+    ASSERT_TRUE(holds_alternative<TransactionProperties>(tx_props));
+    EXPECT_EQ(std::get<TransactionProperties>(tx_props).execution_gas_limit, 53000 - 21000);
+    EXPECT_EQ(validate_transaction_with_state(state, tx).message(),
+        "TransactionException.NONCE_MISMATCH_TOO_HIGH");
+
+    tx.nonce = 0;
+    EXPECT_FALSE(validate_transaction_with_state(state, tx));
+
+    tx.gas_limit = 20999;
+    EXPECT_EQ(std::get<std::error_code>(
+                  validate_transaction(block, tx, EVMC_BERLIN, block.gas_limit, 0, 0))
+                  .message(),
+        "TransactionException.INTRINSIC_GAS_TOO_LOW");
+}
+
 TEST(state_tx, validate_sender)
 {
     BlockInfo block{

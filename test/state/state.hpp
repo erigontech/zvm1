@@ -167,7 +167,27 @@ TransactionReceipt transition(const StateView& state, const BlockInfo& block,
     const BlockHashes& block_hashes, const Transaction& tx, evmc_revision rev, evmc::VM& vm,
     const TransactionProperties& tx_props);
 
-/// Validate a transaction.
+/// Validate a transaction without access to the state.
+///
+/// Does the checks that depend only on the transaction, the block and the revision: the transaction
+/// type, the fee caps, the blob and set-code rules, the gas limits and the intrinsic and floor
+/// costs. The sender is not needed.
+///
+/// @param block_state_gas_left  Remaining block state-gas (EIP-8037).
+/// @return The transaction's computed gas properties or a validation error.
+[[nodiscard]] std::variant<TransactionProperties, std::error_code> validate_transaction(
+    const BlockInfo& block, const Transaction& tx, evmc_revision rev, int64_t block_gas_left,
+    int64_t block_state_gas_left, int64_t blob_gas_left) noexcept;
+
+/// Validate a transaction against the state.
+///
+/// Does the checks that need the sender's account: it is not a contract (EIP-3607), its nonce
+/// is below the limit (EIP-2681) and matches, and its balance covers the maximum cost.
+/// The tx.sender must be set.
+[[nodiscard]] std::error_code validate_transaction_with_state(
+    const StateView& state_view, const Transaction& tx) noexcept;
+
+/// Validate a transaction: the checks without the state, then the ones against it.
 ///
 /// @param block_state_gas_left  Remaining block state-gas (EIP-8037).
 /// @return The transaction's computed gas properties or a validation error.

@@ -669,11 +669,9 @@ void State::rollback(size_t checkpoint)
     m_journal.resize(checkpoint);
 }
 
-/// Validates transaction and computes the gas limits it provides to the EVM.
-/// @return  The transaction's computed gas properties or a validation error.
-std::variant<TransactionProperties, std::error_code> validate_transaction(
-    const StateView& state_view, const BlockInfo& block, const Transaction& tx, evmc_revision rev,
-    int64_t block_gas_left, int64_t block_state_gas_left, int64_t blob_gas_left) noexcept
+std::variant<TransactionProperties, std::error_code> validate_transaction(const BlockInfo& block,
+    const Transaction& tx, evmc_revision rev, int64_t block_gas_left, int64_t block_state_gas_left,
+    int64_t blob_gas_left) noexcept
 {
     if (tx.chain_id_protected() && tx.chain_id != block.chain_id)
         return make_error_code(INVALID_CHAIN_ID);
@@ -757,6 +755,29 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     if (tx.max_gas_price < block.base_fee)
         return make_error_code(INSUFFICIENT_MAX_FEE_PER_GAS);
 
+    // Initcode size is limited by EIP-3860, raised for Amsterdam by EIP-7954.
+    const size_t max_initcode_size =
+        rev >= EVMC_AMSTERDAM ? MAX_INITCODE_SIZE_AMSTERDAM : MAX_INITCODE_SIZE;
+    if (rev >= EVMC_SHANGHAI && !tx.to.has_value() && tx.data.size() > max_initcode_size)
+        return make_error_code(INITCODE_SIZE_EXCEEDED);
+
+    const auto [intrinsic_cost, min_cost] = compute_tx_intrinsic_cost(rev, tx);
+
+    // The transaction state-gas limit is all above the cap constant (EIP-8037).
+    const auto state_gas_limit =
+        rev >= EVMC_AMSTERDAM ? std::max(tx.gas_limit - MAX_TX_GAS_LIMIT, int64_t{0}) : 0;
+
+    // Transaction gas limit with state-gas limit excluded must cover intrinsic and min cost.
+    if (tx.gas_limit - state_gas_limit < std::max(intrinsic_cost, min_cost))
+        return make_error_code(INTRINSIC_GAS_TOO_LOW);
+
+    const auto execution_gas_limit = tx.gas_limit - intrinsic_cost - state_gas_limit;
+    return TransactionProperties{execution_gas_limit, state_gas_limit, min_cost};
+}
+
+std::error_code validate_transaction_with_state(
+    const StateView& state_view, const Transaction& tx) noexcept
+{
     // We need some information about the sender so lookup the account in the state.
     // TODO: During transaction execution this account will be also needed, so we may pass it along.
     const auto sender_acc = state_view.get_account(tx.sender).value_or(
@@ -775,12 +796,6 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     if (sender_acc.nonce > tx.nonce)
         return make_error_code(NONCE_TOO_LOW);
 
-    // Initcode size is limited by EIP-3860, raised for Amsterdam by EIP-7954.
-    const size_t max_initcode_size =
-        rev >= EVMC_AMSTERDAM ? MAX_INITCODE_SIZE_AMSTERDAM : MAX_INITCODE_SIZE;
-    if (rev >= EVMC_SHANGHAI && !tx.to.has_value() && tx.data.size() > max_initcode_size)
-        return make_error_code(INITCODE_SIZE_EXCEEDED);
-
     // Compute and check if sender has enough balance for the theoretical maximum transaction cost.
     // Note this is different from tx_max_cost computed with effective gas price later.
     // The computation cannot overflow if done with 512-bit precision.
@@ -792,18 +807,22 @@ std::variant<TransactionProperties, std::error_code> validate_transaction(
     if (sender_acc.balance < max_total_fee)
         return make_error_code(INSUFFICIENT_ACCOUNT_FUNDS);
 
-    const auto [intrinsic_cost, min_cost] = compute_tx_intrinsic_cost(rev, tx);
+    return {};
+}
 
-    // The transaction state-gas limit is all above the cap constant (EIP-8037).
-    const auto state_gas_limit =
-        rev >= EVMC_AMSTERDAM ? std::max(tx.gas_limit - MAX_TX_GAS_LIMIT, int64_t{0}) : 0;
+std::variant<TransactionProperties, std::error_code> validate_transaction(
+    const StateView& state_view, const BlockInfo& block, const Transaction& tx, evmc_revision rev,
+    int64_t block_gas_left, int64_t block_state_gas_left, int64_t blob_gas_left) noexcept
+{
+    auto tx_props =
+        validate_transaction(block, tx, rev, block_gas_left, block_state_gas_left, blob_gas_left);
+    if (std::holds_alternative<std::error_code>(tx_props))
+        return tx_props;
 
-    // Transaction gas limit with state-gas limit excluded must cover intrinsic and min cost.
-    if (tx.gas_limit - state_gas_limit < std::max(intrinsic_cost, min_cost))
-        return make_error_code(INTRINSIC_GAS_TOO_LOW);
+    if (const auto ec = validate_transaction_with_state(state_view, tx))
+        return ec;
 
-    const auto execution_gas_limit = tx.gas_limit - intrinsic_cost - state_gas_limit;
-    return TransactionProperties{execution_gas_limit, state_gas_limit, min_cost};
+    return tx_props;
 }
 
 StateDiff finalize(const StateView& state_view, evmc_revision rev, const address& coinbase,
