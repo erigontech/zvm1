@@ -14,6 +14,12 @@
 #include <bit>
 #include <new>
 
+#ifdef Z6M_GUEST_PROFILE
+// Profiling counters, defined in evmone_precompiles/keccak.c.
+extern "C" uint64_t z6mprof_sha3_32;
+extern "C" uint64_t z6mprof_sha3_other;
+#endif
+
 #ifdef SP1
 #include <sp1_syscalls.hpp>
 #endif
@@ -1330,10 +1336,30 @@ inline Result keccak256_general(
             return {EVMC_SUCCESS, gas_left};
         }
     }
+#elif defined(__riscv) && __riscv_xlen == 64
+    // The same 64-byte mapping-slot memo the rv32 build uses (see keccak.c): a contract hashes
+    // the same entry's slot again on every access, and on SP1 each saved permutation is ~1,625
+    // prover-gas. The memo reads words, so it takes 8-aligned inputs, which are all but a few.
+    if (s == 64) [[likely]]
+    {
+        const auto data = &state.memory[i];
+        if ((reinterpret_cast<uintptr_t>(data) & 7) == 0) [[likely]]
+        {
+            ethash_keccak256_64_memo(
+                reinterpret_cast<uint64_t*>(&size), reinterpret_cast<const uint64_t*>(data));
+            return {EVMC_SUCCESS, gas_left};
+        }
+    }
 #endif
 #ifdef EVMONE_WORD_LAYOUT
     keccak256_w(size, s != 0 ? &state.memory[i] : nullptr, s);
 #else
+#ifdef Z6M_GUEST_PROFILE
+    if (s == 32)
+        ++z6mprof_sha3_32;
+    else
+        ++z6mprof_sha3_other;
+#endif
     auto data = s != 0 ? &state.memory[i] : nullptr;
     size = intx::be::load<uint256>(ethash::keccak256(data, s));
 #endif

@@ -13,6 +13,10 @@ void syscall_keccak_permute(uint64_t (*state)[25]);
 #elif defined(SP1)
 static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_t state[25])
 {
+#ifdef Z6M_GUEST_PROFILE
+    extern uint64_t z6mprof_keccak_permutes;
+    ++z6mprof_keccak_permutes;
+#endif
     register uint64_t t0 asm("t0") = 0x00010109;
     register uint64_t* a0 asm("a0") = state;
     register uint64_t a1 asm("a1") = 0;
@@ -1550,3 +1554,122 @@ NO_INLINE int ethash_keccak256_read_verify(ethash_w32* dst, size_t size, const e
 }
 #endif
 #endif
+
+#if defined(__riscv) && __riscv_xlen == 64
+
+/// rv64 (SP1 Hypercube) memo of the 64-byte KECCAK256 inputs: the mapping slots keccak(key . slot),
+/// which a contract hashes again on every access to the same entry. The rv32 (Airbender) memo above
+/// measured 65% of the 64-byte hashes in the 200-block corpus repeating one done earlier in the
+/// block; on SP1 each saved permutation is ~1,625 prover-gas, and the hit path also skips the
+/// generic absorb of the input into the state. 2-way set associative, like the rv32 memo.
+///
+/// The key words are the input's 8 little-endian words (the caller passes an 8-aligned pointer;
+/// anything else takes the generic code). The value words are the hash as the big-endian number
+/// intx::be::load() would produce, so the hit path stores them straight into the uint256 slot.
+/// Zero-initialized (.bss): a slot answers only while its first value word is nonzero, so the
+/// all-zero input is recomputed until first hashed, and a hash whose first word is 0 (one in 2^64)
+/// is recomputed every time. Collisions only evict, the compare covers all 64 bytes.
+struct keccak64_memo64_slot
+{
+    uint64_t key[8];
+    uint64_t value[4];
+    uint64_t unused[4];  // Pads the slot to 128 bytes: the index takes the slot with one shift.
+};
+
+#define KECCAK64_MEMO64_BITS 14
+static struct keccak64_memo64_slot keccak64_memo64[1u << KECCAK64_MEMO64_BITS];
+
+// Profiling counters (referenced under Z6M_GUEST_PROFILE from keccak.c itself, evmone's
+// keccak256 opcode and zilkworm's keccak_memo.cpp; defined unconditionally so any build links).
+uint64_t z6mprof_keccak_permutes;    ///< every keccakf1600 through the SP1 ecall
+uint64_t z6mprof_sha3_64;            ///< KECCAK256 calls with a 64-byte 8-aligned input
+uint64_t z6mprof_sha3_64_memo_hit;   ///< of those, answered from the memo
+uint64_t z6mprof_sha3_64_memo_miss;  ///< of those, hashed and stored in the memo
+uint64_t z6mprof_sha3_32;            ///< KECCAK256 opcode calls with a 32-byte input
+uint64_t z6mprof_sha3_other;         ///< KECCAK256 opcode calls of any other size
+uint64_t z6mprof_keyhash_hit;        ///< zilkworm keccak256_memo hits (<=32-byte keys)
+uint64_t z6mprof_keyhash_miss;       ///< zilkworm keccak256_memo misses
+
+/// Hashes the 64 aligned words at @p data into @p slot and copies the result to @p out: the
+/// memo's miss. Out of line to keep the hit path's register allocation alone.
+static NO_INLINE void keccak64_memo64_fill(
+    uint64_t out[4], const uint64_t* data, struct keccak64_memo64_slot* slot)
+{
+    // The state of ethash_keccak256()'s single-block path for a 64-byte input: the input's words,
+    // the padding byte 0x01 after them, zeros, and the last block bit alone in lane 16.
+    uint64_t state[25];
+    size_t i;
+    for (i = 0; i < 8; ++i)
+    {
+        state[i] = data[i];
+        slot->key[i] = data[i];
+    }
+    state[8] = 0x01;
+    for (i = 9; i < 16; ++i)
+        state[i] = 0;
+    state[16] = 0x8000000000000000ULL;
+    for (i = 17; i < 25; ++i)
+        state[i] = 0;
+    keccakf1600_best(state);
+    // The hash bytes big-endian are the number the stack slot holds little-endian: word i of the
+    // slot is byte-reversed lane 3-i.
+    for (i = 0; i < 4; ++i)
+    {
+        slot->value[i] = __builtin_bswap64(state[3 - i]);
+        out[i] = slot->value[i];
+    }
+}
+
+/// The memoized keccak-256 of the 64 bytes at @p data (8-aligned), as the big-endian number's
+/// little-endian words in @p out.
+NO_INLINE void ethash_keccak256_64_memo(uint64_t out[4], const uint64_t* data)
+{
+#ifdef Z6M_GUEST_PROFILE
+    ++z6mprof_sha3_64;
+#endif
+    // The index mixes the words a mapping key and slot vary in (cf. the rv32 memo's word picks):
+    // the low word of each half (a number or an address), the second (the high bytes of the key)
+    // and the last (the slot number's low bytes). On the corpus it hits as often as a mix of all
+    // 8 does. It picks the set: the pair of slots at an even index.
+    const uint64_t x = data[0] ^ data[1] ^ data[3] ^ data[7];
+    const uint64_t index = ((x * 0x9E3779B97F4A7C15ULL) >> (64 - KECCAK64_MEMO64_BITS)) & ~1ULL;
+    struct keccak64_memo64_slot* slot = &keccak64_memo64[index];
+
+    size_t way;
+    for (way = 0; way < 2; ++way)
+    {
+        struct keccak64_memo64_slot* const s = slot + way;
+        size_t i;
+        if (s->value[0] == 0)
+            continue;
+        for (i = 0; i < 8; ++i)
+        {
+            if (s->key[i] != data[i])
+                break;
+        }
+        if (i == 8)
+        {
+            for (i = 0; i < 4; ++i)
+                out[i] = s->value[i];
+#ifdef Z6M_GUEST_PROFILE
+            ++z6mprof_sha3_64_memo_hit;
+#endif
+            return;
+        }
+    }
+#ifdef Z6M_GUEST_PROFILE
+    ++z6mprof_sha3_64_memo_miss;
+#endif
+    // A miss fills an empty slot of the set, or else moves the first slot's input to the second
+    // and takes the first: the one evicted is the older of the two the set holds.
+    if (slot[0].value[0] != 0)
+    {
+        if (slot[1].value[0] == 0)
+            ++slot;
+        else
+            slot[1] = slot[0];
+    }
+    keccak64_memo64_fill(out, data, slot);
+}
+
+#endif  // defined(__riscv) && __riscv_xlen == 64
