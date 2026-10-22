@@ -123,10 +123,13 @@ constinit InPlaceRegion in_place_region;
 constinit thread_local InPlaceRegion in_place_region;
 #endif
 
+/// Padding test reads 40 bytes past end.
+inline constexpr auto kPadReadSlack = 40;
+
 /// Whether the code can be executed where it lies: inside the region and followed by 33 zero
 /// bytes. The test of the bytes on every analysis keeps the copy as the fallback for anything the
 /// host has not padded. The aligned word loads cover them with a few bytes more on either side,
-/// which the shifts drop (the region's contract keeps those readable).
+/// which the shifts drop: at most 40 bytes past an 8-aligned region end.
 bool is_padded_in_place(bytes_view code) noexcept
 {
     static_assert(std::endian::native == std::endian::little);
@@ -137,12 +140,14 @@ bool is_padded_in_place(bytes_view code) noexcept
 #if defined(ZISK)
     // 4-byte loads cost 7x aligned u64 ones.
     using word = uint64_t __attribute__((may_alias));
+    static_assert(kPadReadSlack == 5 * sizeof(word));
     const word* const w = reinterpret_cast<const word*>(end & ~uintptr_t{7});
     const unsigned sh = static_cast<unsigned>(end & 7) * 8;
     uint64_t acc = (w[0] >> sh) | w[1] | w[2] | w[3] | (w[4] << (56 - sh));
     return acc == 0;
 #else
     typedef uint32_t __attribute__((may_alias)) word;
+    static_assert(kPadReadSlack >= 9 * sizeof(word));
     const word* const w = reinterpret_cast<const word*>(end & ~uintptr_t{3});
     const auto sh = static_cast<unsigned>(end & 3) * 8;
     uint32_t acc = (w[0] >> sh) | (w[8] << (24 - sh));

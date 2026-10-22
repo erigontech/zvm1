@@ -126,9 +126,10 @@ EVMC_EXPORT size_t scan_jumpdests(
 /// Lets analyze() use legacy code lying in [begin, end) where it is, instead of copying it to
 /// append the 33 zero bytes of padding the interpreter needs (a STOP after the last opcode and the
 /// data of a PUSH32 cut off by the end): it does so for code followed by 33 zero bytes, which it
-/// checks each time. The caller guarantees that no byte in [begin, end + 36) changes while an
+/// checks each time. The caller guarantees that no byte in [begin, end + 33) changes while an
 /// analysis of such code lives, and resets the region (nullptr, nullptr) before that stops
-/// holding. One region per thread; a new one replaces the last.
+/// holding: the padding test reads at most 40 bytes past an 8-aligned end. One region per
+/// thread; a new one replaces the last.
 EVMC_EXPORT void set_in_place_code_region(const uint8_t* begin, const uint8_t* end) noexcept;
 #endif
 
