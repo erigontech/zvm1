@@ -59,6 +59,8 @@ struct byte_traits : std::char_traits<char>
     /// Copies count bytes from src to dest. The ranges must not overlap.
     static constexpr char_type* copy(char_type* dest, const char_type* src, std::size_t count)
     {
+        if (count == 0)  // memcpy(dst, nullptr, 0) is UB by contract
+            return dest;
         if (__builtin_is_constant_evaluated())
             std::copy_n(src, count, dest);
         else
