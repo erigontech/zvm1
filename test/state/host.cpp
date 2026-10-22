@@ -378,7 +378,7 @@ evmc::Result Host::execute_message(const evmc_message& msg, void* acc_recipient,
     if (code_acc->code_hash == Account::EMPTY_CODE_HASH)  // Skip trivial execution.
         return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
 
-    // Taken by the frame's reset().
+    // Every VM entry re-seeds this.
     m_frame_acc = recipient_acc_ptr != nullptr ? recipient_acc_ptr : acc_recipient;
     auto* my_vm = static_cast<VM*>(m_vm.get_raw_pointer());
     if (my_vm->has_cached_execution())
@@ -389,7 +389,10 @@ evmc::Result Host::execute_message(const evmc_message& msg, void* acc_recipient,
 
     const auto code = m_state.get_code(*code_acc, msg.code_address);
     if (code.empty())  // Skip trivial execution.
+    {
+        m_frame_acc = nullptr;  // No frame runs; drop the staged node.
         return evmc::Result{EVMC_SUCCESS, msg.gas, 0, {.left = msg.state_gas}};
+    }
 
     return m_vm.execute(*this, static_cast<evmc_revision>(m_rev), msg, code.data(), code.size());
 }
