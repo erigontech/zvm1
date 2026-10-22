@@ -1450,6 +1450,10 @@ struct Slot
     word_t key[KEY_WORDS];  ///< The input words, the bytes past its end zero.
 };
 
+#ifdef ZISK
+static_assert(sizeof(Slot) == 176);  // u64 words: 8 + 32 + 17*8
+#endif
+
 [[nodiscard]] inline Slot* table() noexcept
 {
 #if defined(AIRBENDER) || defined(ZISK)
