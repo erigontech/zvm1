@@ -2894,6 +2894,10 @@ inline constexpr u32 p256_words[8] = {
     }
 }
 
+/// The head of mulmod_reduce, defined below: the copy of a product below the modulus and the
+/// closed forms of the sparse moduli.
+[[gnu::always_inline]] inline bool mulmod_reduce_closed(const uint<512>& p, uint<256>& m) noexcept;
+
 /// m = x * y % m from the 512-bit product p, into m's slot (m != 0). The moduli the corpus
 /// multiplies by with a sparse form get a closed form in place of the Knuth division: the NIST
 /// P-256 prime, 2^256 - 1 and powers of two. A product below m is its own remainder. Everything
@@ -2901,6 +2905,18 @@ inline constexpr u32 p256_words[8] = {
 /// the first store into it, and the closed forms read only p. Every path ends in a tail call, so
 /// there is no frame.
 [[gnu::noinline]] inline void mulmod_reduce(const uint<512>& p, uint<256>& m) noexcept
+{
+    if (mulmod_reduce_closed(p, m))
+        return;
+    const w32* const pw = reinterpret_cast<const w32*>(&p);
+    urem(p, significant_words<16>(pw), m, m);
+}
+
+/// The head of mulmod_reduce: the copy of a product below the modulus and the closed forms of the
+/// sparse moduli (the NIST P-256 prime, 2^256 - 1 and powers of two). Returns false when none of
+/// them applies and the caller has to reduce p itself (div32's urem, or a Montgomery reduction).
+/// All of m is read before the first store into it, and the closed forms read only p.
+[[gnu::always_inline]] inline bool mulmod_reduce_closed(const uint<512>& p, uint<256>& m) noexcept
 {
     const w32* const pw = reinterpret_cast<const w32*>(&p);
     w32* const mw = reinterpret_cast<w32*>(&m);
@@ -2923,7 +2939,7 @@ inline constexpr u32 p256_words[8] = {
         {
             for (size_t i = 0; i < 8; ++i)
                 mw[i] = pw[i];
-            return;
+            return true;
         }
     }
     const u32 m7 = mw[7];
@@ -2935,12 +2951,12 @@ inline constexpr u32 p256_words[8] = {
                 p256_reduce_short(mw, pw);
             else
                 p256_reduce(mw, pw);
-            return;
+            return true;
         }
         if ((mw[6] & mw[5] & mw[4] & mw[3] & mw[2] & mw[1] & mw[0]) == 0xFFFFFFFFu)
         {
             ones_fold(mw, pw);
-            return;
+            return true;
         }
     }
     else if ((m7 & (m7 - 1)) == 0) [[unlikely]]
@@ -2969,10 +2985,10 @@ inline constexpr u32 p256_words[8] = {
         if ((top & (top - 1)) == 0 && low == 0)
         {
             pow2_mask(mw, pw, 32 * t + 31 - clz_nonzero(top));
-            return;
+            return true;
         }
     }
-    urem(p, len, m, m);
+    return false;
 }
 }  // namespace div32
 #endif

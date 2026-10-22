@@ -9,6 +9,7 @@
 #include "execution_state.hpp"
 #include "instructions_traits.hpp"
 #include "instructions_xmacro.hpp"
+#include "mulmod_bn254.hpp"
 #include "word_layout.hpp"
 #include <evmone_precompiles/keccak.hpp>
 #include <bit>
@@ -783,7 +784,15 @@ inline void mulmod(StackTop stack) noexcept
     r10 = reinterpret_cast<uintptr_t>(&pw[8]);
     r12 = 0x10;  // MUL_HIGH
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
-    intx::internal::div32::mulmod_reduce(p, m);
+    // The closed forms of the sparse moduli first, then the two alt_bn128 primes by the
+    // hard-coded Montgomery reduction on the BigInt CSR (mulmod_bn254.hpp), then everything
+    // else by div32's Knuth division.
+    if (intx::internal::div32::mulmod_reduce_closed(p, m))
+        ;
+    else if (mont::is_bn254_prime(m)) [[unlikely]]
+        mont::mulmod_bn254(p, m);
+    else
+        intx::internal::div32::mulmod_reduce(p, m);
 #else
     m = intx::mulmod(x, y, m);
 #endif
