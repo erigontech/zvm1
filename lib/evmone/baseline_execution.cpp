@@ -136,6 +136,18 @@ inline constexpr bool kZiskDeferOOG = true;
 inline constexpr bool kZiskDeferOOG = false;
 #endif
 
+/// Cold fault in debt: the op before it halted OOG natively.
+template <bool DeferOOG>
+inline evmc_status_code debt_oog(int64_t gas_left, evmc_status_code status) noexcept
+{
+    if constexpr (DeferOOG)
+    {
+        if (gas_left < 0) [[unlikely]]
+            return EVMC_OUT_OF_GAS;
+    }
+    return status;
+}
+
 /// @param [in,out] gas_left      Gas left.
 /// @param          stack_top     Pointer to the stack top item.
 /// @param          stack_bottom  Pointer to the stack bottom.
@@ -168,7 +180,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         if constexpr (instr::traits[Op].since != EVMC_FRONTIER)
         {
             if (INTX_UNLIKELY(gas_cost < 0))
-                return EVMC_UNDEFINED_INSTRUCTION;
+                return debt_oog<DeferOOG>(gas_left, EVMC_UNDEFINED_INSTRUCTION);
         }
     }
 
@@ -179,7 +191,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         static_assert(instr::traits[Op].stack_height_change == 1,
             "unexpected instruction with multiple results");
         if (INTX_UNLIKELY(stack_top == stack_limit))
-            return EVMC_STACK_OVERFLOW;
+            return debt_oog<DeferOOG>(gas_left, EVMC_STACK_OVERFLOW);
     }
     if constexpr (instr::traits[Op].stack_height_required > 0)
     {
@@ -193,7 +205,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         else
             floor = stack_bottom + min_offset;
         if (INTX_UNLIKELY(stack_top <= floor))
-            return EVMC_STACK_UNDERFLOW;
+            return debt_oog<DeferOOG>(gas_left, EVMC_STACK_UNDERFLOW);
     }
 
     if constexpr (!instr::has_const_gas_cost(Op) || DISPATCH_GAS_COST<Op> > 0)
@@ -1443,7 +1455,7 @@ template <Opcode Op, bool TracingEnabled>
         {
             if (INTX_UNLIKELY(pos.stack_end <= stack_bottom))
             {
-                state.status = EVMC_STACK_UNDERFLOW;
+                state.status = debt_oog<kZiskDeferOOG>(gas, EVMC_STACK_UNDERFLOW);
                 return {nullptr, pos.stack_end};
             }
             gas -= instr::gas_costs[EVMC_FRONTIER][OP_JUMP] + instr::core::JUMPDEST_GAS;
@@ -1457,7 +1469,7 @@ template <Opcode Op, bool TracingEnabled>
         {
             if (INTX_UNLIKELY(pos.stack_end <= bottom1))
             {
-                state.status = EVMC_STACK_UNDERFLOW;
+                state.status = debt_oog<kZiskDeferOOG>(gas, EVMC_STACK_UNDERFLOW);
                 return {nullptr, pos.stack_end};
             }
             if (INTX_UNLIKELY(gas < 0))
@@ -1685,7 +1697,7 @@ int64_t dispatch(const CostTable& cost_table, ExecutionState& state, int64_t gas
 #undef ON_OPCODE
 
         default:
-            state.status = EVMC_UNDEFINED_INSTRUCTION;
+            state.status = debt_oog<!TracingEnabled && kZiskDeferOOG>(gas, EVMC_UNDEFINED_INSTRUCTION);
             return gas;
         }
 #if EVMONE_JUMP_SKIPS_JUMPDEST
@@ -2417,7 +2429,7 @@ template <Opcode Op>
     {
         // Three moves do both swaps at once.
         if (INTX_UNLIKELY(s <= bottom2))
-            return fail(EVMC_STACK_UNDERFLOW);
+            return fail(debt_oog<kZiskDeferOOG>(gas, EVMC_STACK_UNDERFLOW));
         if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_SWAP2]) < 0))
             return fail(EVMC_OUT_OF_GAS);
         const uint256 t = s[-3];
@@ -2429,7 +2441,7 @@ template <Opcode Op>
     {
         // DUP2 overflows; moves give [Y, X, Y].
         if (INTX_UNLIKELY(s == stack_limit))
-            return fail(EVMC_STACK_OVERFLOW);
+            return fail(debt_oog<kZiskDeferOOG>(gas, EVMC_STACK_OVERFLOW));
         if (INTX_UNLIKELY((gas -= instr::gas_costs[EVMC_FRONTIER][OP_DUP2]) < 0))
             return fail(EVMC_OUT_OF_GAS);
         s[0] = s[-1];
@@ -2685,7 +2697,7 @@ int64_t dispatch_cgoto(
         /* PUSH1's checks; the push is made by the successor's ZPUSH1_THEN_ entry. */             \
         if (INTX_UNLIKELY(position.stack_end == stack_limit))                                    \
         {                                                                                        \
-            state.status = EVMC_STACK_OVERFLOW;                                                  \
+            state.status = debt_oog<kZiskDeferOOG>(gas, EVMC_STACK_OVERFLOW);                    \
             return gas;                                                                          \
         }                                                                                        \
         if (INTX_UNLIKELY((gas -= 3) < 0))                                                       \
@@ -2713,7 +2725,7 @@ int64_t dispatch_cgoto(
 #undef ZISK_ON_OPCODE_SWAP
 
 TARGET_OP_UNDEFINED:
-    state.status = EVMC_UNDEFINED_INSTRUCTION;
+    state.status = debt_oog<kZiskDeferOOG>(gas, EVMC_UNDEFINED_INSTRUCTION);
     return gas;
 
 #if EVMONE_ZISK_PUSH1_FUSION
