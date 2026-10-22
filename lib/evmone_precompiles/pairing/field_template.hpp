@@ -97,7 +97,7 @@ struct ExtFieldElem
 
     friend constexpr ExtFieldElem operator+(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
         {
             auto res = e1;
@@ -119,7 +119,7 @@ struct ExtFieldElem
 
     friend constexpr ExtFieldElem operator-(const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
         {
             auto res = e1;
@@ -141,7 +141,7 @@ struct ExtFieldElem
 
     friend constexpr ExtFieldElem operator-(const ExtFieldElem& e) noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
         {
             ExtFieldElem res = {};
@@ -160,7 +160,7 @@ struct ExtFieldElem
     [[gnu::always_inline]] friend constexpr ExtFieldElem operator*(
         const ExtFieldElem& e1, const ExtFieldElem& e2) noexcept
     {
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
         if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
         {
             auto res = e1;

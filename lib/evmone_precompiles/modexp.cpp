@@ -627,7 +627,7 @@ void modinv_pow2(
     }
 }
 
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
 void modexp_sp1(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp,
     std::span<const uint8_t> mod_bytes, uint8_t* output) noexcept
 {
@@ -680,7 +680,7 @@ void modexp(std::span<const uint8_t> base_bytes, std::span<const uint8_t> exp_by
 {
     const Exponent exp{exp_bytes};
 
-#if defined(SP1) || defined(SP1TURBO)
+#if defined(SP1)
     if (std::max(mod_bytes.size(), base_bytes.size()) <= 32)
     {
         modexp_sp1(base_bytes, exp_bytes, mod_bytes, output);

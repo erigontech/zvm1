@@ -30,9 +30,7 @@ uint64_t z6mprof_fold_plain_bytes;   ///< ... and their total encoded bytes
 uint64_t z6mprof_fold_resume;        ///< fold-time hashes resumed from a saved prefix state
 uint64_t z6mprof_fold_full_branch;   ///< fold-time full-branch hashes (patched witness branch)
 
-#ifdef SP1TURBO
-void syscall_keccak_permute(uint64_t (*state)[25]);
-#elif defined(SP1)
+#if defined(SP1)
 static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_t state[25])
 {
 #ifdef Z6M_GUEST_PROFILE
@@ -734,7 +732,7 @@ static void keccakf1600_generic(uint64_t state[25])
 
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
-#if defined(SP1TURBO) || defined(SP1) || defined(AIRBENDER)
+#if defined(SP1) || defined(AIRBENDER)
 /// Not a pointer: GCC will not inline the syscall through one, leaving a call and a return
 /// around the four instructions of the ecall. Nothing selects another implementation here.
 #define keccakf1600_best syscall_keccak_permute

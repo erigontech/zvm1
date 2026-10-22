@@ -515,7 +515,7 @@ ExecutionResult expmod_execute(
 #endif
 }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
 namespace
 {
 using intx::uint256;
@@ -604,7 +604,7 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (!validate(*p) || !validate(*q)) [[unlikely]]
         return {EVMC_PRECOMPILE_FAILURE, 0};
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
     {
         sp1_AffinePoint sp1_p;
         sp1_AffinePoint sp1_q;
@@ -641,7 +641,7 @@ ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* 
 
     const auto c = intx::be::unsafe::load<uint256>(input_buffer + 64);
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
     {
         sp1_AffinePoint sp1_p;
         sp1_point_from_bytes(sp1_p, input_buffer);

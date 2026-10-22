@@ -19,7 +19,7 @@
 #define EVMONE_SECP256K1_MSM_SINGLE 0
 #endif
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
 #include <sp1_syscalls.hpp>
 #endif
 
@@ -344,7 +344,7 @@ evmc::address to_address(std::span<const uint8_t, 64> pubkey) noexcept
     return ret;
 }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
 
 inline void sp1_mulmod(uint256& result, const uint256& x, const uint256& y)
 {
@@ -496,7 +496,7 @@ evmc::address to_address(const AffinePoint& pt) noexcept
     return to_address(serialized);
 }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
 namespace
 {
 constexpr auto Gx_val = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256;
@@ -504,32 +504,11 @@ constexpr auto Gy_val = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d0
 
 constexpr size_t SP1_POINT_SIZE = 64 / sizeof(size_t);
 
-// sp1_G needs platform-specific constexpr initialization due to different limb sizes.
-#ifdef SP1TURBO
-constexpr sp1_AffinePoint sp1_G = {
-    static_cast<uint32_t>(Gx_val[0]),
-    static_cast<uint32_t>(Gx_val[0] >> 32),
-    static_cast<uint32_t>(Gx_val[1]),
-    static_cast<uint32_t>(Gx_val[1] >> 32),
-    static_cast<uint32_t>(Gx_val[2]),
-    static_cast<uint32_t>(Gx_val[2] >> 32),
-    static_cast<uint32_t>(Gx_val[3]),
-    static_cast<uint32_t>(Gx_val[3] >> 32),
-    static_cast<uint32_t>(Gy_val[0]),
-    static_cast<uint32_t>(Gy_val[0] >> 32),
-    static_cast<uint32_t>(Gy_val[1]),
-    static_cast<uint32_t>(Gy_val[1] >> 32),
-    static_cast<uint32_t>(Gy_val[2]),
-    static_cast<uint32_t>(Gy_val[2] >> 32),
-    static_cast<uint32_t>(Gy_val[3]),
-    static_cast<uint32_t>(Gy_val[3] >> 32),
-};
-#else  // SP1
+// sp1_G: the generator, as SP1 words (little-endian 64-bit limbs).
 constexpr sp1_AffinePoint sp1_G = {
     Gx_val[0], Gx_val[1], Gx_val[2], Gx_val[3],
     Gy_val[0], Gy_val[1], Gy_val[2], Gy_val[3],
 };
-#endif
 
 /// Add non-zero p to non-zero r with first-limb fast reject on x-coordinate.
 [[gnu::always_inline]] inline bool sp1_secp256k1_add_nz(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
@@ -667,7 +646,6 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     }
 }
 
-#ifndef SP1TURBO
 // GLV endomorphism: phi(x, y) = (BETA * x, y) = LAMBDA * (x, y). A scalar splits as
 // k = k1 + k2 * LAMBDA (mod N) with |k1|, |k2| < 2^128 (see GLV_G1), so u*G + v*Q becomes four
 // half-length scalars sharing one run of 128 doublings.
@@ -849,7 +827,6 @@ void sp1_msm_glv(sp1_AffinePoint r, const uint256& u, const uint256& v, const sp
         left = 16;
     }
 }
-#endif
 }  // namespace
 #endif
 
@@ -918,7 +895,7 @@ std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> 
     return to_affine(Q);
 }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
 namespace
 {
 // The scalars mod n are plain integers here, multiplied on the uint256_mulmod syscall
@@ -1013,16 +990,6 @@ std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> has
     assert(u2 != 0);
 
     // Point decompression and SP1 point operations.
-#ifdef SP1TURBO
-    uint8_t sp1_Rbytes[64]{};
-    intx::be::unsafe::store(&sp1_Rbytes[0], r_val);
-    syscall_secp256k1_decompress(sp1_Rbytes, parity);
-    const auto y_sp1 = intx::be::unsafe::load<uint256>(&sp1_Rbytes[32]);
-    if (y_sp1 == 0)
-        return std::nullopt;
-    sp1_AffinePoint sp1_R;
-    sp1_point_from_bytes(sp1_R, sp1_Rbytes);
-#else
     const auto y = decompress(r_val, parity);
     if (!y.has_value())
         return std::nullopt;
@@ -1033,15 +1000,10 @@ std::optional<evmc::address> ecrecover_inverted(std::span<const uint8_t, 32> has
         sp1_R[i] = r_val[i];
         sp1_R[SP1_POINT_SIZE / 2 + i] = (*y)[i];
     }
-#endif
 
     // Shamir's trick: compute u1*G + u2*R in a single pass
     sp1_AffinePoint sp1_Q;
-#ifdef SP1TURBO
-    sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
-#else
     sp1_msm_glv(sp1_Q, u1, u2, sp1_R);
-#endif
 
     if (is_zero(sp1_Q)) [[unlikely]]
         return std::nullopt;
@@ -1057,7 +1019,7 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes, bool parity,
     RecoveryMode mode) noexcept
 {
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
     uint256 r, s;
     if (!parse_signature(r_bytes, s_bytes, mode, r, s))
         return std::nullopt;
@@ -1910,7 +1872,7 @@ void ecrecover_batch(std::span<const EcrecoverInput> in, std::span<std::optional
         y *= zzz_inv;
         out[i] = to_address(AffinePoint{x, y});
     }
-#elif defined(SP1TURBO) || defined(SP1)
+#elif defined(SP1)
     // Montgomery's trick: prefix[i] = product of the valid r before i; invert the full product
     // once and peel each r^-1 off it walking back.
     const auto n = in.size();

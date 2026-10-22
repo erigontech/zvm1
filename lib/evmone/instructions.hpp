@@ -647,7 +647,7 @@ inline void smod(StackTop stack) noexcept
 
 #if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
         defined(EVMONE_RV32_DISPATCH_TEST)) && \
-    !(defined(SP1TURBO) || defined(SP1))
+    !defined(SP1)
 /// a < b on 8 words, most significant first: usually decided by the top word.
 [[gnu::always_inline]] inline bool lt8(const word32* a, const word32* b) noexcept
 {
@@ -713,7 +713,7 @@ inline void addmod(StackTop stack) noexcept
 
 #if ((defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || \
         defined(EVMONE_RV32_DISPATCH_TEST)) && \
-    !(defined(SP1TURBO) || defined(SP1))
+    !defined(SP1)
     if (addmod_reduced(
             reinterpret_cast<word32*>(&m), reinterpret_cast<const word32*>(&x),
             reinterpret_cast<const word32*>(&y)))
@@ -726,7 +726,7 @@ inline void addmod(StackTop stack) noexcept
         return;
     }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
     auto [sum, carry] = intx::addc(x, y);
     x = m;
     m = sum;
@@ -760,7 +760,7 @@ inline void mulmod(StackTop stack) noexcept
         return;
     }
 
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1)
     // SP1 syscall expects &x and &(y || m).
     // Because the EVM stack grows downwards, we start with m, y, x.
     // So swap to get x, y, m.
