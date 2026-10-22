@@ -49,6 +49,7 @@ TEST(state_tx, validate_without_state)
     Transaction tx{
         .gas_limit = block.gas_limit,
         .sender = 0x02_address,
+        .to = 0x03_address,
         .nonce = 1,
     };
     const TestState state{{tx.sender, {.nonce = 0, .balance = 0}}};

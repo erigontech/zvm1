@@ -37,7 +37,7 @@ constexpr std::string_view NONCE_TOO_HIGH = R"({"invalid_nonce": {
     "pre": {},
     "transaction": {
         "data": ["0x"],
-        "gasLimit": ["0x00"],
+        "gasLimit": ["0x5208"],
         "gasPrice": "0x0a",
         "nonce": "0x01",
         "sender": "0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b",
