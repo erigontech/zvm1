@@ -594,7 +594,9 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     // was handled. Only reachable on adversarial input.
     if (is_zero(h)) [[unlikely]]
     {
-        const uint64_t* base;
+        // The sp1_AffinePoint limb type on both rv64 (u64) and rv32 (u32); uint32_t is
+        // a distinct type from size_t on this newlib, so the alias, not size_t.
+        const std::remove_extent_t<sp1_AffinePoint>* base;
         uint256 d;
         if (u >= v)
         {
@@ -618,7 +620,7 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
     }
 
     // Lookup table: index = (v_bit << 1) | u_bit.
-    const uint64_t* points[4] = {nullptr, p, q, h};
+    const std::remove_extent_t<sp1_AffinePoint>* points[4] = {nullptr, p, q, h};
 
     // Find the bit width across both scalars simultaneously.
     const auto bw = std::max(intx::bit_width(u), intx::bit_width(v));
