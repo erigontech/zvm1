@@ -114,8 +114,9 @@ private:
     }
 
     /// Move the contents to a heap buffer of `new_capacity`. Called when growing
-    /// past the borrowed capacity, or when growing an existing heap buffer.
-    void allocate_heap(size_t new_capacity) noexcept
+    /// past the borrowed capacity, or when growing an existing heap buffer. Out of line: inlined,
+    /// its spills set up a stack frame on the hot path of grow().
+    [[gnu::noinline, gnu::cold]] void allocate_heap(size_t new_capacity) noexcept
     {
         if (m_heap_owned)
         {
