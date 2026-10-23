@@ -846,17 +846,15 @@ static inline ALWAYS_INLINE void keccak_build_short(uint64_t* state, const uint8
     const size_t words = size / WORD_SIZE;
     const size_t rem = size % WORD_SIZE;
     const uint64_t bit = (uint64_t)1 << (rem * 8);
-    size_t i = 0;
-    if (words != 0)
-    {
-        zisk_dma(state, data, words * WORD_SIZE);
-        i = words;
-    }
-    // Reads past the input; masked out.
-    state[i] = rem != 0 ? (load_le_word(data + i * WORD_SIZE) & (bit - 1)) | bit : bit;
-    ++i;
-    // Filler DMA beats unrolled copyb stores.
-    __builtin_memset(state + i, 0, (25 - i) * WORD_SIZE);
+    // Zero first: tail word copy is partial.
+    __builtin_memset(state + words, 0, (25 - words) * WORD_SIZE);
+    // Exact length: never reads past the input.
+    if (size != 0)
+        zisk_dma(state, data, size);
+    if (rem != 0)
+        state[words] |= bit;
+    else
+        state[words] = bit;
 }
 #endif
 
