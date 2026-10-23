@@ -1095,6 +1095,42 @@ inline void signextend(StackTop stack) noexcept
 #endif
 }
 
+/// x < y of two stack items. On x86-64 one cmp/sbb chain through the words, the borrow its
+/// result: intx's comparison of the 128-bit halves takes twice the instructions and a branch, and
+/// GCC makes its equality test of the high halves a vector compare whose words it moves back.
+/// In assembly for the flag output: from the borrow of intx::subc() GCC makes a value and tests
+/// it (setb, movzx, test) before branching on it. For stack items only: a constant operand,
+/// which intx's comparison folds, would be taken from memory.
+[[gnu::always_inline]] inline bool lt_items(const uint256& x, const uint256& y) noexcept
+{
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    bool lt;
+    uint64_t t;
+    asm("mov %[x0], %[t]\n\t"
+        "cmp %[y0], %[t]\n\t"
+        "mov %[x1], %[t]\n\t"
+        "sbb %[y1], %[t]\n\t"
+        "mov %[x2], %[t]\n\t"
+        "sbb %[y2], %[t]\n\t"
+        "mov %[x3], %[t]\n\t"
+        "sbb %[y3], %[t]"
+        : [t] "=&r"(t), "=@ccc"(lt)
+        : [x0] "m"(x[0]), [x1] "m"(x[1]), [x2] "m"(x[2]), [x3] "m"(x[3]), [y0] "m"(y[0]),
+        [y1] "m"(y[1]), [y2] "m"(y[2]), [y3] "m"(y[3]));
+    return lt;
+#else
+    return x < y;
+#endif
+}
+
+/// intx::slt() of two stack items, with lt_items().
+[[gnu::always_inline]] inline bool slt_items(const uint256& x, const uint256& y) noexcept
+{
+    const auto x_neg = static_cast<int64_t>(x[3]) < 0;
+    const auto y_neg = static_cast<int64_t>(y[3]) < 0;
+    return ((x_neg ^ y_neg) != 0) ? x_neg : lt_items(x, y);
+}
+
 inline void lt(StackTop stack) noexcept
 {
 #if defined(AIRBENDER) && defined(__riscv)
@@ -1109,7 +1145,7 @@ inline void lt(StackTop stack) noexcept
     stack[0] = uint64_t{r12 != 0};  // borrow != 0 means x < stack[0]
 #else
     const auto& x = stack.pop();
-    stack[0] = uint64_t{x < stack[0]};
+    stack[0] = uint64_t{lt_items(x, stack[0])};
 #endif
 }
 
@@ -1127,20 +1163,20 @@ inline void gt(StackTop stack) noexcept
     stack[0] = uint64_t{r12 != 0};  // borrow != 0 means stack[0] < x
 #else
     const auto& x = stack.pop();
-    stack[0] = uint64_t{stack[0] < x};  // Arguments are swapped and < is used.
+    stack[0] = uint64_t{lt_items(stack[0], x)};  // Arguments are swapped and < is used.
 #endif
 }
 
 inline void slt(StackTop stack) noexcept
 {
     const auto& x = stack.pop();
-    stack[0] = uint64_t{slt(x, stack[0])};
+    stack[0] = uint64_t{slt_items(x, stack[0])};
 }
 
 inline void sgt(StackTop stack) noexcept
 {
     const auto& x = stack.pop();
-    stack[0] = uint64_t{slt(stack[0], x)};  // Arguments are swapped and SLT is used.
+    stack[0] = uint64_t{slt_items(stack[0], x)};  // Arguments are swapped and SLT is used.
 }
 
 inline void eq(StackTop stack) noexcept

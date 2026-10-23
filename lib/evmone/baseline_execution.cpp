@@ -1194,13 +1194,13 @@ template <Opcode Op>
         if constexpr (Op == OP_EQ)
             taken = a == b;
         else if constexpr (Op == OP_LT)
-            taken = a < b;
+            taken = instr::core::lt_items(a, b);
         else if constexpr (Op == OP_GT)
-            taken = b < a;
+            taken = instr::core::lt_items(b, a);
         else if constexpr (Op == OP_SLT)
-            taken = slt(a, b);
+            taken = instr::core::slt_items(a, b);
         else
-            taken = slt(b, a);
+            taken = instr::core::slt_items(b, a);
     }
     pos.stack_end -= required;
     if (!taken)
@@ -1245,13 +1245,13 @@ template <Opcode Op>
     // ISZERO inverts the comparison; JUMPI jumps on non-zero.
     bool taken;
     if constexpr (Op == OP_LT)
-        taken = !(a < b);
+        taken = !instr::core::lt_items(a, b);
     else if constexpr (Op == OP_GT)
-        taken = !(b < a);
+        taken = !instr::core::lt_items(b, a);
     else if constexpr (Op == OP_SLT)
-        taken = !slt(a, b);
+        taken = !instr::core::slt_items(a, b);
     else
-        taken = !slt(b, a);
+        taken = !instr::core::slt_items(b, a);
     pos.stack_end -= 2;
     if (!taken)
     {
