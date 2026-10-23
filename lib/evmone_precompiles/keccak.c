@@ -221,6 +221,18 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
 #define NO_SANITIZE_ADDRESS
 #endif
 
+// ASan builds read inputs exactly.
+#if defined(__SANITIZE_ADDRESS__)
+#define KECCAK_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define KECCAK_ASAN 1
+#endif
+#endif
+#ifndef KECCAK_ASAN
+#define KECCAK_ASAN 0
+#endif
+
 #define WORD_SIZE sizeof(uint64_t)
 #define WORD_BITS 64
 
@@ -803,8 +815,8 @@ static inline ALWAYS_INLINE void absorb_input(
     // Absorb last 0–7 bytes of input + the padding byte.
     const uint8_t* const tail = reader.data;
     uint64_t last_word = (uint64_t)0x01 << (size * 8);
-#if defined(ZISK)
-    // Masked load beats byte loop; over-read masked.
+#if defined(ZISK) && !KECCAK_ASAN
+    // Cheaper than bytes; aligned, so never faults.
     if (misalign == 0 && size != 0)
         last_word |= load_le_word(tail) & (last_word - 1);
     else
