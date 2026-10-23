@@ -246,6 +246,32 @@ consteval bool has_const_gas_cost(Opcode op) noexcept
     return true;
 }
 
+/// The base gas cost of an instruction in the first revision defining it, and whether every later
+/// revision has the same: then a dispatch that never runs the instruction where it is undefined
+/// can charge that constant (e.g. 3 for SHL).
+consteval int16_t defined_gas_cost(Opcode op) noexcept
+{
+    for (size_t r = EVMC_FRONTIER; r <= EVMC_MAX_REVISION; ++r)
+    {
+        if (gas_costs[r][op] != undefined)
+            return gas_costs[r][op];
+    }
+    return undefined;
+}
+
+consteval bool has_const_gas_cost_when_defined(Opcode op) noexcept
+{
+    const auto g = defined_gas_cost(op);
+    if (g == undefined)
+        return false;
+    for (size_t r = EVMC_FRONTIER; r <= EVMC_MAX_REVISION; ++r)
+    {
+        if (gas_costs[r][op] != undefined && gas_costs[r][op] != g)
+            return false;
+    }
+    return true;
+}
+
 
 /// The global, EVM revision independent, table of traits of all known EVM instructions.
 constexpr inline std::array<Traits, 256> traits = []() noexcept {

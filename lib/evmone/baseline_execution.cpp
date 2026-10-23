@@ -10,6 +10,7 @@
 #include "zilk_core/print.hpp"
 #include "vm.hpp"
 
+#include <array>
 #include <bit>
 #include <memory>
 
@@ -52,6 +53,44 @@ inline constexpr int16_t DISPATCH_GAS_COST<OP_JUMPI> = 0;
 
 static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP_JUMPI),
     "the jump instructions must charge a compile-time constant gas cost");
+#endif
+
+#if !EVMONE_RV32_DISPATCH
+/// The revisions from which a new set of instructions is defined: dispatch_cgoto() has a table
+/// for each, used for it and the revisions up to the next one.
+inline constexpr evmc_revision TABLE_REVISIONS[] = {EVMC_FRONTIER, EVMC_HOMESTEAD, EVMC_BYZANTIUM,
+    EVMC_PETERSBURG, EVMC_ISTANBUL, EVMC_LONDON, EVMC_SHANGHAI, EVMC_CANCUN, EVMC_OSAKA,
+    EVMC_AMSTERDAM};
+
+/// The index in TABLE_REVISIONS of each revision's table.
+inline constexpr auto TABLE_INDEX = [] {
+    std::array<uint8_t, EVMC_MAX_REVISION + 1> index{};
+    size_t t = 0;
+    for (size_t r = 0; r <= EVMC_MAX_REVISION; ++r)
+    {
+        if (t + 1 < std::size(TABLE_REVISIONS) && r >= TABLE_REVISIONS[t + 1])
+            ++t;
+        index[r] = static_cast<uint8_t>(t);
+    }
+    return index;
+}();
+
+/// Every revision defines the instructions of its table's revision.
+consteval bool tables_match_revisions() noexcept
+{
+    for (size_t r = 0; r <= EVMC_MAX_REVISION; ++r)
+    {
+        for (size_t op = 0; op < 256; ++op)
+        {
+            const auto t = TABLE_REVISIONS[TABLE_INDEX[r]];
+            if ((instr::gas_costs[r][op] == instr::undefined) !=
+                (instr::gas_costs[t][op] == instr::undefined))
+                return false;
+        }
+    }
+    return true;
+}
+static_assert(tables_match_revisions(), "TABLE_REVISIONS must list every change of the instruction set");
 #endif
 
 /// Checks instruction requirements before execution.
@@ -97,7 +136,10 @@ static_assert(instr::has_const_gas_cost(OP_JUMP) && instr::has_const_gas_cost(OP
 /// @param          bottom2       stack_bottom + 2.
 /// @return  Status code with information which check has failed
 ///          or EVMC_SUCCESS if everything is fine.
-template <Opcode Op>
+/// @tparam         DefinedByDispatch  The dispatch never runs Op where it is undefined (see
+///                                    dispatch_cgoto()): no check for that, and the constant cost
+///                                    of an instruction whose cost is the same wherever defined.
+template <Opcode Op, bool DefinedByDispatch = false>
 inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t& gas_left,
     const uint256* stack_top, const uint256* stack_bottom, const uint256* bottom1,
     const uint256* bottom2, const uint256* stack_limit) noexcept
@@ -110,15 +152,23 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
         !instr::has_const_gas_cost(Op) || instr::gas_costs[EVMC_FRONTIER][Op] != instr::undefined,
         "undefined instructions must not be handled by check_requirements()");
 
-    auto gas_cost = DISPATCH_GAS_COST<Op>;  // Init assuming const cost.
-    if constexpr (!instr::has_const_gas_cost(Op))
+    // The cost is a compile-time constant (and then DISPATCH_GAS_COST) when it is the same in
+    // every revision, or in every revision defining Op with the dispatch excluding the others.
+    constexpr bool const_cost =
+        instr::has_const_gas_cost(Op) ||
+        (DefinedByDispatch && instr::has_const_gas_cost_when_defined(Op));
+    constexpr int16_t CONST_COST =
+        instr::has_const_gas_cost(Op) ? DISPATCH_GAS_COST<Op> : instr::defined_gas_cost(Op);
+
+    auto gas_cost = CONST_COST;  // Init assuming const cost.
+    if constexpr (!const_cost)
     {
         gas_cost = cost_table[Op];  // If not, load the cost from the current revision cost table.
 
         // Negative cost marks an undefined instruction.
         // This check must be the first to produce the correct error code.
         // By definition not possible if defined since the first revision.
-        if constexpr (instr::traits[Op].since != EVMC_FRONTIER)
+        if constexpr (instr::traits[Op].since != EVMC_FRONTIER && !DefinedByDispatch)
         {
             if (INTX_UNLIKELY(gas_cost < 0))
                 return EVMC_UNDEFINED_INSTRUCTION;
@@ -149,7 +199,7 @@ inline evmc_status_code check_requirements(const CostTable& cost_table, int64_t&
             return EVMC_STACK_UNDERFLOW;
     }
 
-    if constexpr (!instr::has_const_gas_cost(Op) || DISPATCH_GAS_COST<Op> > 0)
+    if constexpr (!const_cost || CONST_COST > 0)
     {
 #if EVMONE_RV32_DISPATCH
         if (INTX_UNLIKELY(!deduct_gas(gas_left, static_cast<uint32_t>(gas_cost))))
@@ -1267,7 +1317,7 @@ template <Opcode Op>
 #endif
 
 /// A helper to invoke the instruction implementation of the given opcode Op.
-template <Opcode Op, bool TracingEnabled>
+template <Opcode Op, bool TracingEnabled, bool DefinedByDispatch = false>
 [[release_inline]] inline Position invoke(const CostTable& cost_table, const uint256* stack_bottom,
     const uint256* bottom1, const uint256* bottom2, const uint256* stack_limit, Position pos,
     int64_t& gas, ExecutionState& state, [[maybe_unused]] JumpBase jb) noexcept
@@ -1352,7 +1402,7 @@ template <Opcode Op, bool TracingEnabled>
     }
 #endif
     // auto starting_gas = gas;
-    const auto status = check_requirements<Op>(
+    const auto status = check_requirements<Op, DefinedByDispatch>(
         cost_table, gas, pos.stack_end, stack_bottom, bottom1, bottom2, stack_limit);
     if (status != EVMC_SUCCESS)
     {
@@ -1974,15 +2024,50 @@ int64_t dispatch_cgoto(
 #define SWAP1_CGOTO(OP) (slot(OP)[-256])
 #define SWAP2_CGOTO(OP) (slot(OP)[-512])
 #else
-    static constexpr void* cgoto_table[] = {
-#define ON_OPCODE(OPCODE) &&TARGET_##OPCODE,
+    // One table for each revision of TABLE_REVISIONS, an instruction undefined there sent to
+    // TARGET_OP_UNDEFINED: the handlers do not check that their instruction is defined, and those
+    // with the same cost wherever defined charge it as a constant (see check_requirements()).
+    static constexpr void* cgoto_tables[][256] = {
+#define ON_OPCODE(OPCODE) \
+    instr::gas_costs[REV][OPCODE] == instr::undefined ? &&TARGET_OP_UNDEFINED : &&TARGET_##OPCODE,
 #undef ON_OPCODE_UNDEFINED
 #define ON_OPCODE_UNDEFINED(_) &&TARGET_OP_UNDEFINED,
-        MAP_OPCODES
+#define REV EVMC_FRONTIER
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_HOMESTEAD
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_BYZANTIUM
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_PETERSBURG
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_ISTANBUL
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_LONDON
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_SHANGHAI
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_CANCUN
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_OSAKA
+        {MAP_OPCODES},
+#undef REV
+#define REV EVMC_AMSTERDAM
+        {MAP_OPCODES},
+#undef REV
 #undef ON_OPCODE
 #undef ON_OPCODE_UNDEFINED
 #define ON_OPCODE_UNDEFINED ON_OPCODE_UNDEFINED_DEFAULT
     };
+    static_assert(std::size(cgoto_tables) == std::size(TABLE_REVISIONS));
+    const auto* const cgoto_table = cgoto_tables[TABLE_INDEX[state.rev]];
 #define CGOTO(OP) cgoto_table[OP]
 #endif
 
@@ -2003,7 +2088,7 @@ int64_t dispatch_cgoto(
     goto* CGOTO(*position.code_it);
 
 #define ON_OPCODE_INVOKE(OPCODE)                                                                 \
-    if (const auto next = invoke<OPCODE, false>(                                                 \
+    if (const auto next = invoke<OPCODE, false, !EVMONE_RV32_DISPATCH>(                          \
             cost_table, stack_bottom, bottom1, bottom2, stack_limit, position, gas, state, jb);  \
         next.code_it == nullptr)                                                                 \
     {                                                                                            \
