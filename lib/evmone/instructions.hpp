@@ -453,6 +453,52 @@ inline void mul(StackTop stack) noexcept
     register uintptr_t r11 asm("x11") = reinterpret_cast<uintptr_t>(&stack[0]);
     register uint32_t r12 asm("x12") = 0x08;  // MUL_LOW
     asm volatile("csrrw x0, 0x7CA, x0" : "+r"(r12) : "r"(r10), "r"(r11) : "memory");
+#elif defined(__x86_64__) && defined(__BMI2__)
+    // stack[1] = low256(stack[1] * stack[0]) by the rows of stack[1]'s words, each row's
+    // products added with add/adc: the result word below a row is final after it and goes to
+    // the slot of the row's word, already loaded. 32 instructions, no temporaries; GCC builds
+    // every C++ form of this (128-bit or carry-builtin accumulators) through stack temporaries,
+    // in twice the instructions, and reads the result back as a 32-byte load the four 8-byte
+    // stores cannot forward to.
+    auto& x = stack[1];
+    const auto& y = stack[0];
+    uint64_t r1, r2, r3, lo, hi;
+    asm("mov %[x0], %%rdx\n\t"
+        "mulx %[y0], %[lo], %[hi]\n\t"
+        "mov %[lo], %[x0]\n\t"
+        "mulx %[y1], %[r1], %[r2]\n\t"
+        "add %[hi], %[r1]\n\t"
+        "mulx %[y2], %[lo], %[r3]\n\t"
+        "adc %[lo], %[r2]\n\t"
+        "adc $0, %[r3]\n\t"
+        "imul %[y3], %%rdx\n\t"
+        "add %%rdx, %[r3]\n\t"
+        "mov %[x1], %%rdx\n\t"
+        "mulx %[y0], %[lo], %[hi]\n\t"
+        "add %[lo], %[r1]\n\t"
+        "adc %[hi], %[r2]\n\t"
+        "adc $0, %[r3]\n\t"
+        "mov %[r1], %[x1]\n\t"
+        "mulx %[y1], %[lo], %[hi]\n\t"
+        "add %[lo], %[r2]\n\t"
+        "adc %[hi], %[r3]\n\t"
+        "imul %[y2], %%rdx\n\t"
+        "add %%rdx, %[r3]\n\t"
+        "mov %[x2], %%rdx\n\t"
+        "mulx %[y0], %[lo], %[hi]\n\t"
+        "add %[lo], %[r2]\n\t"
+        "adc %[hi], %[r3]\n\t"
+        "mov %[r2], %[x2]\n\t"
+        "imul %[y1], %%rdx\n\t"
+        "add %%rdx, %[r3]\n\t"
+        "mov %[x3], %%rdx\n\t"
+        "imul %[y0], %%rdx\n\t"
+        "add %%rdx, %[r3]\n\t"
+        "mov %[r3], %[x3]"
+        : [x0] "+m"(x[0]), [x1] "+m"(x[1]), [x2] "+m"(x[2]), [x3] "+m"(x[3]), [r1] "=&r"(r1),
+        [r2] "=&r"(r2), [r3] "=&r"(r3), [lo] "=&r"(lo), [hi] "=&r"(hi)
+        : [y0] "m"(y[0]), [y1] "m"(y[1]), [y2] "m"(y[2]), [y3] "m"(y[3])
+        : "rdx", "cc");
 #else
     stack.top() *= stack.pop();
 #endif
