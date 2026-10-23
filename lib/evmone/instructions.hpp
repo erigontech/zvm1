@@ -2313,6 +2313,14 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
     static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
     static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
 
+    if constexpr (Len == 32)
+    {
+        // The whole slot is the immediate: one big-endian load, without zeroing the slot first
+        // (with AVX2 a 32-byte load, a permute and a shuffle).
+        stack.push(intx::be::unsafe::load<uint256>(pos + 1));
+        return pos + 33;
+    }
+
     stack.push({});
     auto& r = stack.top();
     pos += 1;  // Skip the opcode.
