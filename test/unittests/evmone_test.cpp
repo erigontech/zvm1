@@ -84,8 +84,10 @@ TEST(evmone, max_memory_size)
     // The memory of w words costs 3w + w²/512 gas.
     const auto cost = [](uint64_t words) { return 3 * words + words * words / 512; };
 
-    EXPECT_EQ(VM::max_memory_size(-1), 0);
-    EXPECT_EQ(VM::max_memory_size(0), 0);
+    // At least a page: the least capacity of Memory.
+    EXPECT_EQ(VM::max_memory_size(-1), evmone::Memory::page_size);
+    EXPECT_EQ(VM::max_memory_size(0), evmone::Memory::page_size);
+    EXPECT_EQ(VM::max_memory_size(1), evmone::Memory::page_size);
     EXPECT_EQ(VM::max_memory_size(int64_t{1} << 25), VM::MAX_RESERVED_MEMORY);
     EXPECT_EQ(VM::max_memory_size(std::numeric_limits<int64_t>::max()), VM::MAX_RESERVED_MEMORY);
 
@@ -94,6 +96,7 @@ TEST(evmone, max_memory_size)
         const auto size = VM::max_memory_size(gas);
         ASSERT_EQ(size % 32, 0) << gas;
         ASSERT_LE(size, VM::MAX_RESERVED_MEMORY) << gas;
+        ASSERT_GE(size, evmone::Memory::page_size) << gas;
 
         // The largest affordable memory fits, unless capped.
         const auto words = size / 32;

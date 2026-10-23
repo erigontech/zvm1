@@ -2106,26 +2106,20 @@ evmc::Result execute(VM& vm, const evmc_host_interface& host, evmc_host_context*
 
     auto& state = vm.get_execution_state(static_cast<size_t>(msg.depth));
     state.reset(msg, rev, host, ctx, code);
-    state.vm = &vm;
 
     // Top-level entry: rewind to the start of the first stack segment.
     if (msg.depth == 0)
-    {
-        vm.stack_segment = 0;
-        vm.stack_tail = vm.stack_segments[0].begin;
-    }
+        vm.reset_stack_tail();
 
     // This frame's stack lives at the current tail, or at the start of the next segment if its
     // stack and the EVM memory its gas can pay for do not fit. The memory borrows the rest of
     // the segment as its initial backing. If memory grows past this (only with more gas than a
     // transaction can have), Memory transparently falls back to a heap allocation.
     auto* const bottom = vm.place_frame(msg.gas);
-    state.stack_segment = vm.stack_segment;
     state.stack_bottom = reinterpret_cast<uint256*>(bottom);
     auto* const mem_buf = reinterpret_cast<uint8_t*>(bottom + VM::FRAME_STRIDE);
-    state.memory.set_borrowed(mem_buf,
-        static_cast<size_t>(
-            reinterpret_cast<uint8_t*>(vm.stack_segments[vm.stack_segment].end) - mem_buf));
+    state.memory.set_borrowed(
+        mem_buf, static_cast<size_t>(reinterpret_cast<uint8_t*>(vm.stack_end) - mem_buf));
 
     state.analysis.baseline = &analysis;  // Assign code analysis for instruction implementations.
 

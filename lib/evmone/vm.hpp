@@ -110,22 +110,23 @@ public:
     static constexpr size_t STACK_SEGMENT_SIZE = size_t{8} * 1024 * 1024;
     static_assert(FRAME_STRIDE + MAX_RESERVED_MEMORY <= STACK_SEGMENT_SIZE);
 
-    /// The upper bound of the EVM memory size in bytes that a frame with the gas limit @p gas can
-    /// pay for, capped at MAX_RESERVED_MEMORY. The w words cost 3w + w²/512 gas, more than
-    /// w²/512, so w < 16 * sqrt(2 * gas). The sqrt is bounded from above by one Newton step from
-    /// a power of 2, with no multiplication nor division: off by at most 25%.
+    /// The EVM memory size in bytes that a frame with the gas limit @p gas reserves: an upper
+    /// bound of what the gas can pay for, at least a page (the least capacity of Memory) and
+    /// capped at MAX_RESERVED_MEMORY. The w words cost 3w + w²/512 gas, more than w²/512, so
+    /// w < 16 * sqrt(2 * gas). The sqrt is bounded from above by one Newton step from a power
+    /// of 2, with no multiplication nor division: off by at most 25%.
     [[nodiscard]] static constexpr size_t max_memory_size(int64_t gas) noexcept
     {
         // 16 * sqrt(2 * 2^25) words are MAX_RESERVED_MEMORY.
         if (gas >= (int64_t{1} << 25))
             return MAX_RESERVED_MEMORY;
         if (gas <= 0)
-            return 0;
+            return Memory::page_size;
         const auto n = static_cast<uint32_t>(gas) * 2;
         const auto k = static_cast<unsigned>(std::bit_width(n) + 1) / 2;  // 2^k >= sqrt(n).
         // From above, the Newton step stays above sqrt(n) - 1.
         const auto r = (((uint32_t{1} << k) + (n >> k)) >> 1) + 1;
-        return std::min(size_t{r} * 16 * 32, MAX_RESERVED_MEMORY);
+        return std::clamp(size_t{r} * 16 * 32, Memory::page_size, MAX_RESERVED_MEMORY);
     }
 
     /// The EVM stacks and memories of the frames, packed densely in stack segments. A frame
@@ -157,23 +158,30 @@ public:
 
     std::vector<StackSegment> stack_segments;
 
-    /// The index of the segment of the stack tail.
-    size_t stack_segment = 0;
-
     /// Next free byte in the current stack segment. The next frame to be entered starts its
     /// stack at this address, unless its reservation does not fit. Reset to the first segment
     /// on depth-0 entry; updated by `call_impl`/`create_impl` before each nested call to skip
     /// past the parent's stack + live EVM memory.
     std::byte* stack_tail = nullptr;
 
-    /// Hands the stack tail after the caller's stack and live EVM memory to the sub-frame.
+    /// The end of the current stack segment.
+    std::byte* stack_end = nullptr;
+
+    /// Rewinds the stack tail to the start of the first segment, for a depth-0 entry.
+    void reset_stack_tail() noexcept
+    {
+        stack_tail = stack_segments[0].begin;
+        stack_end = stack_segments[0].end;
+    }
+
+    /// Hands the segment space after the caller's live EVM memory to the sub-frame. The caller's
+    /// memory borrows the rest of its segment, so the segment ends where the memory buffer does.
+    /// With the memory moved to the heap, the whole buffer is free again.
     void set_stack_tail(const ExecutionState& caller) noexcept
     {
-        // With the memory moved to the heap, the segment space after the stack is free again.
-        stack_segment = caller.stack_segment;
-        stack_tail = caller.memory.is_borrowed() ?
-                         reinterpret_cast<std::byte*>(caller.memory.borrowed_end()) :
-                         reinterpret_cast<std::byte*>(caller.stack_bottom) + FRAME_STRIDE;
+        const auto [begin, end] = caller.memory.unused_borrowed();
+        stack_tail = reinterpret_cast<std::byte*>(begin);
+        stack_end = reinterpret_cast<std::byte*>(end);
     }
 
     /// Places a frame with the gas limit @p gas, reserving its stack and the EVM memory the gas
@@ -183,7 +191,7 @@ public:
     /// less room than the largest one, which is rare: the segment is almost twice as big.
     [[nodiscard]] std::byte* place_frame(int64_t gas) noexcept
     {
-        const auto room = static_cast<size_t>(stack_segments[stack_segment].end - stack_tail);
+        const auto room = static_cast<size_t>(stack_end - stack_tail);
         if (room < FRAME_STRIDE + MAX_RESERVED_MEMORY) [[unlikely]]
             place_frame_near_end(gas, room);
         return stack_tail;
@@ -193,7 +201,8 @@ private:
     /// The place_frame() path when the segment has less room than the largest reservation.
     [[gnu::cold]] void place_frame_near_end(int64_t gas, size_t room) noexcept;
 
-    /// Moves the stack tail to the start of the next stack segment, allocating it if needed.
+    /// Moves the stack tail to the start of the segment after the one ending at stack_end,
+    /// allocating it if needed (the first one in the constructor).
     [[gnu::cold]] void next_stack_segment() noexcept;
 
     std::vector<ExecutionState> m_execution_states;

@@ -86,6 +86,7 @@ struct AdvancedExecutionState : ExecutionState
         bytes_view _code) noexcept
     {
         ExecutionState::reset(message, revision, host_interface, host_ctx, _code);
+        memory.clear();
         gas_left = message.gas;
         stack_bottom = own_stack.get();
         stack = own_stack.get();

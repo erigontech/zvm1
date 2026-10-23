@@ -119,9 +119,10 @@ void VM::place_frame_near_end(int64_t gas, size_t room) noexcept
 
 void VM::next_stack_segment() noexcept
 {
-    if (!stack_segments.empty())
-        ++stack_segment;
-    if (stack_segment == stack_segments.size())
+    size_t next = 0;
+    while (next < stack_segments.size() && stack_segments[next++].end != stack_end)
+        ;
+    if (next == stack_segments.size())
     {
         // Every reservation fits a segment, so the segments are all of the same size.
         constexpr size_t align = sizeof(intx::uint256);
@@ -131,7 +132,8 @@ void VM::next_stack_segment() noexcept
         auto* const begin = p + (-reinterpret_cast<uintptr_t>(p) & (align - 1));
         stack_segments.push_back({StackSegment::Storage{p}, begin, begin + STACK_SEGMENT_SIZE});
     }
-    stack_tail = stack_segments[stack_segment].begin;
+    stack_tail = stack_segments[next].begin;
+    stack_end = stack_segments[next].end;
 }
 
 ExecutionState& VM::get_execution_state(size_t depth) noexcept
@@ -141,7 +143,11 @@ ExecutionState& VM::get_execution_state(size_t depth) noexcept
     // The ExecutionStates are lazily created because they pre-allocate EVM memory and stack.
     // assert(depth < m_execution_states.capacity());
     if (m_execution_states.size() <= depth)
+    {
         m_execution_states.resize(depth + 1);
+        for (auto& state : m_execution_states)
+            state.vm = this;
+    }
     return m_execution_states[depth];
 }
 

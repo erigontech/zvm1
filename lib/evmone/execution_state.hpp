@@ -53,12 +53,15 @@ struct StackSpace
 /// end of the segment, at least what the frame's gas can pay for up to
 /// VM::MAX_RESERVED_MEMORY. If `grow()` would exceed that, the data is
 /// copied to a heap buffer once and subsequent grows `realloc()` it.
-/// A Memory not given a borrowed buffer (or given one smaller than a page)
-/// uses a heap page, so the capacity is never below page_size.
+/// A Memory not given a borrowed buffer uses a heap page, so the capacity is never below
+/// page_size.
 class Memory
 {
-    /// The size of allocation "page".
+public:
+    /// The size of allocation "page", the least capacity.
     static constexpr size_t page_size = 4 * 1024;
+
+private:
 
     /// Pointer to the active backing storage. Either borrowed (a slice of
     /// a VM stack segment) or heap-owned (malloc-allocated).
@@ -76,6 +79,10 @@ class Memory
 
     /// True when `m_data` was allocated on the heap and must be freed.
     bool m_heap_owned = false;
+
+    /// The borrowed buffer the contents moved out of to the heap: it is unused since.
+    uint8_t* m_spilled_begin = nullptr;
+    uint8_t* m_spilled_end = nullptr;
 
     [[noreturn, gnu::cold]] static void handle_out_of_memory() noexcept { std::terminate(); }
 
@@ -119,6 +126,8 @@ class Memory
             auto* p = static_cast<uint8_t*>(std::malloc(new_capacity));
             if (p != nullptr && m_size != 0)
                 std::memcpy(p, m_data, m_size);
+            m_spilled_begin = m_data;
+            m_spilled_end = m_data + m_capacity;
             m_data = p;
             m_heap_owned = true;
         }
@@ -142,7 +151,9 @@ public:
         m_size{other.m_size},
         m_lim{other.m_lim},
         m_capacity{other.m_capacity},
-        m_heap_owned{other.m_heap_owned}
+        m_heap_owned{other.m_heap_owned},
+        m_spilled_begin{other.m_spilled_begin},
+        m_spilled_end{other.m_spilled_end}
     {
         other.m_data = nullptr;
         other.m_size = 0;
@@ -162,6 +173,8 @@ public:
             m_lim = other.m_lim;
             m_capacity = other.m_capacity;
             m_heap_owned = other.m_heap_owned;
+            m_spilled_begin = other.m_spilled_begin;
+            m_spilled_end = other.m_spilled_end;
             other.m_data = nullptr;
             other.m_size = 0;
             other.m_lim = 0;
@@ -177,26 +190,19 @@ public:
             std::free(m_data);
     }
 
-    /// Rebind to a borrowed buffer and clear the memory. Frees any heap
+    /// Rebind to a borrowed buffer of at least a page and clear the memory. Frees any heap
     /// allocation owned from a previous frame execution at this depth slot.
-    /// A buffer smaller than a page is not borrowed: the memory keeps (or
-    /// allocates) a heap page instead, so the capacity stays at least a page.
     void set_borrowed(uint8_t* buf, size_t capacity) noexcept
     {
-        set_size(0, 0);
-        if (capacity < page_size)
-        {
-            if (!m_heap_owned)
-                allocate_heap(page_size);
-            return;
-        }
-        if (m_heap_owned)
+        assert(capacity >= page_size);
+        if (m_heap_owned) [[unlikely]]
         {
             std::free(m_data);
             m_heap_owned = false;
         }
         m_data = buf;
         m_capacity = capacity;
+        set_size(0, 0);
     }
 
     uint8_t& operator[](size_t index) noexcept { return m_data[index]; }
@@ -204,13 +210,19 @@ public:
 
     [[nodiscard]] size_t size() const noexcept { return m_size; }
 
-    /// True iff the active backing storage is the borrowed shared buffer.
-    [[nodiscard]] bool is_borrowed() const noexcept { return !m_heap_owned; }
-
-    /// Pointer one past the last byte of the live memory contents (only
-    /// meaningful when borrowed). Used by call_impl to place the next frame's
-    /// stack right after the parent's memory.
-    [[nodiscard]] uint8_t* borrowed_end() const noexcept { return m_data + m_size; }
+    /// The unused part [begin, end) of the borrowed buffer: after the live contents, or all of
+    /// it once they moved to the heap. Used by call_impl to place the next frame there.
+    struct Span
+    {
+        uint8_t* begin;
+        uint8_t* end;
+    };
+    [[nodiscard]] Span unused_borrowed() const noexcept
+    {
+        if (!m_heap_owned) [[likely]]
+            return {m_data + m_size, m_data + m_capacity};
+        return {m_spilled_begin, m_spilled_end};
+    }
 
     /// The offset below which a 32-byte access lies inside the memory, whatever the offset: the
     /// size is a multiple of 32, so w + 32 <= size exactly when w < size - 31, which is one
@@ -345,16 +357,12 @@ public:
     /// The frame's state-gas counters (EIP-8037).
     StateGas state_gas;
 
-    /// Bottom of this frame's EVM stack. Points into the VM stack segment
-    /// `stack_segment` at the position the executor entry handed out. Never
-    /// null during dispatch.
+    /// Bottom of this frame's EVM stack. Points into a VM stack segment at the position the
+    /// executor entry handed out, followed by the EVM memory borrowing the rest of the segment.
     uint256* stack_bottom = nullptr;
 
-    /// The index of the VM stack segment holding this frame's stack and EVM memory.
-    size_t stack_segment = 0;
-
-    /// Back-pointer to the owning VM. Used by call/create instructions to
-    /// update `VM::stack_tail` before invoking a sub-frame.
+    /// Back-pointer to the owning VM, set once by VM::get_execution_state(). Used by call/create
+    /// instructions to update `VM::stack_tail` before invoking a sub-frame.
     VM* vm = nullptr;
 
     ExecutionState() noexcept = default;
@@ -378,7 +386,6 @@ public:
     {
         gas_refund = 0;
         state_gas = {{.left = message.state_gas}};
-        memory.clear();
         msg = &message;
         cd_lim = calldata_limit(message);
         host = {host_interface, host_ctx};
@@ -393,10 +400,7 @@ public:
         // else reads m_tx: resetting that field invalidates it, where zeroing all 240 bytes was
         // a memset per message.
         m_tx.block_timestamp = 0;
-        // The executor entry MUST set stack_bottom before dispatch; cleared
-        // here so any caller that forgets fails fast on a nullptr dereference
-        // rather than dispatching with a stale value.
-        stack_bottom = nullptr;
+        // The memory is cleared and the stack placed by the executor entry.
     }
 
     [[nodiscard]] bool in_static_mode() const { return (msg->flags & EVMC_STATIC) != 0; }
