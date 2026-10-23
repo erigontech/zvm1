@@ -317,6 +317,22 @@ inline bool check_memory(
     gas_left = static_cast<int64_t>((uint64_t{hi} << 32) | lo);
     return gas_left >= 0;
 }
+#endif
+
+/// Whether a memory offset fits in 32 bits, its low 32 bits in w0. A 32-bit build tests the
+/// word's 32-bit halves, a 64-bit one the low word's high half with the other words: one test,
+/// where check_memory() tests the high words and compares the low one with max_buffer_size.
+[[gnu::always_inline]] inline bool offset_fits32(const uint256& offset, uint32_t& w0) noexcept
+{
+#if (defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+    const word32* const w = reinterpret_cast<const word32*>(&offset);
+    w0 = w[0];
+    return (w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
+#else
+    w0 = static_cast<uint32_t>(offset[0]);
+    return ((offset[0] >> 32) | offset[1] | offset[2] | offset[3]) == 0;
+#endif
+}
 
 /// check_memory() for a 32-byte access (MLOAD), which also gives the offset it checked.
 ///
@@ -327,11 +343,10 @@ inline bool check_memory(
 [[gnu::always_inline]] inline bool check_memory32(
     int64_t& gas_left, Memory& memory, const uint256& offset, size_t& at) noexcept
 {
-    const word32* const w = reinterpret_cast<const word32*>(&offset);
-    if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
+    uint32_t w0;
+    if (!offset_fits32(offset, w0))
         return false;
 
-    const uint32_t w0 = w[0];
     if (w0 >= memory.limit32())
     {
         gas_left = grow_memory(gas_left, memory, uint64_t{w0} + 32);
@@ -342,46 +357,69 @@ inline bool check_memory(
     return true;
 }
 
-/// check_memory32() for the 32 bytes of MSTORE. A store starting at or below the end of the memory
-/// grows it by one word (85% of MSTORE's growths on mainnet blocks), which is made here rather
-/// than in grow_memory(). From n to n + 1 words the cost is 3 + (n + 1)^2 / 512 - n^2 / 512
-/// (floored divisions), that is 3 + (n^2 % 512 + 2n + 1) / 512, and n^2 % 512 is the low 9 bits
-/// of the wrapped 32-bit square: exact at any size.
+/// The growth of the memory for an MSTORE at w0 (at or past Memory::limit32()). A store starting
+/// at or below the end of the memory grows it by one word (85% of MSTORE's growths on mainnet
+/// blocks), which is made here rather than in grow_memory(). From n to n + 1 words the cost is
+/// 3 + (n + 1)^2 / 512 - n^2 / 512 (floored divisions), that is 3 + (n^2 % 512 + 2n + 1) / 512,
+/// and n^2 % 512 is the low 9 bits of the wrapped 32-bit square: exact at any size. False when out
+/// of gas.
+[[gnu::always_inline]] inline bool grow_memory_for_mstore(
+    int64_t& gas_left, Memory& memory, uint32_t w0) noexcept
+{
+    // The store ends past the memory. A start at most at its end grows it by one word.
+    const auto size = memory.size();
+    if (w0 <= size && size + word_size <= memory.capacity())
+    {
+        const auto n = static_cast<uint32_t>(size >> 5);
+        const auto cost = 3 + ((((n * n) & 511) + 2 * n + 1) >> 9);
+        // A plain 64-bit subtraction: a deduct_gas()-style low-word update keeps gas_left in a
+        // register pair across every MSTORE.
+        if ((gas_left -= cost) < 0)
+            return false;
+        memory.grow_word_for_store(w0);
+        return true;
+    }
+    gas_left = grow_memory(gas_left, memory, uint64_t{w0} + 32);
+    return gas_left >= 0;
+}
+
+#if !((defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST))
+/// grow_memory_for_mstore() out of line: inline, GCC takes MSTORE for too large to inline into
+/// the dispatch loop on 64-bit targets and calls it for every MSTORE. The gas goes by value and
+/// comes back, negative when out of gas: the address of the dispatch loop's gas_left taken for
+/// the call would keep it in memory across the loop.
+[[gnu::noinline]] inline int64_t grow_memory_for_mstore_call(
+    int64_t gas_left, Memory& memory, uint32_t w0) noexcept
+{
+    grow_memory_for_mstore(gas_left, memory, w0);
+    return gas_left;
+}
+#endif
+
+/// check_memory32() for the 32 bytes of MSTORE, with the growth of grow_memory_for_mstore().
 inline bool check_memory_for_mstore(
     int64_t& gas_left, Memory& memory, const uint256& offset, size_t& at) noexcept
 {
-    const word32* const w = reinterpret_cast<const word32*>(&offset);
-    if ((w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0)
+    uint32_t w0;
+    if (!offset_fits32(offset, w0))
         return false;
 
-    const uint32_t w0 = w[0];
     // Unlikely: GCC otherwise lays out the growth inline and the stores that do not grow the
     // memory (most of them) pay for the jump around it.
     if (w0 >= memory.limit32()) [[unlikely]]
     {
-        // The store ends past the memory. A start at most at its end grows it by one word.
-        const auto size = memory.size();
-        if (w0 <= size && size + word_size <= memory.capacity())
-        {
-            const auto n = static_cast<uint32_t>(size >> 5);
-            const auto cost = 3 + ((((n * n) & 511) + 2 * n + 1) >> 9);
-            // A plain 64-bit subtraction: a deduct_gas()-style low-word update keeps gas_left in a
-            // register pair across every MSTORE.
-            if ((gas_left -= cost) < 0)
-                return false;
-            memory.grow_word_for_store(w0);
-        }
-        else
-        {
-            gas_left = grow_memory(gas_left, memory, uint64_t{w0} + 32);
-            if (gas_left < 0) [[unlikely]]
-                return false;
-        }
+#if (defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
+        if (!grow_memory_for_mstore(gas_left, memory, w0))
+            return false;
+#else
+        gas_left = grow_memory_for_mstore_call(gas_left, memory, w0);
+        if (gas_left < 0) [[unlikely]]
+            return false;
+#endif
     }
     at = w0;
     return true;
 }
-#endif
 
 /// Check memory requirements for "copy" instructions.
 inline bool check_memory(
@@ -1951,15 +1989,9 @@ inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noe
 {
     auto& index = stack.top();
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
     size_t at = 0;
     if (!check_memory32(gas_left, state.memory, index, at))
         return {EVMC_OUT_OF_GAS, gas_left};
-#else
-    if (!check_memory(gas_left, state.memory, index, 32))
-        return {EVMC_OUT_OF_GAS, gas_left};
-    const auto at = static_cast<size_t>(index);
-#endif
 
 #ifdef EVMONE_WORD_LAYOUT
     wl::load_u256(index, &state.memory[at]);
@@ -1974,17 +2006,11 @@ inline Result mstore(StackTop stack, int64_t gas_left, ExecutionState& state) no
     const auto& index = stack.pop();
     const auto& value = stack.pop();
 
-#if (defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32) || defined(EVMONE_RV32_DISPATCH_TEST)
     // The fast path leaves a new word the store covers whole unzeroed: the store below writes
     // all 32 bytes.
     size_t at = 0;
     if (!check_memory_for_mstore(gas_left, state.memory, index, at))
         return {EVMC_OUT_OF_GAS, gas_left};
-#else
-    if (!check_memory(gas_left, state.memory, index, 32))
-        return {EVMC_OUT_OF_GAS, gas_left};
-    const auto at = static_cast<size_t>(index);
-#endif
 
 #ifdef EVMONE_WORD_LAYOUT
     wl::store_u256(&state.memory[at], value);
