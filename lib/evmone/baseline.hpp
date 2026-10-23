@@ -189,25 +189,34 @@ public:
 #endif
     }
 
-#if EVMONE_JUMPDEST_BYTEMAP
     /// The JUMPDEST map, for a caller that keeps it in a register: see check_jumpdest_in().
     [[nodiscard]] JumpdestMap jumpdest_map() const noexcept { return m_jumpdest_map; }
 
     /// check_jumpdest() with the map passed in, as jumpdest_map() returned it, which saves its
-    /// load.
-    [[nodiscard]] bool check_jumpdest_in(JumpdestMap map, uint32_t position) const noexcept
+    /// load. The position is a uint32_t on rv32 (whose callers have checked the high words) and a
+    /// uint64_t elsewhere.
+    template <typename Position>
+    [[nodiscard]] bool check_jumpdest_in(JumpdestMap map, Position position) const noexcept
     {
+#if EVMONE_LAZY_JUMPDESTS
         // The scan falls through to the one map test: returning check_jumpdest()'s result instead
         // makes GCC merge the two answers into a register and test that on every jump.
         if (position >= m_scanned) [[unlikely]]
         {
             if (position >= m_code.size())
                 return false;
-            scan_to(position);
+            scan_to(static_cast<size_t>(position));
         }
-        return map[position] != 0;
-    }
+#else
+        if (position >= m_code.size())
+            return false;
 #endif
+#if EVMONE_JUMPDEST_BYTEMAP
+        return map[position] != 0;
+#else
+        return map.test(static_cast<size_t>(position));
+#endif
+    }
 
 private:
 #if EVMONE_LAZY_JUMPDESTS

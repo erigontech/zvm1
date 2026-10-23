@@ -171,25 +171,33 @@ struct Position
     uint256* stack_end;     ///< The pointer to the stack end.
 };
 
-#if EVMONE_RV32_DISPATCH
-/// What a taken jump reads of the analysis besides the scan bound, kept in registers by
-/// dispatch_cgoto(): the code start plus one, where a jump to 0 resumes after its landing
-/// JUMPDEST, and the JUMPDEST map. Each saves a load per jump (and code1 an addi), with the
-/// analysis pointer loaded for the bound alone.
+/// What a taken jump reads of the analysis, kept by the dispatch loop (in registers, or in its
+/// frame where registers are short) instead of loaded through the analysis on every jump: the
+/// code start plus one, where a jump to 0 resumes after its landing JUMPDEST, the JUMPDEST map,
+/// and with the JUMPDESTs scanned up front, the code size that bounds the map. Each saves a load
+/// per jump (and code1 an addi); the lazy scan's bound is still read through the analysis.
 struct JumpBase
 {
     code_iterator code1;
     JumpdestMap map;
+#if !EVMONE_LAZY_JUMPDESTS
+    size_t code_size;
+#endif
 };
 
 [[gnu::always_inline]] inline JumpBase jump_base(
     const uint8_t* code, const ExecutionState& state) noexcept
 {
-    return {code + 1, state.analysis.baseline->jumpdest_map()};
+    const auto& analysis = *state.analysis.baseline;
+#if EVMONE_LAZY_JUMPDESTS
+    return {code + 1, analysis.jumpdest_map()};
+#else
+    return {code + 1, analysis.jumpdest_map(), analysis.code().size()};
+#endif
 }
 
 /// The position after the landing JUMPDEST at dst, a JUMPDEST checked with jb.map.
-[[gnu::always_inline]] inline code_iterator landing(const JumpBase& jb, uint32_t dst) noexcept
+[[gnu::always_inline]] inline code_iterator landing(const JumpBase& jb, size_t dst) noexcept
 {
     const auto target = jb.code1 + dst;
     // A code position is never null. GCC cannot see that through the hidden code1 and would
@@ -198,13 +206,25 @@ struct JumpBase
         __builtin_unreachable();
     return target;
 }
-#else
-struct JumpBase
-{};
 
-[[gnu::always_inline]] inline JumpBase jump_base(const uint8_t*, const ExecutionState&) noexcept
+#if !EVMONE_RV32_DISPATCH
+/// Whether the jump destination dst (a uint256 with zero high words) is a JUMPDEST, with the map
+/// and the bound from jb.
+[[gnu::always_inline]] inline bool is_jumpdest(
+    const JumpBase& jb, const ExecutionState& state, uint64_t dst) noexcept
 {
-    return {};
+#if EVMONE_LAZY_JUMPDESTS
+    return state.analysis.baseline->check_jumpdest_in(jb.map, dst);
+#else
+    (void)state;
+    if (dst >= jb.code_size)
+        return false;
+#if EVMONE_JUMPDEST_BYTEMAP
+    return jb.map[dst] != 0;
+#else
+    return jb.map.test(static_cast<size_t>(dst));
+#endif
+#endif
 }
 #endif
 
@@ -1042,22 +1062,36 @@ template <Opcode Op>
 /// the JUMPDEST at the destination, as jump_impl() does, or fails on a bad destination. Returns
 /// true, the fused sequence handled.
 [[gnu::always_inline]] inline bool jump_to(
-    const uint8_t* imm, Position& pos, ExecutionState& state) noexcept
+    const uint8_t* imm, Position& pos, ExecutionState& state, const JumpBase& jb) noexcept
 {
     // Two byte loads, a shift and an or: without the barrier GCC takes the two bytes for a
     // big-endian halfword and expands its byte swap, 9 instructions without Zbb.
     auto dst = size_t{imm[0]};
     asm("" : "+r"(dst));
     dst = dst << 8 | imm[1];
-    const auto& analysis = *state.analysis.baseline;
-    if (INTX_UNLIKELY(!analysis.check_jumpdest(dst)))
+    if (INTX_UNLIKELY(!is_jumpdest(jb, state, dst)))
     {
         state.status = EVMC_BAD_JUMP_DESTINATION;
         pos.code_it = nullptr;
         return true;
     }
-    pos.code_it = analysis.code().data() + dst + 1;
+    pos.code_it = landing(jb, dst);
     return true;
+}
+
+/// JUMP's jump to the destination dst (the popped item), with jump_impl()'s checks and jb.
+[[gnu::always_inline]] inline code_iterator jump_with(
+    const JumpBase& jb, ExecutionState& state, const uint256& dst) noexcept
+{
+    // Read once: the lazy scan may write memory, which could be the stack item for all GCC
+    // knows, so it would read the destination again for the landing address.
+    const uint64_t offset = dst[0];
+    if (INTX_UNLIKELY((dst[3] | dst[2] | dst[1]) != 0 || !is_jumpdest(jb, state, offset)))
+    {
+        state.status = EVMC_BAD_JUMP_DESTINATION;
+        return nullptr;
+    }
+    return landing(jb, static_cast<size_t>(offset));
 }
 
 /// PUSH2 followed by JUMP or JUMPI, how most jumps are written (19.9M of the 25.9M over 200
@@ -1069,7 +1103,8 @@ template <Opcode Op>
 /// gas or JUMPI's underflow fails first depending on the gas left. The rv32 dispatch has its own
 /// form, fused_push2_jump() above.
 [[gnu::always_inline]] inline bool fused_push2_jump(const uint256* stack_bottom,
-    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    const uint256* stack_limit, Position& pos, int64_t& gas, ExecutionState& state,
+    const JumpBase& jb) noexcept
 {
     static constexpr auto PUSH2_GAS = instr::gas_costs[EVMC_FRONTIER][OP_PUSH2];
     static constexpr auto JUMP_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMP];
@@ -1094,7 +1129,7 @@ template <Opcode Op>
     {
         if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMP_GAS + instr::core::JUMPDEST_GAS) < 0))
             return fail(EVMC_OUT_OF_GAS);
-        return jump_to(c + 1, pos, state);
+        return jump_to(c + 1, pos, state, jb);
     }
     if (INTX_UNLIKELY(pos.stack_end == stack_bottom))
         return false;
@@ -1105,7 +1140,7 @@ template <Opcode Op>
     {
         if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMPI_GAS + instr::core::JUMPDEST_GAS) < 0))
             return fail(EVMC_OUT_OF_GAS);
-        return jump_to(c + 1, pos, state);
+        return jump_to(c + 1, pos, state, jb);
     }
     if (INTX_UNLIKELY((gas -= PUSH2_GAS + JUMPI_GAS) < 0))
         return fail(EVMC_OUT_OF_GAS);
@@ -1124,7 +1159,7 @@ template <Opcode Op>
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_push2_jumpi(const uint256* stack_bottom,
     const uint256* bottom1, const uint256* stack_limit, Position& pos, int64_t& gas,
-    ExecutionState& state) noexcept
+    ExecutionState& state, const JumpBase& jb) noexcept
 {
     static_assert(Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT || Op == OP_SLT ||
                   Op == OP_SGT);
@@ -1177,7 +1212,7 @@ template <Opcode Op>
     }
     if (INTX_UNLIKELY((gas -= GAS + instr::core::JUMPDEST_GAS) < 0))
         return fail(EVMC_OUT_OF_GAS);
-    return jump_to(c + 2, pos, state);
+    return jump_to(c + 2, pos, state, jb);
 }
 #endif
 
@@ -1187,7 +1222,7 @@ template <Opcode Op>
 /// with the checks of fused_cmp_push2_jumpi(): the comparison pops one, so nothing can overflow.
 template <Opcode Op>
 [[gnu::always_inline]] inline bool fused_cmp_iszero_push2_jumpi(const uint256* bottom1,
-    Position& pos, int64_t& gas, ExecutionState& state) noexcept
+    Position& pos, int64_t& gas, ExecutionState& state, const JumpBase& jb) noexcept
 {
     static_assert(Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT);
     static constexpr auto GAS = 3 + 3 + instr::gas_costs[EVMC_FRONTIER][OP_PUSH2] +
@@ -1227,7 +1262,7 @@ template <Opcode Op>
     }
     if (INTX_UNLIKELY((gas -= GAS + instr::core::JUMPDEST_GAS) < 0))
         return fail(EVMC_OUT_OF_GAS);
-    return jump_to(c + 3, pos, state);
+    return jump_to(c + 3, pos, state, jb);
 }
 #endif
 
@@ -1241,7 +1276,7 @@ template <Opcode Op, bool TracingEnabled>
     // Not with a tracer attached: it is to see each instruction.
     if constexpr (Op == OP_PUSH2 && !TracingEnabled)
     {
-        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state))
+        if (fused_push2_jump(stack_bottom, stack_limit, pos, gas, state, jb))
             return pos;
     }
     else if constexpr ((Op == OP_ISZERO || Op == OP_EQ || Op == OP_LT || Op == OP_GT ||
@@ -1251,10 +1286,10 @@ template <Opcode Op, bool TracingEnabled>
         if constexpr (Op != OP_ISZERO && Op != OP_EQ)
         {
             // ISZERO first: it follows each of them more often than PUSH2 does.
-            if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state))
+            if (fused_cmp_iszero_push2_jumpi<Op>(bottom1, pos, gas, state, jb))
                 return pos;
         }
-        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state))
+        if (fused_cmp_push2_jumpi<Op>(stack_bottom, bottom1, stack_limit, pos, gas, state, jb))
             return pos;
     }
 #endif
@@ -1359,6 +1394,25 @@ template <Opcode Op, bool TracingEnabled>
     {
         shift_by_stack<Op>(pos.stack_end);
         return {pos.code_it + 1, pos.stack_end - 1};
+    }
+#endif
+#if EVMONE_JUMP_SKIPS_JUMPDEST
+    // JUMP and JUMPI as instr::core::jump() and jumpi() make them, with the code base and the
+    // JUMPDEST map from jb.
+    if constexpr (Op == OP_JUMP)
+        return {jump_with(jb, state, pos.stack_end[-1]), pos.stack_end - 1};
+    if constexpr (Op == OP_JUMPI)
+    {
+        static constexpr auto BASE_GAS = instr::gas_costs[EVMC_FRONTIER][OP_JUMPI];
+        const auto& dst = pos.stack_end[-1];
+        const auto& cond = pos.stack_end[-2];
+        const auto taken = cond != 0;
+        if (INTX_UNLIKELY((gas -= BASE_GAS + (taken ? instr::core::JUMPDEST_GAS : 0)) < 0))
+        {
+            state.status = EVMC_OUT_OF_GAS;
+            return {nullptr, pos.stack_end};
+        }
+        return {taken ? jump_with(jb, state, dst) : pos.code_it + 1, pos.stack_end - 2};
     }
 #endif
     auto new_pos = invoke(instr::core::impl<Op>, pos, gas, state);
