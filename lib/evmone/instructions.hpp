@@ -1577,7 +1577,6 @@ template <size_t Len>
 }
 #endif
 
-#if defined(EVMONE_WORD_LAYOUT) || (defined(__riscv) && !defined(__riscv_zbb))
 /// CALLDATALOAD of an index that calldataload() does not load whole: one at or past cd_lim, or
 /// above 32 bits. That is 0 at or past the end of the input, else the bytes up to its end followed
 /// by zeros: fewer than 32. Out of line, as the loads of the instruction are long: with them all
@@ -1624,7 +1623,7 @@ template <size_t Len>
 }
 #endif
 
-/// CALLDATALOAD on RISC-V. The whole word lies inside the input when the index is below cd_lim
+/// CALLDATALOAD. The whole word lies inside the input when the index is below cd_lim
 /// (input_size - 31, see ExecutionState): one compare, then the full load in place. In the word
 /// layout the calldata of a call is the caller's memory, and its whole word is 8 word copies.
 [[gnu::always_inline]] inline void calldataload(StackTop stack, ExecutionState& state) noexcept
@@ -1646,35 +1645,6 @@ template <size_t Len>
     load_be_word(index, state.msg->input_data + index[0]);
 #endif
 }
-#else
-inline void calldataload(StackTop stack, ExecutionState& state) noexcept
-{
-    auto& index = stack.top();
-
-    // An index at the end loads 0 here as well, so that below the input has a byte at begin and
-    // input_data is not null (an empty input may have none, which memcpy must not get).
-    if (state.msg->input_size <= index)
-        index = 0;
-    else
-    {
-        const auto begin = static_cast<size_t>(index);
-        const auto end = std::min(begin + 32, state.msg->input_size);
-        const auto len = end - begin;
-
-        if (len == 32) [[likely]]
-        {
-            // Fast path: full 32-byte load, skip temporary buffer.
-            load_be_word(index, state.msg->input_data + begin);
-        }
-        else
-        {
-            uint8_t data[32] = {};
-            std::memcpy(data, state.msg->input_data + begin, len);
-            index = intx::be::load<uint256>(data);
-        }
-    }
-}
-#endif
 
 inline void calldatasize(StackTop stack, ExecutionState& state) noexcept
 {
