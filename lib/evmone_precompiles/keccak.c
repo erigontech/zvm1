@@ -115,10 +115,14 @@ static inline __attribute__((always_inline)) void keccak_permute_at(uint64_t* s)
 {
     register uint32_t ctrl __asm__("x10") = 0;
     register void*    sptr __asm__("x11") = (void*)s;
+    // EXPERIMENT: Keccak-f1600 on the column parity / theta-rho / chi5 circuits, 361 calls.
     __asm__ __volatile__(
-        ".rept 649\n"
-        "  csrrw x0, 0x7CB, x0\n"
+        ".rept 24\n"
+        "  .rept 5\n  csrrw x0, 0x7CD, x0\n  .endr\n"
+        "  .rept 5\n  csrrw x0, 0x7CC, x0\n  .endr\n"
+        "  .rept 5\n  csrrw x0, 0x7CE, x0\n  .endr\n"
         ".endr\n"
+        "csrrw x0, 0x7CD, x0\n"
         : "+r"(ctrl)
         : "r"(sptr)
         : "memory"
