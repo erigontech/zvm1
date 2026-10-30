@@ -1377,6 +1377,55 @@ inline void callvalue(StackTop stack, ExecutionState& state) noexcept
 #endif
 }
 
+#if defined(__riscv) && !defined(__riscv_zbb)
+// Without a byte-swap instruction an access of unproven alignment is split into byte accesses,
+// and a big-endian conversion adds a swap on top: an aligned word takes ld/sd and the swap,
+// anything else is assembled or split in big-endian order directly.
+
+/// Big-endian value of the Len bytes at p.
+template <size_t Len>
+[[gnu::always_inline]] inline uint64_t load_be_bytes(const uint8_t* p) noexcept
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < Len; ++i)
+        v = (v << 8) | p[i];
+    return v;
+}
+
+/// Stores the big-endian bytes of v at p.
+[[gnu::always_inline]] inline void store_be_bytes(uint8_t* p, uint64_t v) noexcept
+{
+    for (size_t i = 0; i < 8; ++i)
+        p[i] = static_cast<uint8_t>(v >> (56 - 8 * i));
+}
+
+[[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
+{
+    if (reinterpret_cast<uintptr_t>(p) % 8 == 0) [[likely]]
+        return intx::be::unsafe::load<uint256>(std::assume_aligned<8>(p));
+    return {load_be_bytes<8>(p + 24), load_be_bytes<8>(p + 16), load_be_bytes<8>(p + 8),
+        load_be_bytes<8>(p)};
+}
+
+[[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& value) noexcept
+{
+    if (reinterpret_cast<uintptr_t>(p) % 8 == 0) [[likely]]
+        return intx::be::unsafe::store(std::assume_aligned<8>(p), value);
+    for (size_t i = 0; i < 4; ++i)
+        store_be_bytes(p + 8 * i, value[3 - i]);
+}
+#else
+[[gnu::always_inline]] inline uint256 load_be_word(const uint8_t* p) noexcept
+{
+    return intx::be::unsafe::load<uint256>(p);
+}
+
+[[gnu::always_inline]] inline void store_be_word(uint8_t* p, const uint256& value) noexcept
+{
+    intx::be::unsafe::store(p, value);
+}
+#endif
+
 inline void calldataload(StackTop stack, ExecutionState& state) noexcept
 {
     auto& index = stack.top();
@@ -1418,6 +1467,11 @@ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
     else
     {
         const auto begin = static_cast<size_t>(index);
+        if (state.msg->input_size - begin >= 32) [[likely]]
+        {
+            index = load_be_word(&state.msg->input_data[begin]);
+            return;
+        }
         const auto end = std::min(begin + 32, state.msg->input_size);
         const auto len = end - begin;
 
@@ -2018,6 +2072,31 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
 /// @tparam Len The number of push data bytes, e.g. PUSH3 is push<3>.
 ///
 /// It assumes that at least 32 bytes of data are available, so code padding is required.
+#if defined(__riscv) && !defined(__riscv_zbb)
+template <size_t Len>
+inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
+{
+    using word_type = uint256::word_type;
+    static constexpr auto NUM_FULL_WORDS = Len / sizeof(word_type);
+    static constexpr auto NUM_PARTIAL_BYTES = Len % sizeof(word_type);
+
+    // Built in registers and pushed once: pushing zero first leaves four dead stores.
+    uint256 r;
+    pos += 1;  // Skip the opcode.
+    if constexpr (NUM_PARTIAL_BYTES != 0)
+    {
+        r[NUM_FULL_WORDS] = load_be_bytes<NUM_PARTIAL_BYTES>(pos);
+        pos += NUM_PARTIAL_BYTES;
+    }
+    for (size_t i = 0; i < NUM_FULL_WORDS; ++i)
+    {
+        r[NUM_FULL_WORDS - 1 - i] = load_be_bytes<sizeof(word_type)>(pos);
+        pos += sizeof(word_type);
+    }
+    stack.push(r);
+    return pos;
+}
+#else
 template <size_t Len>
 inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterator pos) noexcept
 {
@@ -2048,6 +2127,7 @@ inline code_iterator push(StackTop stack, ExecutionState& /*state*/, code_iterat
 
     return pos;
 }
+#endif  // __riscv && !__riscv_zbb
 #endif
 
 /// DUP instruction implementation.
